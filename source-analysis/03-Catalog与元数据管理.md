@@ -125,7 +125,7 @@ Catalog (接口, AutoCloseable)
 |       |-- 在操作前校验权限
 |
 +-- RESTCatalog
-    |-- paimon-api: rest/RESTCatalog (通过 REST API 与远端 Catalog Server 交互)
+    |-- paimon-core: rest/RESTCatalog (通过 REST API 与远端 Catalog Server 交互)
 ```
 
 **为什么这么设计?**
@@ -839,7 +839,7 @@ public Snapshot latestSnapshot() {
 }
 ```
 
-**为什么 `latestSnapshotFromFileSystem()` 扫描文件系统而不是维护一个指针文件?** 因为文件系统上的 snapshot 文件名包含了 ID（`snapshot-1`, `snapshot-2`），可以通过目录列表快速找到最大 ID。维护指针文件反而增加了额外的一致性风险（指针文件和实际快照文件之间可能不一致）。
+**`latestSnapshotFromFileSystem()` 的查找策略: hint 文件优先 + 目录列表兜底。** 实际上 Paimon **维护了 LATEST hint 指针文件**（位于 `{snapshot_dir}/LATEST`）。`findLatest()` 内部调用 `HintFileUtils.findLatest()`，首先尝试读取 hint 文件获取快照 ID，并验证该 ID 的下一个快照不存在来确认其确实是最新的；如果 hint 文件不存在、无效或已过时，则回退到列出目录下所有快照文件取最大 ID 的方式（`findByListFiles()`）。提交成功后通过 `commitLatestHint()` 更新 hint 文件。这种设计兼顾了性能（hint 命中时只需 1-2 次文件操作）和正确性（hint 失效时自动降级到全量扫描）。
 
 ---
 

@@ -201,7 +201,7 @@ final class SetOption implements SchemaChange {
 ```
 
 **用途**: 设置或修改表的配置选项（如 `write-buffer-size`、`merge-engine` 等）。
-**约束**: 如果表已有 Snapshot，会触发 `checkAlterTableOption` 检查不可变选项（如 `write-mode`、`merge-engine`）。
+**约束**: 如果表已有 Snapshot，会触发 `checkAlterTableOption` 检查不可变选项（如 `bucket-key`、`merge-engine`）。
 **好处**: 运行时调优无需重建表，极大降低了运维成本。
 
 #### 2. RemoveOption — 删除表选项
@@ -558,7 +558,7 @@ public <T> T runWithLock(Identifier identifier, Callable<T> callable) throws Exc
 | 配置项 | 默认值 | 作用 |
 |-------|--------|------|
 | `alter-column-null-to-not-null.disabled` | `true` | 是否禁止将 nullable 改为 NOT NULL |
-| `explicit-type-casting.disabled` | `false` | 是否禁止显式类型转换（收窄转换） |
+| `disable-explicit-type-casting` | `false` | 是否禁止显式类型转换（收窄转换） |
 | `add-column-before-partition` | `false` | 新增列是否自动放在分区列之前 |
 
 ### 5.2 AddColumn 处理流程
@@ -1879,7 +1879,7 @@ graph LR
 | 配置项 | 默认值 | 说明 |
 |-------|--------|------|
 | `alter-column-null-to-not-null.disabled` | `true` | 禁止将nullable改为NOT NULL |
-| `explicit-type-casting.disabled` | `false` | 禁止显式类型转换（收窄） |
+| `disable-explicit-type-casting` | `false` | 禁止显式类型转换（收窄） |
 | `add-column-before-partition` | `false` | 新增列放在分区列之前 |
 | `deletion-vectors.modifiable` | `false` | 是否允许修改删除向量开关 |
 

@@ -630,12 +630,20 @@ public void add(KeyValue kv) {
 @Override
 public void add(KeyValue kv) {
     if (kv.valueKind().isRetract()) {
-        if (ignoreDelete) return;
-        else throw new IllegalArgumentException(
-                "First row merge engine can not accept DELETE/UPDATE_BEFORE records.");
+        if (ignoreDelete) {
+            return;
+        } else {
+            throw new IllegalArgumentException(
+                    "By default, First row merge engine can not accept DELETE/UPDATE_BEFORE records.\n"
+                            + "You can config 'ignore-delete' to ignore the DELETE/UPDATE_BEFORE records.");
+        }
     }
-    if (first == null) this.first = kv;  // 只保存第一条
-    if (kv.level() > 0) containsHighLevel = true;
+    if (first == null) {
+        this.first = kv;  // 只保存第一条
+    }
+    if (kv.level() > 0) {
+        containsHighLevel = true;
+    }
 }
 ```
 
@@ -1408,10 +1416,18 @@ Paimon Compaction 的核心参数及调优策略：
 **源码证据：**
 
 ```java
-// 源码: paimon-core/.../compact/MergeTreeCompactManagerFactory.java:191-222
+// 源码: paimon-core/.../compact/MergeTreeCompactManagerFactory.java:191-223
 private CompactStrategy createCompactStrategy(CoreOptions options) {
     if (options.needLookup()) {
-        // Lookup 场景使用 ForceUpLevel0Compaction 包装
+        // Lookup 场景: 根据 GENTLE/RADICAL 模式决定 compactMaxInterval
+        Integer compactMaxInterval = null;
+        switch (options.lookupCompact()) {
+            case GENTLE:
+                compactMaxInterval = options.lookupCompactMaxInterval();
+                break;
+            case RADICAL:
+                break;
+        }
         return new ForceUpLevel0Compaction(
                 new UniversalCompaction(
                         options.maxSizeAmplificationPercent(),
@@ -1422,12 +1438,18 @@ private CompactStrategy createCompactStrategy(CoreOptions options) {
                 compactMaxInterval);
     }
     // 普通场景
-    return new UniversalCompaction(
-            options.maxSizeAmplificationPercent(),
-            options.sortedRunSizeRatio(),
-            options.numSortedRunCompactionTrigger(),
-            EarlyFullCompaction.create(options),
-            OffPeakHours.create(options));
+    UniversalCompaction universal =
+            new UniversalCompaction(
+                    options.maxSizeAmplificationPercent(),
+                    options.sortedRunSizeRatio(),
+                    options.numSortedRunCompactionTrigger(),
+                    EarlyFullCompaction.create(options),
+                    OffPeakHours.create(options));
+    if (options.compactionForceUpLevel0()) {
+        return new ForceUpLevel0Compaction(universal, null);
+    } else {
+        return universal;
+    }
 }
 ```
 
