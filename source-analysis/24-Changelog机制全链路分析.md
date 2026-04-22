@@ -356,11 +356,22 @@ public void add(KeyValue kv) {
                 "Top level key-value already exists!");
         topLevelKv = kv;  // 记录来自最高层级的旧值
     }
-    // ... 聚合到 mergeFunction
+
+    if (initialKv == null) {
+        initialKv = kv;
+    } else {
+        if (!isInitialized) {
+            merge(initialKv);
+            isInitialized = true;
+        }
+        merge(kv);
+    }
 }
 ```
 
 **为什么 topLevelKv 代表"旧值"**: 在 LSM 树的全压缩中（Universal Compaction），最高层级 (maxLevel) 的文件包含的是之前压缩沉淀下来的"历史最终值"。新写入的数据在 Level 0，逐步通过压缩下沉到更高层级。因此 maxLevel 的记录就是"上次全压缩之后的值"。
+
+**注意**: 源码中 `add()` 方法还维护了 `initialKv` 和 `isInitialized` 标志，用于处理只有一条记录的情况。当只有一条记录时，不需要调用 `mergeFunction.add()`，直接在 `getResult()` 中处理。
 
 ### 5.3 何时产生 INSERT/UPDATE/DELETE
 
@@ -396,6 +407,7 @@ public ChangelogResult getResult() {
         if (topLevelKv == null && initialKv.isAdd()) {
             reusedResult.addChangelog(replace(reusedAfter, RowKind.INSERT, initialKv));
         }
+        // 如果 topLevelKv != null 但只有一条记录，说明 topLevelKv 就是唯一的记录，无变更
         return reusedResult.setResultIfNotRetract(initialKv);
     }
 }
@@ -464,7 +476,18 @@ public ChangelogResult getResult() {
         if (lookupResult != null) {
             if (lookupStrategy.deletionVector) {
                 // Deletion Vector 模式下的特殊处理
-                // ... 记录 deletion vector 信息
+                String fileName;
+                long rowPosition;
+                if (lookupResult instanceof PositionedKeyValue) {
+                    PositionedKeyValue positionedKeyValue = (PositionedKeyValue) lookupResult;
+                    highLevel = positionedKeyValue.keyValue();
+                    fileName = positionedKeyValue.fileName();
+                    rowPosition = positionedKeyValue.rowPosition();
+                } else {
+                    FilePosition position = (FilePosition) lookupResult;
+                    fileName = position.fileName();
+                    rowPosition = position.rowPosition();
+                }
                 deletionVectorsMaintainer.notifyNewDeletion(fileName, rowPosition);
             } else {
                 highLevel = (KeyValue) lookupResult;
@@ -512,7 +535,7 @@ public class LookupMergeFunction implements MergeFunction<KeyValue> {
         try (CloseableIterator<KeyValue> iterator = candidates.iterator()) {
             while (iterator.hasNext()) {
                 KeyValue kv = iterator.next();
-                if (kv.level() <= 0) continue;
+                if (kv.level() <= 0) continue;  // 跳过 Level 0 及以下
                 if (highLevel == null || kv.level() < highLevel.level()) {
                     highLevel = kv;
                 }
@@ -520,10 +543,22 @@ public class LookupMergeFunction implements MergeFunction<KeyValue> {
         }
         return highLevel;
     }
+
+    public boolean containLevel0() {
+        // 检查是否存在 Level 0 记录
+        try (CloseableIterator<KeyValue> iterator = candidates.iterator()) {
+            while (iterator.hasNext()) {
+                if (iterator.next().level() <= 0) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
 }
 ```
 
-**为什么选择 "最小 level > 0"**: 在 LookupMergeFunction 中，每次合并查询的是该键在更高层级的"最近已合并状态"。Level 越低越新，但 Level 0 是未合并的新数据。因此"最小的非零 Level"就是"距离当前最近的已确认历史值"。
+**为什么选择 "最小 level > 0"**: 在 LookupMergeFunction 中，每次合并查询的是该键在更高层级的"最近已合并状态"。Level 越低越新，但 Level 0 是未合并的新数据。因此"最小的正 Level"就是"距离当前最近的已确认历史值"。
 
 ### 6.3 Deletion Vector 的协同
 
@@ -858,7 +893,7 @@ public SnapshotReader.Plan scan(Snapshot snapshot, SnapshotReader snapshotReader
 }
 ```
 
-关键区别在于调用 `readChanges()` 而非 `read()`。`readChanges()` 会优先读取 `changelogManifestList`，如果存在的话，其中的文件携带完整的 RowKind 语义。
+关键区别在于调用 `readChanges()` 而非 `read()`。`readChanges()` 会在内部检查 `changelogManifestList`，如果存在的话，优先读取其中的 Changelog 文件；否则降级为读取 `deltaManifestList` 中的增量文件。
 
 ### 9.4 ScanMode 三态模型
 
@@ -881,18 +916,20 @@ public enum ScanMode {
 ### 9.5 SnapshotReader.readChanges 的实现
 
 `readChanges()` 是流式消费的关键入口。它的逻辑是：
-1. 检查当前 Snapshot 是否有 `changelogManifestList`
-2. 如果有 → 使用 `ScanMode.CHANGELOG` 读取 Changelog 文件
-3. 如果没有 → 使用 `ScanMode.DELTA` 读取增量文件（降级）
+1. 设置扫描模式为 `ScanMode.DELTA`
+2. 调用 `FileStoreScan.plan()` 获取执行计划
+3. 在 `FileStoreScan` 内部会检查 Snapshot 的 `changelogManifestList` 字段
+4. 如果存在 changelog manifest → 读取 Changelog 文件
+5. 如果不存在 → 降级为读取 `deltaManifestList` 中的增量文件
 
 **源码实现细节** (`paimon-core/.../table/source/snapshot/SnapshotReaderImpl.java:466`):
 
 ```java
 public Plan readChanges() {
-    withMode(ScanMode.DELTA);  // 先设置为 DELTA 模式
+    withMode(ScanMode.DELTA);  // 设置为 DELTA 模式
     FileStoreScan.Plan plan = scan.plan();
     
-    // 关键: 实际读取时会检查 changelogManifestList
+    // 关键: FileStoreScan.plan() 内部会检查 changelogManifestList
     // 如果存在，会优先读取 changelog 文件
     // 如果不存在，降级为读取 delta 文件
     Map<BinaryRow, Map<Integer, List<ManifestEntry>>> beforeFiles =
@@ -904,10 +941,12 @@ public Plan readChanges() {
 ```
 
 **降级机制的工作方式**:
-- `readChanges()` 并非直接切换到 `ScanMode.CHANGELOG`，而是先用 `DELTA` 模式扫描
-- 在 `FileStoreScan.plan()` 内部会检查 Snapshot 的 `changelogManifestList` 字段
+- `readChanges()` 设置 `ScanMode.DELTA` 后，实际的文件选择逻辑在 `FileStoreScan.plan()` 中
+- `FileStoreScan` 会检查 Snapshot 的 `changelogManifestList` 字段
 - 如果存在 changelog manifest，会读取 changelog 文件；否则读取 delta 文件
 - 这种设计确保了即使某些 Snapshot 没有 Changelog（如 FULL_COMPACTION 模式下未触发全压缩），流式消费也不会中断
+
+**重要说明**: 源码中 `readChanges()` 实际上是通过 `ScanMode.DELTA` 模式来实现的，而不是直接使用 `ScanMode.CHANGELOG`。这是因为 `readChanges()` 需要支持降级逻辑 — 当某个 Snapshot 没有 Changelog 时，自动降级为读取 delta 文件。
 
 ---
 
@@ -1017,7 +1056,7 @@ public ExpireConfig build() {
 
 ### 11.2 ExpireConfig 的解耦设计
 
-**源码路径**: `paimon-api/.../options/ExpireConfig.java`
+**源码路径**: `paimon-api/.../options/ExpireConfig.java` (行 54-57)
 
 ```java
 public class ExpireConfig {

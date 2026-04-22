@@ -91,10 +91,10 @@ paimon-flink/                          (聚合 POM)
 
 Paimon 通过 Maven Profile 机制管理 Flink 版本矩阵：
 
-| Profile   | Flink 版本范围       | 公共模块依赖                  | 默认激活 |
-|-----------|--------------------|-----------------------------|---------|
-| `flink1`  | 1.16, 1.17, 1.18, 1.19, 1.20 | `paimon-flink1-common` (Flink 1.20.1 编译) | 是       |
-| `flink2`  | 2.0, 2.1, 2.2     | `paimon-flink2-common` (Flink 2.2.0 编译)  | 否       |
+| Profile   | Flink 版本范围       | 公共模块依赖                  | Java 版本 | Scala 版本 | 默认激活 |
+|-----------|--------------------|-----------------------------|----------|----------|---------|
+| `flink1`  | 1.16, 1.17, 1.18, 1.19, 1.20 | `paimon-flink1-common` (Flink 1.20.1 编译) | 8+ | 2.12 | 是       |
+| `flink2`  | 2.0, 2.1, 2.2     | `paimon-flink2-common` (Flink 2.2.0 编译)  | 11+ | 2.13 | 否       |
 
 源码路径: `pom.xml` (L453-L485)
 
@@ -104,7 +104,7 @@ Paimon 通过 Maven Profile 机制管理 Flink 版本矩阵：
 
 2. **`paimon-flink-common` 是版本无关的抽象**: 它依赖 `${paimon-flinkx-common}` 变量，在不同 Profile 下解析为 `paimon-flink1-common` 或 `paimon-flink2-common`。
 
-3. **Flink 2.x 需要 Java 11 以上**，而 Paimon 整体基于 JDK 8。因此 `flink2` Profile 不是默认激活的。
+3. **Flink 2.x 需要 Java 11 以上，而 Paimon 整体基于 JDK 8**。因此 `flink2` Profile 不是默认激活的。同时，Flink 2.x 使用 Scala 2.13，而 Flink 1.x 使用 Scala 2.12。
 
 ### 1.3 依赖层次
 
@@ -646,6 +646,7 @@ private final Deque<CommitT> inputs = new ArrayDeque<>();
 **`processElement()` (L221-L224)**: 只做两件事——转发元素和缓存输入。
 
 ```java
+@Override
 public void processElement(StreamRecord<CommitT> element) {
     output.collect(element);      // 转发给下游 (DiscardingSink)
     this.inputs.add(element.getValue());  // 缓存到输入队列
@@ -802,7 +803,7 @@ public void build() throws Exception {
 
 源码路径: `paimon-flink/paimon-flink-cdc/src/main/java/org/apache/paimon/flink/action/cdc/SyncTableActionBase.java`
 
-**`beforeBuildingSourceSink()` (L114-L149)**: 最关键的表准备逻辑:
+**`beforeBuildingSourceSink()` (L115-L149)**: 最关键的表准备逻辑:
 
 ```
 1. 尝试获取目标 Paimon 表
@@ -812,9 +813,11 @@ public void build() throws Exception {
    |     - retrieveSchema() 从源获取 Schema
    |     - buildComputedColumns() 构建计算列
    |     - assertSchemaCompatible() 检查兼容性
+   |     - 如果 Schema 检索失败，跳过兼容性检查但使用已有表的 Schema 构建计算列
    |
    +-- 表不存在:
          - retrieveSchema() 从源获取 Schema
+         - buildComputedColumns() 构建计算列
          - buildPaimonSchema() 构建 Paimon Schema
          - catalog.createTable() 自动创建表
 ```

@@ -151,7 +151,7 @@ public void validate(Comparator<InternalRow> comparator) {
 ```
 
 ```java
-// 源码: paimon-core/src/main/java/org/apache/paimon/mergetree/Levels.java:128-135
+// 源码: paimon-core/src/main/java/org/apache/paimon/mergetree/Levels.java:127-135
 public int numberOfSortedRuns() {
     int numberOfSortedRuns = level0.size();  // Level0 每个文件算一个 SortedRun
     for (SortedRun run : levels) {
@@ -947,7 +947,7 @@ Paimon 的 Exactly-Once 保证通过三个关键机制实现：
 **源码证据：**
 
 ```java
-// 源码: paimon-flink/.../CommitterOperator.java:163-168
+// 源码: paimon-flink/.../CommitterOperator.java:164-168
 @Override
 public void snapshotState(StateSnapshotContext context) throws Exception {
     super.snapshotState(context);
@@ -1476,8 +1476,8 @@ Bucket 是 Paimon 在每个分区内部的数据分片单位。每个 bucket 独
 
 **Bucket 模式**：
 - **FIXED**：固定 bucket 数量，通过 `bucket = N` 配置。适合数据量可预估的场景。
-- **DYNAMIC**：动态调整 bucket 数量。适合数据量波动较大的场景。
-- **BUCKET_UNAWARE**：不使用 bucket 概念，数据直接写入。适合 append-only 表。
+- **DYNAMIC**：动态调整 bucket 数量，通过 `dynamic-bucket.target-row-num` 配置目标行数。适合数据量波动较大的场景。
+- **UNAWARE**：不使用 bucket 概念，数据直接写入。适合 append-only 表。
 
 Bucket 数量直接影响了 Flink 的写入并行度——每个 Writer 实例负责一个或多个 bucket，bucket 数量过少会导致写入成为瓶颈。
 

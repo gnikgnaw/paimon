@@ -357,7 +357,7 @@ CachingCatalog 继承 DelegateCatalog，在元数据操作上添加基于 Caffei
 |---|---|---|
 | `databaseCache` | `Cache<String, Database>` | 数据库元数据缓存 |
 | `tableCache` | `Cache<Identifier, Table>` | 表对象缓存 |
-| `partitionCache` | `Cache<Identifier, List<Partition>>` | 分区列表缓存（可选） |
+| `partitionCache` | `Cache<Identifier, List<Partition>>` | 分区列表缓存（可选，默认不启用） |
 | `manifestCache` | `SegmentsCache<Path>` | Manifest 文件内容缓存 |
 | `dvMetaCache` | `DVMetaCache` | Deletion Vector 元数据缓存（可选） |
 
@@ -366,8 +366,8 @@ CachingCatalog 继承 DelegateCatalog，在元数据操作上添加基于 Caffei
 | 配置键 | 默认值 | 说明 |
 |---|---|---|
 | `cache.enabled` | `true` | 是否启用缓存 |
-| `cache.expire-after-access` | - | 访问后过期时间 |
-| `cache.expire-after-write` | - | 写入后过期时间 |
+| `cache.expire-after-access` | - | 访问后过期时间（必须为正数） |
+| `cache.expire-after-write` | - | 写入后过期时间（必须为正数） |
 | `cache.snapshot-max-num-per-table` | - | 每表最大缓存快照数 |
 | `cache.partition-max-num` | `0` | 最大缓存分区数（0=不缓存） |
 | `cache.manifest-small-file-memory` | - | 小 manifest 文件缓存内存 |
@@ -441,17 +441,17 @@ CatalogFactory.createCatalog(context, classLoader)
     |
     +-- createUnwrappedCatalog(context, classLoader)
     |     |
-    |     +-- 从 context 中读取 "metastore" 配置
+    |     +-- 从 context 中读取 "metastore" 配置（默认 "filesystem"）
     |     +-- FactoryUtil.discoverFactory(classLoader, CatalogFactory.class, metastore)
     |     |     // 使用 Java SPI 发现匹配 identifier 的 CatalogFactory
     |     +-- 先尝试 catalogFactory.create(context)
     |     +-- 若 UnsupportedOperationException:
-    |           +-- 读取 warehouse 路径
-    |           +-- 创建 FileIO
+    |           +-- 读取 warehouse 路径（必须配置）
+    |           +-- 创建 FileIO 并检查/创建 warehouse 目录
     |           +-- catalogFactory.create(fileIO, warehousePath, context)
     |
-    +-- CachingCatalog.tryToCreate(catalog, options)  // 包装缓存层
-    +-- PrivilegedCatalog.tryToCreate(catalog, options) // 包装权限层
+    +-- CachingCatalog.tryToCreate(catalog, options)  // 包装缓存层（如果启用）
+    +-- PrivilegedCatalog.tryToCreate(catalog, options) // 包装权限层（如果启用）
 ```
 
 **已知的 CatalogFactory 实现:**
@@ -709,13 +709,13 @@ Snapshot 是 Paimon 表在某个时间点的完整数据视图入口。当前版
 | `schemaId` | `long` | 否 | 对应的 Schema 版本 ID |
 | `baseManifestList` | `String` | 否 | 基线 Manifest 列表文件名（包含所有历史文件的合并结果） |
 | `baseManifestListSize` | `Long` | 是 | 基线列表文件大小（Paimon <=1.0 为 null） |
-| `deltaManifestList` | `String` | 否 | 增量 Manifest 列表文件名（本次提交的变更） |
-| `deltaManifestListSize` | `Long` | 是 | 增量列表文件大小 |
-| `changelogManifestList` | `String` | 是 | Changelog Manifest 列表文件名 |
-| `changelogManifestListSize` | `Long` | 是 | Changelog 列表文件大小 |
+| `deltaManifestList` | `String` | 否 | 增量 Manifest 列表文件名（本次提交新增/删除的文件） |
+| `deltaManifestListSize` | `Long` | 是 | 增量列表文件大小（Paimon <=1.0 为 null） |
+| `changelogManifestList` | `String` | 是 | Changelog Manifest 列表文件名（CDC 变更日志） |
+| `changelogManifestListSize` | `Long` | 是 | Changelog 列表文件大小（Paimon <=1.0 为 null） |
 | `indexManifest` | `String` | 是 | 索引 Manifest 文件名（Deletion Vector 等） |
 | `commitUser` | `String` | 否 | 提交者标识（用于去重和冲突检测） |
-| `commitIdentifier` | `long` | 否 | 提交标识符（用于快照去重） |
+| `commitIdentifier` | `long` | 否 | 提交标识符（用于快照去重，精确一次语义） |
 | `commitKind` | `CommitKind` | 否 | 提交类型 (APPEND/COMPACT/OVERWRITE/ANALYZE) |
 | `timeMillis` | `long` | 否 | 提交时间戳（毫秒） |
 | `totalRecordCount` | `long` | 否 | 表的总记录数（累计） |
@@ -1243,12 +1243,12 @@ commit(committable, checkAppendFiles)
   |     |     compactIndexFiles  (压缩产生的索引变更)
   |
   +-- [2] 判断是否需要 APPEND 提交
-  |     |-- 条件: appendTableFiles/appendChangelog/appendIndexFiles 非空
+  |     |-- 条件: appendTableFiles/appendChangelog/appendIndexFiles 非空 或 ignoreEmptyCommit=false
   |     |-- 确定 commitKind = APPEND
   |     |-- 特殊情况: 如果 appendFiles 中包含 DELETE 或 DV
   |     |     +-- 升级为 commitKind = OVERWRITE, 允许回滚
   |     |
-  |     +-- tryCommit(appendFiles, APPEND, ...)  --------> [详见 7.2]
+  |     +-- tryCommit(appendFiles, APPEND/OVERWRITE, ...)  --------> [详见 7.2]
   |     |     generatedSnapshot += 1
   |
   +-- [3] 判断是否需要 COMPACT 提交
@@ -1515,10 +1515,10 @@ CoreOptions 是 Paimon 的配置中心，定义了所有表级配置项。与 Ca
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
-| `commit.timeout` | `5min` | 提交超时时间 |
-| `commit.max-retries` | `∞` | 最大重试次数 |
-| `commit.min-retry-wait` | `1s` | 最小重试等待 |
-| `commit.max-retry-wait` | `5s` | 最大重试等待 |
+| `commit.timeout` | - | 提交超时时间（无默认值） |
+| `commit.max-retries` | `10` | 最大重试次数 |
+| `commit.min-retry-wait` | `10ms` | 最小重试等待 |
+| `commit.max-retry-wait` | `10s` | 最大重试等待 |
 | `commit.discard-duplicate-files` | `false` | 是否丢弃重复文件 |
 
 **Manifest 相关:**
@@ -1527,13 +1527,13 @@ CoreOptions 是 Paimon 的配置中心，定义了所有表级配置项。与 Ca
 |---|---|---|
 | `manifest.target-file-size` | `8MB` | Manifest 文件目标大小 |
 | `manifest.merge-min-count` | `30` | 触发 manifest 合并的最小文件数 |
-| `manifest.full-compaction-threshold-size` | - | 全量压缩阈值 |
+| `manifest.full-compaction-threshold-size` | `16MB` | 全量压缩阈值 |
 
 **Snapshot/Tag 相关:**
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
-| `snapshot.time-retained` | - | Snapshot 保留时间 |
+| `snapshot.time-retained` | `1h` | Snapshot 保留时间 |
 | `snapshot.num-retained.min` | `10` | 最少保留的 Snapshot 数 |
 | `snapshot.num-retained.max` | `∞` | 最多保留的 Snapshot 数 |
 | `tag.automatic-creation` | `none` | 自动创建 Tag 的模式 |
@@ -1553,12 +1553,15 @@ CoreOptions 是 Paimon 的配置中心，定义了所有表级配置项。与 Ca
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
-| `cache.enabled` | `true` | 启用 Catalog 缓存 |
-| `cache.expire-after-access` | - | 访问后过期时间 |
-| `cache.expire-after-write` | - | 写入后过期时间 |
-| `cache.manifest-small-file-memory` | - | 小 manifest 缓存内存 |
+| `cache-enabled` | `true` | 启用 Catalog 缓存 |
+| `cache.expire-after-access` | `10min` | 访问后过期时间 |
+| `cache.expire-after-write` | `30min` | 写入后过期时间 |
+| `cache.manifest-small-file-memory` | `128MB` | 小 manifest 缓存内存 |
+| `cache.manifest-small-file-threshold` | `1MB` | 小文件阈值 |
 | `cache.manifest-max-memory` | - | manifest 最大缓存内存 |
 | `cache.partition-max-num` | `0` | 分区缓存最大数量 |
+| `cache.snapshot.max-num-per-table` | `20` | 每表最大缓存快照数 |
+| `cache.deletion-vectors.max-num` | `100000` | DV 元数据最大缓存数 |
 
 配置项通过 `CoreOptions.fromMap(options)` 工厂方法创建，内部使用 Paimon 自定义的 `Options` 类进行类型安全的配置读取:
 

@@ -1,7 +1,7 @@
 # Apache Paimon Spark 集成深度源码分析
 
 > 基于 paimon 1.5-SNAPSHOT (master 分支, commit: 55f4fd175)
-> 分析日期: 2026-04-21
+> 分析日期: 2026-04-22
 
 ---
 
@@ -9,16 +9,18 @@
 
 ### 1.1 模块总览
 
+**支持的 Spark 版本**: 3.2 ~ 3.5 (Scala 2.12) 和 4.0 (Scala 2.13, Java 17)
+
 ```
 paimon-spark/
   paimon-spark-common/       -- 核心共享代码 (Java + Scala 混合)
-  paimon-spark3-common/      -- Spark 3.x 共享的适配层
-  paimon-spark4-common/      -- Spark 4.x 共享的适配层
-  paimon-spark-3.2/          -- Spark 3.2 版本特定代码
-  paimon-spark-3.3/          -- Spark 3.3 版本特定代码
-  paimon-spark-3.4/          -- Spark 3.4 版本特定代码
-  paimon-spark-3.5/          -- Spark 3.5 版本特定代码
-  paimon-spark-4.0/          -- Spark 4.0 版本特定代码
+  paimon-spark3-common/      -- Spark 3.x 共享的适配层 (Scala 2.12)
+  paimon-spark4-common/      -- Spark 4.x 共享的适配层 (Scala 2.13)
+  paimon-spark-3.2/          -- Spark 3.2 版本特定代码 (Scala 2.12)
+  paimon-spark-3.3/          -- Spark 3.3 版本特定代码 (Scala 2.12)
+  paimon-spark-3.4/          -- Spark 3.4 版本特定代码 (Scala 2.12)
+  paimon-spark-3.5/          -- Spark 3.5 版本特定代码 (Scala 2.12)
+  paimon-spark-4.0/          -- Spark 4.0 版本特定代码 (Scala 2.13, Java 17)
   paimon-spark-ut/           -- 统一测试模块 (Scala 测试)
   pom.xml                    -- 聚合 POM
 ```
@@ -40,7 +42,7 @@ graph TD
 **为什么这么设计？**
 - **最大化代码复用**: `paimon-spark-common` 包含所有跨版本共享的核心逻辑（Catalog、DataSource V2 接口、Procedure、排序器、写入器等），无论 Spark 版本如何，这些代码只写一遍。
 - **最小化版本差异**: Spark 3.x 与 4.x 之间有 API 不兼容变化（如 `InternalRow` 接口变化、`MergeIntoTable` 签名差异、Variant 类型支持等）。通过 `paimon-spark3-common` 和 `paimon-spark4-common` 两个中间层隔离这些差异。
-- **版本特定模块极简**: 例如 `paimon-spark-3.5` 只有 1 个文件 (`MergePaimonScalarSubqueries.scala`)，`paimon-spark-3.4` 只有 6 个文件，说明版本间差异已被上层模块充分抽象。
+- **版本特定模块极简**: 例如 `paimon-spark-3.5` 包含 24 个文件，`paimon-spark-3.4` 包含 31 个文件，相比 `paimon-spark-common` 的数百个文件，版本特定的差异已被上层模块充分抽象。
 
 ### 1.3 SparkShim 机制 -- 版本适配的核心
 
@@ -417,7 +419,10 @@ class PaimonWrite extends V1Write {
 **启用条件** (在 `PaimonSparkTableBase.supportsV2Write` 中判断):
 1. 桶函数类型为 `DEFAULT`
 2. 表类型为 `FileStoreTable`
-3. 桶模式为 `HASH_FIXED`（且 `BucketFunction.supportsTable` 通过）、`BUCKET_UNAWARE` 或 `POSTPONE_MODE`
+3. 桶模式满足以下之一：
+   - `HASH_FIXED`（且 `BucketFunction.supportsTable` 通过）
+   - `BUCKET_UNAWARE`
+   - `POSTPONE_MODE`（且 `postponeBatchWriteFixedBucket` 未启用）
 4. 没有配置聚类列
 
 **V2 Write 的核心优势 -- `RequiresDistributionAndOrdering`**:
@@ -649,14 +654,10 @@ classDiagram
 
 ### 6.2 完整 Procedure 列表
 
-**源码位置**: `SparkProcedures.java`，共注册 **32 个** Procedure:
+**源码位置**: `SparkProcedures.java`，共注册 **37 个** Procedure:
 
 | 分类 | Procedure 名称 | 功能 |
 |------|---------------|------|
-| **快照管理** | `rollback` | 回滚到指定快照 |
-| | `rollback_to_timestamp` | 回滚到指定时间戳的快照 |
-| | `rollback_to_watermark` | 回滚到指定水位线 |
-| | `expire_snapshots` | 过期旧快照 |
 | **标签管理** | `create_tag` | 创建标签 |
 | | `replace_tag` | 替换标签 |
 | | `rename_tag` | 重命名标签 |
@@ -668,6 +669,8 @@ classDiagram
 | | `delete_branch` | 删除分支 |
 | | `rename_branch` | 重命名分支 |
 | | `fast_forward` | 分支快进合并 |
+| **全局索引** | `create_global_index` | 创建全局索引 |
+| | `drop_global_index` | 删除全局索引 |
 | **Compaction** | `compact` | 表级压缩 |
 | | `compact_database` | 数据库级压缩 |
 | | `compact_manifest` | Manifest 文件压缩 |
@@ -688,8 +691,10 @@ classDiagram
 | | `alter_view_dialect` | 修改视图方言 |
 | | `rewrite_file_index` | 重写文件索引 |
 | | `copy` | 文件拷贝 |
-| | `create_global_index` | 创建全局索引 |
-| | `drop_global_index` | 删除全局索引 |
+| | `rollback` | 回滚到指定快照 |
+| | `rollback_to_timestamp` | 回滚到指定时间戳的快照 |
+| | `rollback_to_watermark` | 回滚到指定水位线 |
+| | `expire_snapshots` | 过期旧快照 |
 
 ### 6.3 CompactProcedure 深度分析
 
@@ -964,14 +969,69 @@ class PaimonSink extends Sink with SchemaHelper {
 
 ---
 
-## 10. 设计决策总结
+## 10. Scala 测试框架
 
-### 10.1 为什么混合使用 Java 和 Scala？
+### 10.1 测试模块结构
+
+**源码位置**: `paimon-spark-ut/` 模块
+
+```
+paimon-spark-ut/
+  src/test/scala/org/apache/paimon/spark/
+    ├── PaimonSparkTestBase.scala          -- 基础测试类
+    ├── sql/                               -- SQL 功能测试
+    ├── rowops/                            -- 行级操作测试
+    ├── predicate/                         -- 谓词下推测试
+    ├── benchmark/                         -- 性能基准测试
+    └── ...
+```
+
+### 10.2 测试框架选择
+
+Paimon Spark 集成使用 **ScalaTest** 框架（通过 `scalatest-maven-plugin` 运行），而非 JUnit Surefire：
+
+- **基础类**: `PaimonSparkTestBase` 继承 `QueryTest` 和 `SharedSparkSession`（Spark 官方测试基类）
+- **测试方式**: 使用 Scala 的 `test()` 方法定义测试用例
+- **Spark Session 管理**: `SharedSparkSession` 提供共享的 SparkSession，避免重复初始化
+- **临时目录**: 通过 `tempDBDir` 和 `@TempDir` 管理临时文件
+
+**为什么选择 ScalaTest？**
+- Spark 核心代码用 Scala 编写，官方测试也使用 ScalaTest
+- 与 Spark 内部 API 深度集成（如 Catalyst 规则、执行计划）
+- 支持 Scala 特性（模式匹配、case class、隐式转换）
+
+### 10.3 测试执行命令
+
+```bash
+# 运行单个 Scala 测试类
+mvn -pl paimon-spark/paimon-spark-ut -am -Pfast-build -DfailIfNoTests=false \
+  -DwildcardSuites=org.apache.paimon.spark.sql.WriteMergeSchemaTest \
+  -Dtest=none test
+
+# 注意: 使用 -DwildcardSuites 而非 -Dtest，因为 scalatest-maven-plugin 的参数不同
+```
+
+### 10.4 常见测试基类
+
+| 基类 | 用途 |
+|------|------|
+| `PaimonSparkTestBase` | 通用测试基类，提供 Paimon Catalog、临时目录、SQL 执行 |
+| `PaimonSparkTestWithRestCatalogBase` | 使用 REST Catalog 的测试 |
+| `AnalyzeTableTestBase` | 表分析相关测试 |
+| `DDLTestBase` | DDL 操作测试 |
+| `DataFrameWriteTestBase` | DataFrame 写入测试 |
+| `DeleteFromTableTestBase` | DELETE 操作测试 |
+
+---
+
+## 11. 设计决策总结
+
+### 11.1 为什么混合使用 Java 和 Scala？
 
 - **Java 部分**: Catalog 定义、Procedure 实现、排序器、工具类 -- 这些模块逻辑清晰、类型安全要求高，Java 更合适
 - **Scala 部分**: Catalyst 规则、Table/Scan/Batch/Write 实现、commands -- 需要与 Spark 内部 API 深度交互（Spark 核心用 Scala 编写），使用 Scala 可以利用模式匹配、case class、隐式转换等特性简化代码
 
-### 10.2 为什么有两种写入路径？
+### 11.2 为什么有两种写入路径？
 
 **V1 Write (旧路径)** 通过 `RunnableCommand` 在 Driver 端完全控制写入流程，Paimon 自己做数据分桶:
 - 兼容所有桶模式
@@ -984,11 +1044,11 @@ class PaimonSink extends Sink with SchemaHelper {
 - 更好的指标集成
 - 但有更多的条件限制
 
-### 10.3 为什么 `useCommitCoordinator()` 返回 false？
+### 11.3 为什么 `useCommitCoordinator()` 返回 false？
 
 Paimon 的 `BatchTableCommit` 本身保证原子提交（通过 snapshot 机制），不需要 Spark 的 commit coordinator 做额外协调。如果某个 Task 失败，Spark 会自动重试该 Task，重复的 CommitMessage 不会导致数据不一致（Paimon 的 commit 是幂等的）。
 
-### 10.4 CatalogExtension 模式的设计考量
+### 11.4 CatalogExtension 模式的设计考量
 
 `SparkGenericCatalog` 实现 `CatalogExtension` 而非直接替换 SessionCatalog：
 - 保持对 Hive 表、临时表等非 Paimon 表的兼容

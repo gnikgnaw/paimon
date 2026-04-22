@@ -1,7 +1,8 @@
 # Flink 写入 Paimon 源码流程深度分析
 
 > 基于 Apache Paimon 1.5-SNAPSHOT (commit: 55f4fd175)
-> 分析日期: 2026-04-21
+> 分析日期: 2026-04-22
+> Flink 版本支持: 1.16 ~ 2.2
 
 ---
 
@@ -146,18 +147,35 @@ FlinkSink<T> (abstract)
 public SinkRuntimeProvider getSinkRuntimeProvider(Context context) {
     // 1. 流式不支持 INSERT OVERWRITE
     if (overwrite && !context.isBounded()) {
-        throw new UnsupportedOperationException("...");
+        throw new UnsupportedOperationException("Paimon doesn't support streaming INSERT OVERWRITE.");
     }
-    // 2. 创建 PaimonDataStreamSinkProvider，Lambda 内构建 FlinkSinkBuilder
+    String name = tableIdentifier.asSummaryString();
+    
+    // 2. FormatTable 特殊处理（日志存储表）
+    if (table instanceof FormatTable) {
+        return new PaimonDataStreamSinkProvider(
+            (dataStream) -> new FlinkFormatTableDataStreamSink(formatTable, overwrite, staticPartitions)
+                    .sinkFrom(dataStream),
+            name, table);
+    }
+    
+    // 3. 创建 PaimonDataStreamSinkProvider，Lambda 内构建 FlinkSinkBuilder
+    Options conf = Options.fromMap(table.options());
     return new PaimonDataStreamSinkProvider(
         (dataStream) -> {
             FlinkSinkBuilder builder = createSinkBuilder();
             builder.forRowData(dataStream);
-            // 3. 可选：Clustering 排序优化（仅批模式 + BUCKET_UNAWARE）
-            builder.clusteringIfPossible(...);
-            // 4. 可选：INSERT OVERWRITE
+            // 4. 可选：Clustering 排序优化（仅批模式 + BUCKET_UNAWARE）
+            if (!conf.get(CLUSTERING_INCREMENTAL) || conf.get(CLUSTERING_INCREMENTAL_OPTIMIZE_WRITE)) {
+                builder.clusteringIfPossible(
+                    conf.get(CLUSTERING_COLUMNS),
+                    conf.get(CLUSTERING_STRATEGY),
+                    conf.get(CLUSTERING_SORT_IN_CLUSTER),
+                    conf.get(CLUSTERING_SAMPLE_FACTOR));
+            }
+            // 5. 可选：INSERT OVERWRITE
             if (overwrite) builder.overwrite(staticPartitions);
-            // 5. 可选：自定义并行度
+            // 6. 可选：自定义并行度
             conf.getOptional(SINK_PARALLELISM).ifPresent(builder::parallelism);
             return builder.build();
         }, name, table);
@@ -175,8 +193,25 @@ public ChangelogMode getChangelogMode(ChangelogMode requestedMode) {
         // 无主键表：接受所有 RowKind
         return requestedMode;
     } else {
+        Options options = Options.fromMap(table.options());
+        
+        // 特殊情况 1: INPUT changelog producer，保留全部 RowKind
+        if (options.get(CHANGELOG_PRODUCER) == ChangelogProducer.INPUT) {
+            return requestedMode;
+        }
+
+        // 特殊情况 2: AGGREGATE merge engine，需要 UPDATE_BEFORE 做撤回
+        if (options.get(MERGE_ENGINE) == MergeEngine.AGGREGATE) {
+            return requestedMode;
+        }
+
+        // 特殊情况 3: PARTIAL_UPDATE + 定义了聚合函数，保留全部 RowKind
+        if (options.get(MERGE_ENGINE) == MergeEngine.PARTIAL_UPDATE
+                && new CoreOptions(options).definedAggFunc()) {
+            return requestedMode;
+        }
+
         // 主键表默认 Upsert 模式：过滤掉 UPDATE_BEFORE
-        // 特殊情况：INPUT changelog producer / AGGREGATE merge engine 保留全部 RowKind
         ChangelogMode.Builder builder = ChangelogMode.newBuilder();
         for (RowKind kind : requestedMode.getContainedKinds()) {
             if (kind != RowKind.UPDATE_BEFORE) {
@@ -199,15 +234,24 @@ public ChangelogMode getChangelogMode(ChangelogMode requestedMode) {
 ```java
 // FlinkSinkBuilder.java:207-243
 public DataStreamSink<?> build() {
-    // Step 1: RowData → InternalRow
-    DataStream<InternalRow> input = mapToInternalRow(this.input, table.rowType(), ...);
+    // Step 1: 自适应并行度冲突处理
+    setParallelismIfAdaptiveConflict();
+    input = trySortInput(input);
+    
+    // Step 2: RowData → InternalRow
+    CatalogContext contextForDescriptor = BlobDescriptorUtils.getCatalogContext(...);
+    DataStream<InternalRow> input = mapToInternalRow(this.input, table.rowType(), contextForDescriptor);
 
-    // Step 2: 可选 LocalMerge 算子（主键表 + local-merge-buffer-size > 0）
+    // Step 3: 可选 LocalMerge 算子（主键表 + local-merge-buffer-size > 0）
     if (table.coreOptions().localMergeEnabled() && table.schema().primaryKeys().size() > 0) {
-        input = input.forward().transform("local merge", ..., new LocalMergeOperator.Factory(...));
+        SingleOutputStreamOperator<InternalRow> newInput =
+            input.forward().transform("local merge", input.getType(), 
+                new LocalMergeOperator.Factory(table.schema()));
+        forwardParallelism(newInput, input);
+        input = newInput;
     }
 
-    // Step 3: 根据 BucketMode 路由到不同 Sink
+    // Step 4: 根据 BucketMode 路由到不同 Sink
     BucketMode bucketMode = table.bucketMode();
     switch (bucketMode) {
         case POSTPONE_MODE:   return buildPostponeBucketSink(input);
@@ -215,6 +259,8 @@ public DataStreamSink<?> build() {
         case HASH_DYNAMIC:    return buildDynamicBucketSink(input, false);
         case KEY_DYNAMIC:     return buildDynamicBucketSink(input, true);
         case BUCKET_UNAWARE:  return buildUnawareBucketSink(input);
+        default:
+            throw new UnsupportedOperationException("Unsupported bucket mode: " + bucketMode);
     }
 }
 ```
@@ -281,17 +327,59 @@ input → INDEX_BOOTSTRAP → shuffle by key hash → cross-partition-bucket-ass
 
 **为什么需要 bootstrap**: 跨分区 upsert 要求知道一个主键之前属于哪个分区+桶，因此必须在启动时加载全量索引。
 
+#### POSTPONE_MODE 模式
+
+```java
+// FlinkSinkBuilder.java:289-315
+private DataStreamSink<?> buildPostponeBucketSink(DataStream<InternalRow> input) {
+    // 流式模式或未启用 postponeBatchWriteFixedBucket：使用 PostponeBucketSink
+    if (isStreaming(input) || !table.coreOptions().postponeBatchWriteFixedBucket()) {
+        ChannelComputer<InternalRow> channelComputer;
+        if (!table.partitionKeys().isEmpty()
+                && table.coreOptions().partitionSinkStrategy() == PartitionSinkStrategy.HASH) {
+            channelComputer = new RowDataHashPartitionChannelComputer(table.schema());
+        } else {
+            channelComputer = new PostponeBucketChannelComputer(table.schema());
+        }
+        DataStream<InternalRow> partitioned = partition(input, channelComputer, parallelism);
+        PostponeBucketSink sink = new PostponeBucketSink(table, overwritePartition);
+        return sink.sinkFrom(partitioned);
+    } else {
+        // 批模式且启用 postponeBatchWriteFixedBucket：使用 PostponeFixedBucketSink
+        // 这种情况下桶数已知，可以提前分配
+        Map<BinaryRow, Integer> knownNumBuckets = PostponeUtils.getKnownNumBuckets(table);
+        DataStream<InternalRow> partitioned =
+                partition(input,
+                    new PostponeFixedBucketChannelComputer(table.schema(), knownNumBuckets),
+                    parallelism);
+
+        FileStoreTable tableForWrite = PostponeUtils.tableForFixBucketWrite(table);
+        PostponeFixedBucketSink sink =
+                new PostponeFixedBucketSink(tableForWrite, overwritePartition, knownNumBuckets);
+        return sink.sinkFrom(partitioned);
+    }
+}
+```
+
+**POSTPONE_MODE 的两种行为**:
+1. **流式或首次批写**: 使用 `PostponeBucketSink`，桶号在 writer 侧动态分配
+2. **已知桶数的批写**: 使用 `PostponeFixedBucketSink`，桶号在 shuffle 时提前分配，性能更优
+
 #### BUCKET_UNAWARE 模式
 
 ```java
 // FlinkSinkBuilder.java:317-332
 private DataStreamSink<?> buildUnawareBucketSink(DataStream<InternalRow> input) {
-    checkArgument(table.primaryKeys().isEmpty(), "Unaware bucket mode only works with append-only table.");
+    checkArgument(
+        table.primaryKeys().isEmpty(),
+        "Unaware bucket mode only works with append-only table for now.");
+
     // 可选：分区表+HASH策略时按分区 hash 分区
     if (!table.partitionKeys().isEmpty()
             && table.coreOptions().partitionSinkStrategy() == PartitionSinkStrategy.HASH) {
         input = partition(input, new RowDataHashPartitionChannelComputer(table.schema()), parallelism);
     }
+
     return new RowAppendTableSink(table, overwritePartition, parallelism).sinkFrom(input);
 }
 ```
@@ -375,14 +463,53 @@ public void processElement(StreamRecord<InternalRow> record) throws Exception {
         }
     }
 }
+
+// prepareSnapshotPreBarrier 中 flush 缓冲区
+public void prepareSnapshotPreBarrier(long checkpointId) throws Exception {
+    if (!endOfInput) {
+        flushBuffer();
+    }
+}
+
+// endInput 时也要 flush
+public void endInput() throws Exception {
+    endOfInput = true;
+    flushBuffer();
+}
 ```
 
 **为什么需要 LocalMerge**: 解决主键数据倾斜问题。在 shuffle 之前先在本地做预合并，减少网络传输量。例如一条记录被连续更新 100 次，LocalMerge 只向下游发送最终值。
 
+**LocalMerger 的两种实现**:
+1. **HashMapLocalMerger**: 用于所有非主键字段都是固定长度的情况（如 INT、LONG、DOUBLE）。使用 HashMap 存储 key→value 映射，内存高效。
+2. **SortBufferLocalMerger**: 用于存在变长字段（如 STRING、ARRAY）的情况。使用排序缓冲区，支持溢写到磁盘。
+
+**LocalMerger 的选择逻辑**:
+
+```java
+// LocalMergeOperator.java:108-145
+boolean canHashMerger = true;
+for (DataField field : valueType.getFields()) {
+    if (primaryKeys.contains(field.name())) {
+        continue;  // 跳过主键字段
+    }
+    if (!BinaryRow.isInFixedLengthPart(field.type())) {
+        canHashMerger = false;  // 存在变长字段，不能用 HashMap
+        break;
+    }
+}
+
+if (canHashMerger) {
+    merger = new HashMapLocalMerger(...);
+} else {
+    merger = new SortBufferLocalMerger(...);
+}
+```
+
 **好处**:
 1. 显著减少 shuffle 数据量，降低网络开销
 2. 减轻下游 writer 的写放大
-3. 支持两种 LocalMerger 实现：`HashMapLocalMerger`（固定长度值字段）和 `SortBufferLocalMerger`（变长字段），自动选择
+3. 自动选择最优的 merger 实现
 
 ### 4.4 FlinkStreamPartitioner 数据分区
 
@@ -423,6 +550,67 @@ StoreSinkWrite.createWriteProvider()
     └── 默认 ──→ StoreSinkWriteImpl
 ```
 
+**源码逻辑**:
+
+```java
+// StoreSinkWrite.java:100-187
+static StoreSinkWrite.Provider createWriteProvider(
+        FileStoreTable fileStoreTable,
+        CheckpointConfig checkpointConfig,
+        boolean isStreaming,
+        boolean ignorePreviousFiles,
+        boolean hasSinkMaterializer) {
+    
+    Options options = fileStoreTable.coreOptions().toConfiguration();
+    CoreOptions.ChangelogProducer changelogProducer = fileStoreTable.coreOptions().changelogProducer();
+    boolean waitCompaction;
+    CoreOptions coreOptions = fileStoreTable.coreOptions();
+    
+    if (coreOptions.writeOnly()) {
+        waitCompaction = false;
+    } else {
+        waitCompaction = coreOptions.prepareCommitWaitCompaction();
+        int deltaCommits = -1;
+        
+        // 检查 full-compaction.delta-commits 或 changelog-producer-full-compaction-trigger-interval
+        if (options.contains(FULL_COMPACTION_DELTA_COMMITS)) {
+            deltaCommits = options.get(FULL_COMPACTION_DELTA_COMMITS);
+        } else if (options.contains(CHANGELOG_PRODUCER_FULL_COMPACTION_TRIGGER_INTERVAL)) {
+            long fullCompactionThresholdMs = options.get(CHANGELOG_PRODUCER_FULL_COMPACTION_TRIGGER_INTERVAL).toMillis();
+            deltaCommits = (int)(fullCompactionThresholdMs / checkpointConfig.getCheckpointInterval());
+        }
+
+        // 如果配置了 FULL_COMPACTION 或 deltaCommits >= 0，使用 GlobalFullCompactionSinkWrite
+        if (changelogProducer == CoreOptions.ChangelogProducer.FULL_COMPACTION || deltaCommits >= 0) {
+            int finalDeltaCommits = Math.max(deltaCommits, 1);
+            return (table, commitUser, state, ioManager, memoryPoolFactory, metricGroup) -> {
+                assertNoSinkMaterializer.run();
+                return new GlobalFullCompactionSinkWrite(
+                        table, commitUser, state, ioManager, ignorePreviousFiles,
+                        waitCompaction, finalDeltaCommits, isStreaming, memoryPoolFactory, metricGroup);
+            };
+        }
+
+        // 如果需要 Lookup changelog producer，使用 LookupSinkWrite
+        if (coreOptions.needLookup()) {
+            return (table, commitUser, state, ioManager, memoryPoolFactory, metricGroup) -> {
+                assertNoSinkMaterializer.run();
+                return new LookupSinkWrite(
+                        table, commitUser, state, ioManager, ignorePreviousFiles,
+                        waitCompaction, isStreaming, memoryPoolFactory, metricGroup);
+            };
+        }
+    }
+
+    // 默认使用 StoreSinkWriteImpl
+    return (table, commitUser, state, ioManager, memoryPoolFactory, metricGroup) -> {
+        assertNoSinkMaterializer.run();
+        return new StoreSinkWriteImpl(
+                table, commitUser, state, ioManager, ignorePreviousFiles,
+                waitCompaction, isStreaming, memoryPoolFactory, metricGroup);
+    };
+}
+
 ### 5.2 三种 StoreSinkWrite 实现对比
 
 | 特性 | StoreSinkWriteImpl | GlobalFullCompactionSinkWrite | LookupSinkWrite |
@@ -439,22 +627,28 @@ StoreSinkWrite.createWriteProvider()
 
 ```java
 // GlobalFullCompactionSinkWrite.java:149-184
-public List<Committable> prepareCommit(boolean waitCompaction, long checkpointId) {
-    checkSuccessfulFullCompaction();
+public List<Committable> prepareCommit(boolean waitCompaction, long checkpointId)
+        throws IOException {
+    checkSuccessfulFullCompaction();  // 检查之前的 full compaction 是否成功
+    
     // 记录本 checkpoint 期间修改的 bucket
     if (!currentWrittenBuckets.isEmpty()) {
         writtenBuckets.computeIfAbsent(checkpointId, k -> new HashSet<>())
                       .addAll(currentWrittenBuckets);
         currentWrittenBuckets.clear();
     }
+    
     // 判断是否到达 full compaction 触发点
+    // isFullCompactedIdentifier 检查 checkpointId 是否是 deltaCommits 的倍数
     if (!writtenBuckets.isEmpty() && isFullCompactedIdentifier(checkpointId, deltaCommits)) {
         waitCompaction = true;
     }
+    
     if (waitCompaction) {
         submitFullCompaction(checkpointId);  // 对所有 writtenBuckets 提交 full compaction
         commitIdentifiersToCheck.add(checkpointId);
     }
+    
     return super.prepareCommit(waitCompaction, checkpointId);
 }
 ```
@@ -684,6 +878,12 @@ private void emitCommittables(boolean waitCompaction, long checkpointId) throws 
     prepareCommit(waitCompaction, checkpointId)
         .forEach(committable -> output.collect(new StreamRecord<>(committable)));
 }
+
+// endInput 时也要 emit committables，但 waitCompaction=true
+public void endInput() throws Exception {
+    endOfInput = true;
+    emitCommittables(true, Long.MAX_VALUE);
+}
 ```
 
 **为什么在 `prepareSnapshotPreBarrier` 中 emit**: 这保证了所有数据文件在 checkpoint barrier 到达 Committer 之前已经准备好。Barrier 对齐机制确保了一致性。
@@ -704,19 +904,28 @@ public List<Committable> prepareCommit(boolean waitCompaction, long checkpointId
 #### Step 3: CommitterOperator 接收并提交
 
 ```java
-// CommitterOperator.java:190-193
+// CommitterOperator.java:190-218
 public void notifyCheckpointComplete(long checkpointId) throws Exception {
     super.notifyCheckpointComplete(checkpointId);
     commitUpToCheckpoint(endInput ? END_INPUT_CHECKPOINT_ID : checkpointId);
 }
 
-// CommitterOperator.java:195-218
 private void commitUpToCheckpoint(long checkpointId) throws Exception {
     NavigableMap<Long, GlobalCommitT> headMap =
         committablesPerCheckpoint.headMap(checkpointId, true);
     List<GlobalCommitT> committables = committables(headMap);
-    // ...
-    committer.commit(committables);  // → StoreCommitter.commit()
+    
+    if (committables.isEmpty() && committer.forceCreatingSnapshot()) {
+        committables = Collections.singletonList(
+            toCommittables(checkpointId, Collections.emptyList()));
+    }
+
+    if (checkpointId == END_INPUT_CHECKPOINT_ID) {
+        // 批作业重启后可能再次 endInput，需要检查 snapshot 是否已存在
+        committer.filterAndCommit(committables, false, true);
+    } else {
+        committer.commit(committables);
+    }
     headMap.clear();
 }
 ```
@@ -753,18 +962,90 @@ CommitMessageImpl {
 }
 ```
 
-### 7.4 FileStoreCommitImpl 的原子提交
+### 7.5 事务性保证机制
 
-**源码路径**: `paimon-core/src/main/java/org/apache/paimon/operation/FileStoreCommitImpl.java`
+Paimon Flink Sink 通过以下机制保证 Exactly-Once 语义：
 
-提交流程概述：
-1. **冲突检查**: 检查要删除的文件是否仍然存在，新文件的 key 范围是否与已有文件冲突
-2. **写入 Manifest**: 将 `ManifestEntry` 写入 `ManifestFile`，汇总为 `ManifestFileMeta`
-3. **写入 ManifestList**: 将新旧 `ManifestFileMeta` 汇总写入 `ManifestList`
-4. **写入 Snapshot**: 原子性地创建新的 Snapshot 文件（通过文件系统的 atomic rename 或外部 `SnapshotCommit`）
-5. **重试机制**: 如果冲突失败，从最新 snapshot 重新扫描并重试
+#### 1. Checkpoint 模式强制检查
 
-**为什么 Committer 必须单并行度**: Snapshot 的创建需要全局有序——每个 snapshot ID 严格递增，只有单点才能保证这一点。
+```java
+// FlinkSink.java
+env.getCheckpointConfig().getCheckpointingMode() == CheckpointingMode.EXACTLY_ONCE,
+"Paimon sink currently only supports EXACTLY_ONCE checkpoint mode. Please set "
++ "execution.checkpointing.mode to exactly-once");
+```
+
+**为什么强制 EXACTLY_ONCE**: Paimon 的原子提交依赖于 Flink 的 checkpoint 协议。AT_LEAST_ONCE 模式下，同一个 checkpoint 可能被提交多次，导致重复数据。
+
+#### 2. CommitUser 机制
+
+```java
+// CommitterOperator.java:126-131
+commitUser = StateUtils.getSingleValueFromState(
+    context, "commit_user_state", String.class, initialCommitUser);
+```
+
+**CommitUser 的作用**:
+- 每个 Flink 作业有唯一的 commitUser（基于作业启动时间或用户指定）
+- 作业重启后从状态恢复 commitUser，保证一致性
+- Snapshot 中记录 commitUser，用于幂等性检查
+
+#### 3. Snapshot 幂等性检查
+
+```java
+// CommitterOperator.java:205-213
+if (checkpointId == END_INPUT_CHECKPOINT_ID) {
+    // 批作业重启后可能再次 endInput，需要检查 snapshot 是否已存在
+    committer.filterAndCommit(committables, false, true);
+} else {
+    committer.commit(committables);
+}
+```
+
+**幂等性检查流程**:
+1. 批作业 endInput 时，检查对应的 snapshot 是否已存在
+2. 如果存在，跳过重复提交
+3. 如果不存在，正常提交
+
+#### 4. Barrier 对齐保证
+
+```
+Writer 侧                          Committer 侧
+    │                                  │
+    │ prepareSnapshotPreBarrier        │
+    │ (flush 所有数据文件)              │
+    │                                  │
+    │ ─────── Barrier ─────────────>   │
+    │                                  │
+    │ snapshotState()                  │
+    │ (保存状态)                        │
+    │                                  │
+    │ notifyCheckpointComplete         │
+    │ ─────────────────────────────>   │
+    │                                  │
+    │                          commit() │
+    │                          (原子提交) │
+```
+
+**Barrier 对齐的意义**:
+- 所有 Writer 的数据文件在 Barrier 到达 Committer 前已准备好
+- Committer 收到 Barrier 后，所有数据文件已稳定，可以安全提交
+- 即使 Committer 失败，重启后可以从状态恢复并重新提交（幂等）
+
+#### 5. 文件冲突检查
+
+```java
+// FileStoreCommitImpl.java
+// 提交前检查：
+// 1. 要删除的文件是否仍然存在
+// 2. 新文件的 key 范围是否与已有文件冲突
+// 3. 如果冲突，从最新 snapshot 重新扫描并重试
+```
+
+**冲突检查的必要性**:
+- 多个 Writer 可能同时写入同一 partition+bucket
+- 冲突检查确保不会覆盖其他 Writer 的数据
+- 重试机制保证最终一致性
 
 ---
 
@@ -1082,6 +1363,11 @@ notifyCheckpointComplete(cpId)
   → StoreCommitter.commit()
 ```
 
+**流式模式的 streamingCheckpointEnabled 标志**:
+- 当 Flink 启用了 checkpoint 时，`streamingCheckpointEnabled=true`
+- 此时 CommitterOperator 在 `notifyCheckpointComplete` 时提交
+- 如果 checkpoint 禁用，则在 `endInput` 时提交
+
 #### 批式提交
 
 ```
@@ -1226,6 +1512,8 @@ RowData
 ---
 
 ## 附录 A: 核心源码文件索引
+
+**注**: 以下源码路径基于 `paimon-flink-common` 模块。对于特定 Flink 版本（1.16-2.2），相应的版本特定模块（如 `paimon-flink-1.16`、`paimon-flink-2.0` 等）会继承这些类并进行版本适配。
 
 | 文件 | 路径 | 职责 |
 |---|---|---|

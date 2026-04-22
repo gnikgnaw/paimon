@@ -1383,9 +1383,9 @@ Flink 的 `TableChange` 到 Paimon 的 `SchemaChange` 的完整映射：
 | `AddColumn` | `SchemaChange.addColumn` | 只处理物理列；转换 Move |
 | `DropColumn` | `SchemaChange.dropColumn` | 跳过非物理列 |
 | `ModifyColumnName` | `SchemaChange.renameColumn` | 跳过非物理列 |
-| `ModifyPhysicalColumnType` | 嵌套更新 | 调用 `generateNestedColumnUpdates` |
-| `ModifyColumnPosition` | `SchemaChange.updateColumnPosition` | 跳过非物理列 |
-| `ModifyColumnComment` | `SchemaChange.updateColumnComment` | 跳过非物理列 |
+| `ModifyPhysicalColumnType` | 嵌套更新 | 调用 `NestedSchemaUtils.generateNestedColumnUpdates`，最终生成 `updateColumnType(keepNullability=false)` |
+| `ModifyColumnPosition` | `SchemaChange.updateColumnPosition` | 跳过非物理列；不支持嵌套路径 |
+| `ModifyColumnComment` | `SchemaChange.updateColumnComment` | 跳过非物理列；不支持嵌套路径 |
 | `SetOption` | `SchemaChange.setOption` / `updateComment` | COMMENT_PROP 特殊处理 |
 | `ResetOption` | `SchemaChange.removeOption` / `updateComment(null)` | COMMENT_PROP 特殊处理 |
 | `AddWatermark` | `SchemaChange.setOption` (多个) | 水印存储在 options 中 |
@@ -1439,19 +1439,19 @@ Spark 的实现比 Flink 简洁，因为 Spark 没有非物理列的概念。
 | `AddColumn` | `SchemaChange.addColumn` | 校验无默认值；支持嵌套路径 |
 | `RenameColumn` | `SchemaChange.renameColumn` | 支持嵌套路径 |
 | `DeleteColumn` | `SchemaChange.dropColumn` | 支持嵌套路径 |
-| `UpdateColumnType` | `SchemaChange.updateColumnType` | **keepNullability=true** |
-| `UpdateColumnNullability` | `SchemaChange.updateColumnNullability` | - |
+| `UpdateColumnType` | `SchemaChange.updateColumnType` | **keepNullability=true**；支持嵌套路径 |
+| `UpdateColumnNullability` | `SchemaChange.updateColumnNullability` | 支持嵌套路径 |
 | `UpdateColumnComment` | `SchemaChange.updateColumnComment` | 支持嵌套路径 |
-| `UpdateColumnPosition` | `SchemaChange.updateColumnPosition` | 仅支持 FIRST/AFTER |
-| `UpdateColumnDefaultValue` | `SchemaChange.updateColumnDefaultValue` | Spark 3.4+ |
+| `UpdateColumnPosition` | `SchemaChange.updateColumnPosition` | 仅支持 FIRST/AFTER；不支持嵌套路径 |
+| `UpdateColumnDefaultValue` | `SchemaChange.updateColumnDefaultValue` | Spark 3.4+；支持嵌套路径 |
 
 ### 13.3 Flink 与 Spark 实现差异对比
 
 | 特性 | Flink | Spark |
 |------|-------|-------|
 | 非物理列支持 | 有（watermark、computed column） | 无 |
-| 嵌套列变更入口 | `generateNestedColumnUpdates` | 直接传递嵌套路径 |
-| 类型更新 keepNullability | **false**（会改变 nullability） | **true**（保持原 nullability） |
+| 嵌套列变更入口 | `NestedSchemaUtils.generateNestedColumnUpdates` | 直接传递嵌套路径 |
+| 类型更新 keepNullability | **false**（通过 `handlePrimitiveTypeUpdate` 生成） | **true**（保持原 nullability） |
 | Move 类型 | FIRST, AFTER | FIRST, AFTER |
 | BEFORE/LAST Move | 不支持 | 不支持 |
 | 主键删除 | 通过 DropConstraint | 不支持 |

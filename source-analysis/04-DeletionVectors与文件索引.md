@@ -187,7 +187,7 @@ public class BitmapDeletionVector implements DeletionVector {
 
 序列化格式 (`serializeTo` 方法, L87-L101):
 1. 先将 `Magic Number + Bitmap 数据` 写入临时缓冲区
-2. 写入缓冲区长度 (4 字节 int)
+2. 写入缓冲区长度 (4 字节 int) -- **返回值是 Magic+Bitmap 的长度，不含 Length 和 CRC 字段**
 3. 写入缓冲区内容
 4. 写入 CRC32 校验和 (4 字节 int)
 
