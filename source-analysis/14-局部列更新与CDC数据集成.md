@@ -6,6 +6,11 @@
 
 ## 目录
 
+- [0. 快速理解：Partial Update 解决什么问题](#0-快速理解partial-update-解决什么问题)
+  - [0.1 核心问题与解决方案](#01-核心问题与解决方案)
+  - [0.2 使用时的常见陷阱](#02-使用时的常见陷阱)
+  - [0.3 聚合函数详解](#03-聚合函数详解)
+  - [0.4 设计理念：业务能力下沉到存储层](#04-设计理念业务能力下沉到存储层)
 - [1. 局部列更新 (Partial Update) 深度分析](#1-局部列更新-partial-update-深度分析)
   - [1.1 整体架构与核心类](#11-整体架构与核心类)
   - [1.2 无 Sequence Group 时的 updateNonNullFields 逻辑](#12-无-sequence-group-时的-updatenonnullfields-逻辑)
@@ -49,6 +54,570 @@
   - [7.2 Aggregation 建表和使用示例](#72-aggregation-建表和使用示例)
   - [7.3 MySQL CDC 同步到 Paimon 的完整配置](#73-mysql-cdc-同步到-paimon-的完整配置)
   - [7.4 跨分区更新的配置和注意事项](#74-跨分区更新的配置和注意事项)
+
+---
+
+## 0. 快速理解：Partial Update 解决什么问题
+
+### 0.1 核心问题与解决方案
+
+#### 问题：多源数据更新冲突
+
+在实际业务中，同一行数据的不同列往往来自不同数据源或不同时间点的更新。例如订单系统中：
+- 创建时只有基本信息
+- 支付时更新支付信息  
+- 发货时更新物流信息
+
+如果使用传统的全量覆盖方式，后到的更新会把先到的字段覆盖为 null，导致数据丢失。
+
+#### 解决方案的价值
+
+**1. 避免字段丢失**
+
+每次只更新非空字段，空字段保留旧值，不同数据源可以安全地更新各自负责的列。
+
+```sql
+-- 第一次写入：来自注册系统
+INSERT INTO user_profile VALUES (1, 'Alice', 'alice@example.com', NULL, NULL);
+-- 结果: (1, 'Alice', 'alice@example.com', NULL, NULL)
+
+-- 第二次写入：来自手机绑定系统
+INSERT INTO user_profile VALUES (1, NULL, NULL, '13800138000', NULL);
+-- 结果: (1, 'Alice', 'alice@example.com', '13800138000', NULL)  ← name 和 email 保留
+```
+
+**2. 简化 ETL 逻辑**
+
+无需在上游进行全量数据合并，各个数据源可以独立发送部分字段的更新。
+
+**3. 字段级版本控制**
+
+通过 Sequence Group 机制，不同字段组可以有独立的序列号，实现字段级别的乱序容忍。
+
+```sql
+CREATE TABLE order_info (
+    order_id BIGINT PRIMARY KEY NOT ENFORCED,
+    order_status STRING,
+    payment_amount DECIMAL(10,2),
+    payment_ts BIGINT,
+    shipping_address STRING,
+    tracking_no STRING,
+    shipping_ts BIGINT
+) WITH (
+    'merge-engine' = 'partial-update',
+    'fields.payment_ts.sequence-group' = 'order_status,payment_amount',
+    'fields.shipping_ts.sequence-group' = 'shipping_address,tracking_no'
+);
+
+-- 支付系统更新（payment_ts=100）
+INSERT INTO order_info VALUES (1, 'PAID', 99.00, 100, NULL, NULL, NULL);
+
+-- 物流系统更新（shipping_ts=200）
+INSERT INTO order_info VALUES (1, NULL, NULL, NULL, 'Beijing', 'SF001', 200);
+
+-- 支付系统乱序更新（payment_ts=50，比现有的100小，被忽略）
+INSERT INTO order_info VALUES (1, 'PENDING', 0.00, 50, NULL, NULL, NULL);
+-- 结果: 支付信息未变，因为序列号更小
+```
+
+### 0.2 使用时的常见陷阱
+
+#### 陷阱 1: 删除记录处理必须配置 ⚠️
+
+**问题**: 如果不配置删除策略，收到 DELETE 记录会直接抛异常。
+
+**解决**: 必须选择以下三种模式之一：
+
+```sql
+-- 模式1: 忽略删除记录
+'ignore-delete' = 'true'
+
+-- 模式2: DELETE 记录删除整行
+'partial-update.remove-record-on-delete' = 'true'
+
+-- 模式3: 指定序列组的 DELETE 才删除整行
+'partial-update.remove-record-on-sequence-group' = 'seq_field1,seq_field2'
+```
+
+**互斥限制**:
+- `ignore-delete` 和 `remove-record-on-delete` 不能同时启用
+- `remove-record-on-delete` 和 `sequence-group` 不能同时使用
+
+#### 陷阱 2: 聚合函数必须配合 Sequence Group ⚠️
+
+**问题**: 除了 `last_non_null_value` 外，其他聚合函数如果不配合 Sequence Group 使用会报错。
+
+```sql
+-- ❌ 错误：sum 没有 sequence group 保护
+'fields.amount.aggregate-function' = 'sum'
+
+-- ✅ 正确：必须配置 sequence group
+'fields.update_ts.sequence-group' = 'amount',
+'fields.amount.aggregate-function' = 'sum'
+```
+
+**原因**: 乱序数据到达时，没有版本控制的聚合操作可能导致重复计算。
+
+#### 陷阱 3: NOT NULL 字段的陷阱 ⚠️
+
+**问题**: 如果字段定义为 NOT NULL，但输入记录中该字段为 null，会抛异常。
+
+```sql
+CREATE TABLE t (
+    id BIGINT PRIMARY KEY NOT ENFORCED,
+    name STRING NOT NULL  -- 危险！
+) WITH ('merge-engine' = 'partial-update');
+
+-- 这条记录会报错，因为 name 为 null
+INSERT INTO t VALUES (1, NULL);
+```
+
+**建议**: Partial Update 场景下，非主键字段尽量设为 nullable。
+
+#### 陷阱 4: Schema 演进的限制 ⚠️
+
+**问题**: 已有数据的表添加新列时，新列必须是 nullable。
+
+```sql
+-- ❌ 错误：已有数据的表不能添加 NOT NULL 列
+ALTER TABLE t ADD COLUMN age INT NOT NULL;
+
+-- ✅ 正确：新列必须允许为空
+ALTER TABLE t ADD COLUMN age INT;
+```
+
+**原因**: 旧数据文件中不包含新列，读取时自动填充 null。
+
+#### 陷阱 5: 无 Sequence Group 时的乱序问题 ⚠️
+
+**问题**: 不配置 Sequence Group 时，依赖全局 sequenceNumber 排序，无法处理字段级别的乱序。
+
+**建议**: 多源更新场景务必配置 Sequence Group。
+
+#### 陷阱 6: 跨分区更新的限制 ⚠️
+
+如果使用分区表 + 跨分区更新：
+
+```sql
+'cross-partition-upsert.enabled' = 'true'
+```
+
+**必须满足**:
+- 必须使用动态 bucket: `'bucket' = '-1'`
+- 只能单写入：不能有多个 Flink 作业同时写入
+- Partial Update 引擎下，跨分区更新会写入旧分区（不迁移），保持聚合状态
+
+#### 陷阱 7: CDC 同步的类型映射 ⚠️
+
+**问题**: MySQL 的 NOT NULL 列同步到 Paimon 后，如果保持 NOT NULL，后续 schema 演进可能报错。
+
+**建议**: 使用 `--type-mapping to-nullable` 将所有列转为 nullable。
+
+```bash
+mysql_sync_table \
+    --type-mapping to-nullable \
+    --table-conf merge-engine=partial-update
+```
+
+#### 陷阱 8: Sequence Group 字段全为 null 的行为 ⚠️
+
+**问题**: 如果某个 Sequence Group 的所有序列号字段都为 null，该 group 的所有字段会被跳过（不更新）。
+
+```sql
+'fields.update_ts.sequence-group' = 'name,age'
+
+-- update_ts 为 null，name 和 age 都不会更新
+INSERT INTO t VALUES (1, 'Bob', 30, NULL);
+```
+
+**建议**: 确保序列号字段始终有值，或者理解这个跳过逻辑。
+
+### 0.3 聚合函数详解
+
+#### 什么是聚合函数？
+
+聚合函数是指对同一主键的多条记录进行**累积计算**的函数，而不是简单的覆盖。
+
+#### 基本概念对比
+
+**不使用聚合函数（默认 Partial Update）**
+
+```sql
+CREATE TABLE user_info (
+    user_id BIGINT PRIMARY KEY NOT ENFORCED,
+    name STRING,
+    login_count BIGINT
+) WITH ('merge-engine' = 'partial-update');
+
+-- 第一次写入
+INSERT INTO user_info VALUES (1, 'Alice', 5);
+-- 结果: (1, 'Alice', 5)
+
+-- 第二次写入
+INSERT INTO user_info VALUES (1, NULL, 3);
+-- 结果: (1, 'Alice', 3)  ← login_count 被覆盖为 3
+```
+
+**使用聚合函数（累积计算）**
+
+```sql
+CREATE TABLE user_info (
+    user_id BIGINT PRIMARY KEY NOT ENFORCED,
+    name STRING,
+    login_count BIGINT,
+    update_ts BIGINT
+) WITH (
+    'merge-engine' = 'partial-update',
+    'fields.update_ts.sequence-group' = 'name,login_count',
+    'fields.login_count.aggregate-function' = 'sum'  -- 聚合函数
+);
+
+-- 第一次写入
+INSERT INTO user_info VALUES (1, 'Alice', 5, 100);
+-- 结果: (1, 'Alice', 5, 100)
+
+-- 第二次写入
+INSERT INTO user_info VALUES (1, NULL, 3, 200);
+-- 结果: (1, 'Alice', 8, 200)  ← login_count 累加：5 + 3 = 8
+```
+
+#### 常用聚合函数
+
+**1. 数值累积类**
+
+```sql
+-- sum: 求和
+'fields.amount.aggregate-function' = 'sum'
+-- 100 + 50 = 150
+
+-- count: 计数
+'fields.visit_count.aggregate-function' = 'count'
+-- 5 + 3 = 8
+
+-- product: 累乘
+'fields.multiplier.aggregate-function' = 'product'
+-- 2 * 3 = 6
+```
+
+**2. 极值类**
+
+```sql
+-- max: 取最大值
+'fields.max_score.aggregate-function' = 'max'
+-- max(80, 95) = 95
+
+-- min: 取最小值
+'fields.min_price.aggregate-function' = 'min'
+-- min(100, 80) = 80
+```
+
+**3. 取值类**
+
+```sql
+-- last_value: 取最后一个值（包括 null）
+'fields.status.aggregate-function' = 'last_value'
+
+-- last_non_null_value: 取最后一个非空值
+'fields.address.aggregate-function' = 'last_non_null_value'
+
+-- first_value: 取第一个值
+'fields.create_time.aggregate-function' = 'first_value'
+```
+
+**4. 集合类**
+
+```sql
+-- collect: 收集到数组
+'fields.tags.aggregate-function' = 'collect'
+-- ['tag1'] + ['tag2'] = ['tag1', 'tag2']
+
+-- merge_map: 合并 MAP
+'fields.attributes.aggregate-function' = 'merge_map'
+-- {a:1} + {b:2} = {a:1, b:2}
+
+-- listagg: 字符串拼接
+'fields.comments.aggregate-function' = 'listagg'
+-- 'hello' + 'world' = 'hello,world'
+```
+
+**5. 近似计算类**
+
+```sql
+-- roaring_bitmap (rbm32/rbm64): 用户去重
+'fields.unique_users.aggregate-function' = 'rbm32'
+
+-- hll_sketch: 基数估计
+'fields.distinct_count.aggregate-function' = 'hll_sketch'
+```
+
+#### 实际业务场景
+
+**场景 1: 用户行为统计**
+
+```sql
+CREATE TABLE user_behavior (
+    user_id BIGINT PRIMARY KEY NOT ENFORCED,
+    latest_action STRING,           -- 最新行为（覆盖）
+    action_count BIGINT,            -- 行为次数（累加）
+    total_amount DECIMAL(10,2),     -- 总金额（累加）
+    max_single_amount DECIMAL(10,2), -- 最大单笔（取最大）
+    action_ts BIGINT
+) WITH (
+    'merge-engine' = 'partial-update',
+    'fields.action_ts.sequence-group' = 'latest_action,action_count,total_amount,max_single_amount',
+    'fields.action_count.aggregate-function' = 'sum',
+    'fields.total_amount.aggregate-function' = 'sum',
+    'fields.max_single_amount.aggregate-function' = 'max'
+);
+```
+
+**场景 2: 订单多源更新**
+
+```sql
+CREATE TABLE order_info (
+    order_id BIGINT PRIMARY KEY NOT ENFORCED,
+    -- 订单基础信息（覆盖更新）
+    order_status STRING,
+    create_ts BIGINT,
+    -- 支付信息（累加金额）
+    payment_amount DECIMAL(10,2),
+    payment_count INT,
+    payment_ts BIGINT,
+    -- 物流信息（覆盖更新）
+    tracking_no STRING,
+    shipping_ts BIGINT
+) WITH (
+    'merge-engine' = 'partial-update',
+    'fields.create_ts.sequence-group' = 'order_status',
+    'fields.payment_ts.sequence-group' = 'payment_amount,payment_count',
+    'fields.shipping_ts.sequence-group' = 'tracking_no',
+    'fields.payment_amount.aggregate-function' = 'sum',  -- 支持部分退款累加
+    'fields.payment_count.aggregate-function' = 'sum'
+);
+```
+
+#### 关键点
+
+**1. 聚合函数 ≠ Aggregation 引擎**
+- Partial Update 可以混用聚合函数（部分字段聚合，部分字段覆盖）
+- Aggregation 引擎要求所有非主键字段都必须配置聚合函数
+
+**2. 必须配合 Sequence Group**
+
+除了 `last_non_null_value`，其他聚合函数都需要 Sequence Group 提供版本控制。
+
+**3. 支持 Retract**
+
+部分聚合函数支持撤回操作（处理 DELETE/UPDATE_BEFORE 记录）：
+- sum: 减法撤回
+- collect: 移除元素
+- merge_map: 删除 key
+- max/min: 不支持撤回
+
+### 0.4 设计理念：业务能力下沉到存储层
+
+Paimon 的核心设计理念是：**将传统上需要在业务层、ETL 层或计算层做的数据处理逻辑，下沉到存储层在写入时完成**。
+
+#### 传统方案 vs Paimon 方案
+
+**传统方案：业务层处理**
+
+```
+┌─────────────┐
+│ 支付系统     │ ──┐
+├─────────────┤   │
+│ 物流系统     │ ──┼──> ┌──────────────┐      ┌──────────┐
+├─────────────┤   │    │ ETL/Flink    │      │  数据湖   │
+│ 用户系统     │ ──┘    │ 1. 多源 JOIN  │ ───> │ (覆盖写) │
+└─────────────┘        │ 2. 聚合计算   │      └──────────┘
+                       │ 3. 去重逻辑   │
+                       │ 4. 乱序处理   │
+                       └──────────────┘
+                       复杂、易出错、资源消耗大
+```
+
+**Paimon 方案：存储层处理**
+
+```
+┌─────────────┐
+│ 支付系统     │ ──┐
+├─────────────┤   │
+│ 物流系统     │ ──┼──> ┌──────────────────────────┐
+├─────────────┤   │    │      Paimon              │
+│ 用户系统     │ ──┘    │ 写入时自动：              │
+└─────────────┘        │ • Partial Update 合并    │
+                       │ • 聚合计算 (sum/max)     │
+                       │ • 去重 (deduplicate)     │
+                       │ • 乱序处理 (seq group)   │
+                       └──────────────────────────┘
+                       简单、高效、声明式配置
+```
+
+#### Paimon 下沉的业务能力
+
+**1. 多源数据合并（Partial Update）**
+
+传统方案：
+```sql
+-- 需要在 Flink 中写复杂的 JOIN 逻辑
+SELECT 
+    COALESCE(payment.user_id, shipping.user_id) as user_id,
+    COALESCE(payment.amount, old.amount) as amount,
+    COALESCE(shipping.address, old.address) as address
+FROM payment 
+FULL OUTER JOIN shipping ON payment.user_id = shipping.user_id
+LEFT JOIN old_data old ON ...
+```
+
+Paimon 方案：
+```sql
+-- 只需声明式配置，写入时自动合并
+CREATE TABLE user_info (...) WITH (
+    'merge-engine' = 'partial-update'
+);
+-- 各系统直接写入，Paimon 自动合并非空字段
+```
+
+**2. 实时聚合（Aggregation）**
+
+传统方案：
+```sql
+-- 需要维护状态，处理乱序
+SELECT user_id, 
+       SUM(amount) as total_amount,
+       COUNT(*) as order_count
+FROM orders
+GROUP BY user_id;
+```
+
+Paimon 方案：
+```sql
+CREATE TABLE user_stats (...) WITH (
+    'merge-engine' = 'partial-update',
+    'fields.total_amount.aggregate-function' = 'sum',
+    'fields.order_count.aggregate-function' = 'sum'
+);
+-- 直接写入增量，Paimon 自动累加
+```
+
+**3. 去重（Deduplicate）**
+
+传统方案：
+```sql
+-- 需要维护去重状态
+SELECT DISTINCT ON (order_id) *
+FROM orders
+ORDER BY order_id, update_time DESC;
+```
+
+Paimon 方案：
+```sql
+CREATE TABLE orders (...) WITH (
+    'merge-engine' = 'deduplicate'
+);
+-- 相同主键自动保留最新记录
+```
+
+**4. 乱序处理（Sequence Group）**
+
+传统方案：
+```java
+// 需要在代码中维护 watermark 和状态
+stream
+    .keyBy(...)
+    .window(...)
+    .allowedLateness(Time.minutes(5))
+    .process(new ComplexProcessFunction());
+```
+
+Paimon 方案：
+```sql
+CREATE TABLE orders (...) WITH (
+    'fields.payment_ts.sequence-group' = 'payment_amount',
+    'fields.shipping_ts.sequence-group' = 'tracking_no'
+);
+-- 不同字段组独立的版本控制，自动处理乱序
+```
+
+**5. 跨分区更新**
+
+传统方案：
+```sql
+-- 需要手动删除旧分区记录，插入新分区记录
+DELETE FROM orders WHERE order_id = 123 AND dt = '2024-01-01';
+INSERT INTO orders VALUES (123, ..., '2024-01-02');
+```
+
+Paimon 方案：
+```sql
+CREATE TABLE orders (...) PARTITIONED BY (dt) WITH (
+    'bucket' = '-1'  -- 启用动态 bucket，自动支持跨分区更新
+);
+-- 直接写入，Paimon 自动处理分区迁移
+```
+
+**6. CDC 数据集成**
+
+传统方案：
+```java
+// 需要解析 binlog，处理 schema 变更，类型转换
+MySqlSource -> Custom Parser -> Schema Evolution Logic -> Sink
+```
+
+Paimon 方案：
+```bash
+# 一行命令完成 MySQL 到 Paimon 的同步
+mysql_sync_database \
+    --warehouse hdfs:///paimon \
+    --database target_db \
+    --mysql-conf hostname=mysql-host
+# 自动处理 schema 演进、类型映射、分库分表合并
+```
+
+#### 这样设计的好处
+
+**1. 简化架构**
+```
+传统：数据源 → Flink 复杂处理 → 数据湖
+Paimon：数据源 → Paimon（内置处理）
+```
+
+**2. 降低延迟**
+- 不需要等待批处理窗口
+- 写入即完成合并/聚合
+- 读取直接获得最终结果
+
+**3. 减少资源消耗**
+- 不需要维护大量 Flink 状态
+- 不需要复杂的 JOIN 操作
+- 存储层天然支持，无额外计算开销
+
+**4. 声明式配置**
+```sql
+-- 不需要写代码，只需要配置
+'merge-engine' = 'partial-update',
+'fields.amount.aggregate-function' = 'sum'
+```
+
+**5. 数据一致性保证**
+- LSM-tree 保证原子性
+- Snapshot 机制保证一致性读
+- 不需要业务层处理并发冲突
+
+#### 代价和限制
+
+当然，这种设计也有代价：
+
+1. **灵活性降低**：只能使用 Paimon 提供的合并策略，无法实现任意复杂逻辑
+2. **学习成本**：需要理解 merge-engine、sequence-group 等概念
+3. **调试难度**：数据合并在存储层黑盒完成，出问题时不如代码直观
+4. **性能权衡**：写入时处理增加了写入延迟（但减少了读取和计算成本）
+
+#### 总结
+
+Paimon 将常见的数据处理模式（合并、聚合、去重、乱序处理）内置到存储引擎中，通过声明式配置在写入时自动完成，从而简化了数据架构，降低了开发和运维成本。
+
+这也是为什么 Paimon 自称为 "Streaming Data Lake" 而不是简单的 "Table Format"——它不仅仅是存储格式，更是一个带有流式处理能力的存储引擎。
 
 ---
 

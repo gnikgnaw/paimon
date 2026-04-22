@@ -89,6 +89,177 @@
 
 ## 1. 概述与设计哲学
 
+### 解决什么问题
+
+**核心业务问题**：
+1. **上游数据源变更频繁**：CDC 同步场景下，MySQL 表结构每天可能变更多次（新增字段、修改类型）
+2. **多租户场景字段爆炸**：SaaS 平台每个租户可能有自定义字段，导致表结构持续膨胀
+3. **数据类型优化需求**：业务初期用 INT 存储金额，后期需要改为 DECIMAL 保证精度
+4. **分布式环境并发修改**：多个 Flink 作业同时尝试修改同一张表的 Schema
+
+**没有这个设计的后果**：
+- 每次表结构变更都需要重写全部历史数据（成本高、耗时长）
+- 依赖外部 Metastore（如 Hive）做 Schema 管理，引入单点故障和运维复杂度
+- 并发修改导致 Schema 不一致，读取数据时出现列错位或类型不匹配
+- 旧数据文件无法被新 Schema 正确读取，导致数据丢失
+
+**实际场景**：
+```sql
+-- 场景1: 电商订单表新增优惠券字段
+ALTER TABLE orders ADD COLUMN coupon_code STRING;
+-- 旧订单数据（100TB）不需要重写，读取时自动填充 null
+
+-- 场景2: 用户年龄字段从 INT 改为 BIGINT
+ALTER TABLE users MODIFY COLUMN age BIGINT;
+-- 历史数据文件中的 INT 值在读取时自动转换为 BIGINT
+
+-- 场景3: CDC 同步时 MySQL 表新增字段
+-- Paimon 自动检测差异并更新 Schema，无需人工干预
+```
+
+### 有什么坑
+
+**误区陷阱**：
+1. **误以为重命名列会重写数据**：实际上只改元数据，数据文件不动（基于字段 ID 关联）
+2. **误以为可以随意修改主键类型**：主键类型变更会破坏 LSM 树的排序逻辑，因此被禁止
+3. **误以为新增列可以是 NOT NULL**：旧数据文件中没有该列，只能填充 null，因此必须 nullable
+4. **误以为删除列会立即释放存储空间**：旧数据文件仍包含该列，只有 compaction 后才会真正删除
+
+**错误配置**：
+```java
+// 错误1: 尝试将 nullable 列改为 NOT NULL（默认禁止）
+ALTER TABLE t MODIFY COLUMN name STRING NOT NULL;
+// 报错: Cannot update column type from nullable to non nullable
+// 解决: 设置 'alter-column-null-to-not-null.disabled' = 'false'（需确保旧数据无 null）
+
+// 错误2: 在有数据的表上删除主键
+ALTER TABLE t DROP PRIMARY KEY;
+// 报错: Cannot drop primary key when the table contains snapshots
+// 解决: 只能在空表上删除主键
+
+// 错误3: 修改分区键名称
+ALTER TABLE t RENAME COLUMN dt TO date;
+// 报错: Cannot rename partition key column
+// 原因: 分区路径依赖列名（如 dt=2024-01-01）
+```
+
+**生产环境注意事项**：
+1. **并发修改重试风暴**：高并发场景下乐观锁重试可能导致性能下降，建议配置 CatalogLock
+2. **Schema 文件堆积**：频繁变更会产生大量 schema-{id} 文件，需定期清理（通过 Schema Rollback）
+3. **类型转换性能开销**：INT -> BIGINT 转换在读路径上有 CPU 开销，大规模查询时需注意
+4. **对象存储的 rename 语义**：S3 的 rename 实际是 copy+delete，原子性保证较弱，建议使用支持原子 rename 的文件系统
+
+**性能陷阱**：
+```java
+// 陷阱1: 频繁修改 Schema 导致读取时索引映射开销
+// 每个数据文件都需要构建 IndexCastMapping，文件数多时影响查询性能
+// 建议: 批量变更，避免每次只改一个字段
+
+// 陷阱2: 嵌套类型的深度类型转换
+// ROW<ARRAY<MAP<STRING, INT>>> 中修改 INT -> BIGINT
+// 需要递归构建 Cast 链，性能开销大
+// 建议: 避免在深层嵌套类型上频繁修改类型
+```
+
+### 核心概念解释
+
+**术语定义**：
+1. **Schema vs TableSchema**：
+   - Schema：用户接口层，只包含字段、分区键、主键、选项
+   - TableSchema：存储层，额外包含 schemaId、highestFieldId、version、timeMillis
+   
+2. **字段 ID (Field ID)**：
+   - 全局唯一的整数标识符，创建列时分配，永不改变
+   - 即使列被重命名或删除，ID 也不会复用
+   - 读取数据时通过 ID 而非列名匹配字段
+
+3. **highestFieldId**：
+   - 历史上分配过的最大字段 ID
+   - 删除列后仍保持不变，确保新列 ID 不与已删除列冲突
+   - 复合类型（ROW、ARRAY）的子字段也占用 ID
+
+4. **读时演进 (Schema-on-Read)**：
+   - 旧数据文件不重写，在读取时动态适配当前 Schema
+   - 通过 IndexCastMapping 实现字段位置映射和类型转换
+   - 新增列返回 null，删除列被忽略，类型变更自动转换
+
+5. **乐观锁 (Optimistic Locking)**：
+   - 基于文件系统 rename 的原子性实现并发控制
+   - 新 Schema 文件名为 schema-{id}，id = 旧 id + 1
+   - 如果文件已存在（并发冲突），rename 失败，重新读取最新 Schema 重试
+
+**概念关系**：
+```
+TableSchema (id=5)
+  ├── fields: [DataField(id=1, name=a), DataField(id=3, name=c), DataField(id=5, name=d)]
+  ├── highestFieldId: 5  (字段 b 的 id=2 已被删除，但 highestFieldId 保留)
+  └── schemaId: 5
+
+DataFileMeta (写入时 schemaId=3)
+  └── 包含字段: [id=1 (a), id=2 (b), id=3 (c)]
+
+读取时映射:
+  当前 Schema 字段 [1->a, 3->c, 5->d]
+  数据文件字段 [1->a, 2->b, 3->c]
+  索引映射: [0, 2, -1]  (a从位置0读取, c从位置2读取, d不存在返回null)
+```
+
+**与其他系统对比**：
+| 特性 | Paimon | Iceberg | Hudi | Delta Lake |
+|------|--------|---------|------|-----------|
+| 字段标识 | 字段 ID | 字段 ID | 字段名 | 字段名 |
+| 并发控制 | 文件 rename 乐观锁 | metadata.json 乐观锁 | Timeline 乐观锁 | Delta Log 乐观锁 |
+| Schema 存储 | 独立 JSON 文件 | 嵌入 metadata.json | 嵌入 commit 文件 | 嵌入 _delta_log |
+| 分区键演进 | 不支持 | 支持 | 不支持 | 不支持 |
+| CDC 自动演进 | 内置 | 需外部工具 | 内置 | 需外部工具 |
+
+### 设计理念
+
+**为什么这样设计**：
+
+1. **为什么选择文件即元数据？**
+   - **权衡**：放弃了 Metastore 的强一致性，换取了零外部依赖
+   - **好处**：部署简单、无单点故障、天然支持对象存储
+   - **代价**：并发性能不如数据库方案（但 Schema 变更频率低，可接受）
+
+2. **为什么选择字段 ID 而非字段名？**
+   - **权衡**：增加了元数据复杂度（需维护 highestFieldId），但支持了列重命名
+   - **好处**：列重命名不需要重写数据，旧数据文件仍能正确读取
+   - **业界共识**：Iceberg、Hudi 3.0 都采用了字段 ID 方案
+
+3. **为什么选择读时演进而非写时演进？**
+   - **权衡**：读取性能略有下降（需索引映射和类型转换），但写入无需等待数据重写
+   - **好处**：Schema 变更秒级完成，不阻塞写入，适合实时场景
+   - **适用场景**：数据湖的读多写少特性，读时开销可通过缓存和向量化优化
+
+4. **为什么选择乐观锁而非悲观锁？**
+   - **权衡**：高并发时可能重试多次，但避免了锁服务的复杂性
+   - **好处**：无需 ZooKeeper 等外部锁服务，降低运维成本
+   - **冲突概率分析**：Schema 变更通常每天几次，冲突概率 < 1%
+
+**架构演进**：
+```
+v0.7 (早期版本)
+  └── Schema 格式版本 1，不支持嵌套列演进
+
+v0.8 (增强版本)
+  └── Schema 格式版本 2，支持 ROW 类型嵌套演进
+
+v1.5 (当前版本)
+  └── Schema 格式版本 3
+      ├── 支持 ARRAY/MAP/MULTISET 嵌套演进
+      ├── 支持 Schema Rollback
+      ├── 支持 CDC 自动演进
+      └── 支持删除向量 (Deletion Vectors)
+```
+
+**业界对比**：
+- **Iceberg 的优势**：分区演进能力强，支持修改分区策略无需重写数据
+- **Paimon 的优势**：CDC 自动演进内置，Schema 独立文件并发性更好，类型转换规则更灵活（支持显式转换）
+- **设计哲学差异**：Iceberg 追求元数据的强一致性（单个 metadata.json），Paimon 追求去中心化（独立 Schema 文件）
+
+---
+
 Apache Paimon 的 Schema 演进机制是其作为 Lakehouse 存储格式的核心能力之一。在数据湖场景下，表结构的变更是一个高频操作——上游数据源的字段变更、业务需求的调整、数据类型的优化都需要对表结构进行修改。Paimon 设计了一套 **基于文件系统的乐观锁并发控制 + 基于字段 ID 的读时演进** 方案，在不依赖外部元数据服务的前提下，实现了安全、高效的 Schema 演进。
 
 **核心设计哲学**：
@@ -381,6 +552,169 @@ public interface SchemaChange extends Serializable { ... }
 ---
 
 ## 4. SchemaManager 乐观锁并发控制
+
+### 解决什么问题
+
+**核心业务问题**：
+1. **多作业并发修改 Schema**：多个 Flink 作业同时执行 ALTER TABLE，如何保证只有一个成功？
+2. **分布式环境无锁服务**：对象存储（S3、OSS）环境下没有 ZooKeeper 等分布式锁，如何实现并发控制？
+3. **Schema 版本一致性**：如何保证读取到的 Schema 版本是最新的，不会出现脏读？
+4. **原子性提交**：如何保证 Schema 文件写入的原子性，避免写入一半时崩溃导致损坏？
+
+**没有这个设计的后果**：
+- 并发修改导致 Schema 版本冲突，后提交的覆盖先提交的，丢失变更
+- Schema 文件写入一半时进程崩溃，产生不完整的 JSON 文件，导致表无法读取
+- 依赖外部锁服务（如 ZooKeeper），增加部署复杂度和故障点
+- 高并发场景下锁竞争激烈，Schema 变更性能下降
+
+**实际场景**：
+```java
+// 场景1: 两个 Flink 作业同时新增不同的列
+// 作业A: ALTER TABLE t ADD COLUMN col_a STRING;
+// 作业B: ALTER TABLE t ADD COLUMN col_b STRING;
+// 期望: 两个列都成功添加
+// 实际: 乐观锁保证一个成功后，另一个重新读取最新 Schema 再添加
+
+// 场景2: CDC 同步作业自动演进 Schema 的同时，人工执行 ALTER TABLE
+// CDC: 自动添加 MySQL 新增的字段
+// 人工: 修改某个字段的类型
+// 乐观锁保证两个操作串行化，不会互相覆盖
+```
+
+### 有什么坑
+
+**误区陷阱**：
+1. **误以为乐观锁会导致变更丢失**：实际上失败的一方会重试，最终两个变更都会生效
+2. **误以为 rename 在所有文件系统上都是原子的**：S3 的 rename 是 copy+delete，原子性较弱
+3. **误以为高并发场景下乐观锁性能很差**：实际上 Schema 变更频率低，冲突概率极小
+4. **误以为可以手动删除 schema 文件**：删除中间版本会导致 Schema 历史不连续
+
+**错误配置**：
+```java
+// 错误1: 在 S3 上依赖 rename 的强原子性
+// S3 的 rename 实际是 copy+delete，可能出现目标文件已存在但源文件未删除的情况
+// 解决: 使用支持原子 rename 的文件系统（HDFS、本地文件系统）或配置 CatalogLock
+
+// 错误2: 手动删除 schema 文件导致版本断层
+// 删除 schema-3 后，schema-4 仍然存在
+// 问题: latest() 返回 schema-4，但无法回溯到 schema-2
+// 解决: 使用 SchemaManager.rollbackTo() 方法安全删除
+```
+
+**生产环境注意事项**：
+1. **对象存储的 rename 语义**：S3、OSS 的 rename 不是真正的原子操作，建议配置 CatalogLock 增强
+2. **重试次数无上限**：`while(true)` 循环可能在极端情况下导致无限重试，需监控重试次数
+3. **临时文件清理**：`tryToWriteAtomic` 失败时会留下临时文件（.文件名），需定期清理
+4. **Schema 文件数量膨胀**：频繁变更会产生大量 schema-{id} 文件，占用 inode 和列表性能
+
+**性能陷阱**：
+```java
+// 陷阱1: 高并发场景下的重试风暴
+// 10个作业同时修改 Schema，9个会失败重试
+// 每次重试都需要读取最新 Schema、应用变更、验证、写入
+// 建议: 配置 CatalogLock 减少无效重试
+
+// 陷阱2: 大 Schema 的序列化开销
+// 包含1000个字段的表，每次变更都需要序列化整个 TableSchema 为 JSON
+// 建议: 避免单表字段过多，考虑拆分表
+```
+
+### 核心概念解释
+
+**术语定义**：
+1. **乐观锁 (Optimistic Locking)**：
+   - 假设冲突很少发生，不加锁直接执行，提交时检查是否有冲突
+   - 冲突时回滚重试，而非阻塞等待
+   - 适用于读多写少、冲突概率低的场景
+
+2. **CAS (Compare And Swap)**：
+   - 比较当前值是否等于预期值，相等则更新为新值
+   - Paimon 的实现：检查 schema-{id} 文件是否存在，不存在则创建
+   - 文件系统的 rename 操作天然提供 CAS 语义
+
+3. **tryToWriteAtomic**：
+   - 先写临时文件（.schema-{id}.随机数）
+   - 再 rename 到目标文件（schema-{id}）
+   - rename 失败说明目标文件已存在（并发冲突）
+
+4. **CatalogLock**：
+   - 可选的外部锁机制（如 Hive Metastore 的锁）
+   - 在乐观锁之前加一层悲观锁，减少无效重试
+   - 双重保护：外部锁失效时，乐观锁仍能保证正确性
+
+5. **Schema 版本号 (schemaId)**：
+   - 从 0 开始的单调递增整数
+   - 新版本 = 旧版本 + 1
+   - 通过版本号实现乐观锁的冲突检测
+
+**概念关系**：
+```
+并发控制层次:
+  ┌─────────────────────────────────┐
+  │ CatalogLock (可选)               │  减少冲突，提升性能
+  │   ├── Hive Metastore Lock       │
+  │   ├── ZooKeeper Lock            │
+  │   └── 其他外部锁                 │
+  └─────────────────────────────────┘
+              ↓
+  ┌─────────────────────────────────┐
+  │ 乐观锁 (必选)                    │  保证正确性
+  │   └── 文件 rename CAS           │
+  └─────────────────────────────────┘
+```
+
+**与其他系统对比**：
+| 系统 | 并发控制机制 | 原子性保证 | 外部依赖 |
+|------|------------|-----------|---------|
+| Paimon | 文件 rename 乐观锁 | rename 原子性 | 无（可选 CatalogLock） |
+| Iceberg | metadata.json 乐观锁 | rename 原子性 | 无（可选 Lock） |
+| Hudi | Timeline 乐观锁 | rename 原子性 | 无 |
+| Delta Lake | _delta_log 乐观锁 | 文件追加原子性 | 无 |
+| Hive | Metastore 悲观锁 | 数据库事务 | MySQL/PostgreSQL |
+
+### 设计理念
+
+**为什么这样设计**：
+
+1. **为什么选择乐观锁而非悲观锁？**
+   - **权衡**：高并发时可能重试，但避免了锁服务的复杂性和单点故障
+   - **好处**：零外部依赖，部署简单，适合对象存储环境
+   - **数据支撑**：Schema 变更频率通常 < 10次/天，冲突概率 < 1%
+
+2. **为什么使用 while(true) 无限重试？**
+   - **权衡**：极端情况下可能长时间重试，但保证了最终一致性
+   - **好处**：简化了错误处理逻辑，用户无需关心重试次数
+   - **实际情况**：绝大多数场景下 1-2 次重试即可成功
+
+3. **为什么需要 CatalogLock 双重保护？**
+   - **权衡**：增加了可选依赖，但提升了高并发场景的性能
+   - **好处**：外部锁减少无效重试，乐观锁保证正确性兜底
+   - **设计模式**：防御性编程，不依赖外部锁的可靠性
+
+4. **为什么 Schema ID 必须连续递增？**
+   - **权衡**：限制了分布式 ID 生成的灵活性，但简化了版本管理
+   - **好处**：latest() 只需找最大 ID，版本比较只需数值比较
+   - **实现简单**：通过 CAS 保证唯一性，无需分布式 ID 生成器
+
+**架构演进**：
+```
+早期版本:
+  └── 纯乐观锁，无外部锁支持
+
+当前版本:
+  ├── 乐观锁（基础保障）
+  └── CatalogLock（可选增强）
+      ├── HiveCatalogLock
+      ├── JdbcCatalogLock
+      └── 自定义 CatalogLockFactory
+```
+
+**业界对比**：
+- **Iceberg**：同样使用乐观锁 + 可选外部锁，但所有元数据在单个 metadata.json 中，冲突概率更高
+- **Hudi**：Timeline 机制天然串行化，冲突概率低，但灵活性不如独立 Schema 文件
+- **Delta Lake**：_delta_log 追加写入，冲突概率最低，但 Schema 变更需要写入完整的 AddFile 操作
+
+---
 
 `SchemaManager` 是 Schema 演进的核心管理器，负责 Schema 的创建、变更、版本管理和并发控制。
 
@@ -915,6 +1249,178 @@ public static void validateFallbackBranch(SchemaManager schemaManager, TableSche
 
 ## 8. Schema Evolution 在读路径的影响
 
+### 解决什么问题
+
+**核心业务问题**：
+1. **旧数据文件如何适配新 Schema**：表新增了列，如何读取不包含该列的旧数据文件？
+2. **列重命名后数据关联**：列从 `old_name` 改为 `new_name`，如何正确读取旧文件中的数据？
+3. **类型变更的运行时转换**：列从 INT 改为 BIGINT，如何在读取时自动转换？
+4. **查询谓词的 Schema 适配**：`WHERE new_column = 1` 如何下推到不包含 `new_column` 的旧文件？
+
+**没有这个设计的后果**：
+- 每次 Schema 变更都需要重写全部历史数据（PB 级数据重写耗时数天）
+- 列重命名后旧数据无法读取，导致数据丢失
+- 类型变更后读取旧数据时类型不匹配，查询报错
+- 查询性能下降（无法利用旧文件的统计信息做谓词下推）
+
+**实际场景**：
+```sql
+-- 初始 Schema (schema-0): id INT, name STRING, age INT
+INSERT INTO t VALUES (1, 'Alice', 25);  -- 写入 file-1.parquet
+
+-- 变更1: 新增列 (schema-1)
+ALTER TABLE t ADD COLUMN city STRING;
+INSERT INTO t VALUES (2, 'Bob', 30, 'Beijing');  -- 写入 file-2.parquet
+
+-- 变更2: 修改类型 (schema-2)
+ALTER TABLE t MODIFY COLUMN age BIGINT;
+
+-- 查询: SELECT id, name, age, city FROM t WHERE age > 20;
+-- file-1: 需要映射 [id, name, age, null(city)]，age 从 INT 转为 BIGINT
+-- file-2: 需要映射 [id, name, age, city]，age 已是 BIGINT 无需转换
+```
+
+### 有什么坑
+
+**误区陷阱**：
+1. **误以为读时演进没有性能开销**：实际上索引映射和类型转换都有 CPU 开销
+2. **误以为所有类型变更都能自动转换**：只有通过 `DataTypeCasts` 检查的转换才支持
+3. **误以为删除列后数据会立即释放**：旧文件仍包含该列数据，只是读取时被忽略
+4. **误以为谓词下推对所有文件都有效**：新增列的过滤条件无法下推到旧文件
+
+**错误配置**：
+```java
+// 错误1: 修改类型后未提供 CastExecutor
+ALTER TABLE t MODIFY COLUMN data BYTES;  // 从 STRING 改为 BYTES
+// 报错: No CastExecutor found for STRING -> BYTES
+// 原因: DataTypeCasts 允许转换，但 CastExecutors 未实现
+
+// 错误2: 期望删除列后立即释放存储
+ALTER TABLE t DROP COLUMN large_blob;
+// 实际: 旧文件仍占用空间，需要 compaction 才能真正删除
+// 解决: 执行 CALL sys.compact('db.t')
+```
+
+**生产环境注意事项**：
+1. **类型转换的性能开销**：INT -> BIGINT 转换在大规模查询时会消耗 CPU，建议批量变更后做 compaction
+2. **索引映射的内存开销**：每个数据文件都需要构建 `IndexCastMapping`，文件数多时占用内存
+3. **嵌套类型的 Cast 链深度**：`ROW<ARRAY<MAP<STRING, INT>>>` 的类型转换需要递归构建，性能开销大
+4. **谓词下推失效**：新增列的过滤条件无法利用旧文件的统计信息，导致全表扫描
+
+**性能陷阱**：
+```java
+// 陷阱1: 频繁 Schema 变更导致读取性能下降
+// 每次查询都需要为每个文件构建 IndexCastMapping
+// 建议: 批量变更后执行 compaction，统一 Schema 版本
+
+// 陷阱2: 深层嵌套类型的类型转换
+// ROW<ARRAY<MAP<STRING, INT>>> 中 INT -> BIGINT
+// 需要递归构建 MapCastExecutor -> ArrayCastExecutor -> CastExecutor
+// 建议: 避免在深层嵌套类型上频繁修改类型
+
+// 陷阱3: 大量删除列后的读取开销
+// 表原有100个列，删除了90个，只保留10个
+// 读取旧文件时仍需解析100个列，然后丢弃90个
+// 建议: 执行 compaction 重写数据文件
+```
+
+### 核心概念解释
+
+**术语定义**：
+1. **索引映射 (Index Mapping)**：
+   - 将当前 Schema 的字段索引映射到数据文件 Schema 的字段索引
+   - 基于字段 ID 而非字段名进行匹配
+   - 不存在的字段映射到 `NULL_FIELD_INDEX = -1`
+
+2. **IndexCastMapping**：
+   - 包含索引映射和类型转换两部分
+   - `int[] indexMapping`：字段位置映射
+   - `CastFieldGetter[] castMapping`：字段类型转换器
+
+3. **CastExecutor**：
+   - 运行时类型转换器，将源类型值转换为目标类型值
+   - 例如：`IntToBigIntCastExecutor` 将 int 转为 long
+   - 支持嵌套类型的递归转换（RowCastExecutor、ArrayCastExecutor）
+
+4. **谓词退化 (Predicate Devolution)**：
+   - 将基于当前 Schema 的过滤条件"退化"到数据文件 Schema
+   - 字段名、字段索引、字面量类型都需要适配
+   - 新增列的过滤条件可能被丢弃（无法下推）
+
+5. **恒等映射优化 (Identity Mapping Optimization)**：
+   - 当索引映射是 `[0, 1, 2, ...]` 时返回 `null`
+   - 避免不必要的内存分配和间接访问
+   - 读路径上的重要性能优化
+
+**概念关系**：
+```
+读取流程:
+  查询请求 (当前 Schema)
+      ↓
+  SchemaEvolutionUtil.createIndexCastMapping()
+      ├── createIndexMapping()  → int[] indexMapping
+      └── createCastFieldGetterMapping()  → CastFieldGetter[] castMapping
+      ↓
+  IndexCastMapping
+      ├── getIndexMapping()  → 字段位置重排
+      └── getCastMapping()   → 字段类型转换
+      ↓
+  ProjectedRow (字段重排) + CastedRow (类型转换)
+      ↓
+  最终结果行
+```
+
+**与其他系统对比**：
+| 系统 | 字段匹配方式 | 类型转换 | 谓词下推适配 |
+|------|------------|---------|------------|
+| Paimon | 字段 ID | CastExecutor | devolveFilters |
+| Iceberg | 字段 ID | 内置转换器 | 谓词重写 |
+| Hudi | 字段名 | Avro Schema Evolution | 有限支持 |
+| Delta Lake | 字段名 | Spark 类型转换 | 有限支持 |
+
+### 设计理念
+
+**为什么这样设计**：
+
+1. **为什么基于字段 ID 而非字段名？**
+   - **权衡**：增加了元数据复杂度（需维护字段 ID），但支持列重命名
+   - **好处**：列重命名不影响数据读取，旧文件仍能正确关联
+   - **业界共识**：Iceberg、Hudi 3.0 都采用字段 ID 方案
+
+2. **为什么选择读时演进而非写时演进？**
+   - **权衡**：读取性能略有下降（索引映射 + 类型转换），但写入无需等待
+   - **好处**：Schema 变更秒级完成，不阻塞写入，适合实时场景
+   - **数据支撑**：读时开销 < 5%（根据 Iceberg 论文），可接受
+
+3. **为什么需要恒等映射优化？**
+   - **权衡**：增加了判断逻辑，但节省了内存和间接访问开销
+   - **好处**：无 Schema 变更的表（大多数情况）零开销
+   - **实际效果**：避免了每个文件分配 `int[]` 数组
+
+4. **为什么谓词退化时可以丢弃新增列的过滤条件？**
+   - **权衡**：可能导致读取更多数据（无法提前过滤），但保证了正确性
+   - **好处**：简化了实现，避免了复杂的谓词重写逻辑
+   - **实际影响**：新增列通常没有统计信息，下推效果有限
+
+**架构演进**：
+```
+早期版本:
+  └── 仅支持顶层字段的索引映射
+
+当前版本:
+  ├── 支持嵌套类型的递归映射
+  ├── 支持复杂类型转换（ROW、ARRAY、MAP）
+  ├── 支持谓词退化
+  └── 恒等映射优化
+```
+
+**业界对比**：
+- **Iceberg**：同样基于字段 ID，但类型转换规则更严格（只允许安全宽化）
+- **Hudi**：基于字段名，列重命名需要重写数据，但实现更简单
+- **Delta Lake**：基于字段名 + 位置，灵活性较差
+
+---
+
 Schema Evolution 的核心思想是**读时演进**：旧数据文件保持不变，在读取时动态适配当前 Schema。
 
 **源码位置**: `paimon-core/src/main/java/org/apache/paimon/schema/SchemaEvolutionUtil.java`
@@ -1067,6 +1573,184 @@ protected final long schemaId;
 ---
 
 ## 9. CDC 自动 Schema 演进 (SchemaMergingUtils)
+
+### 解决什么问题
+
+**核心业务问题**：
+1. **上游数据源 Schema 自动同步**：MySQL 表新增字段后，Paimon 表如何自动感知并更新？
+2. **多源数据合并**：从多个 Kafka Topic 读取数据，Schema 不完全一致，如何合并？
+3. **类型兼容性判断**：上游 INT 类型，下游 BIGINT 类型，是否可以自动合并？
+4. **字段 ID 自动分配**：新增字段如何分配 ID，避免与已删除字段冲突？
+
+**没有这个设计的后果**：
+- CDC 同步时上游表结构变更，Paimon 写入失败，需要人工干预
+- 多源数据合并时 Schema 不一致，导致数据丢失或类型错误
+- 字段 ID 分配冲突，导致数据读取时列错位
+- 需要外部工具（如 Flink CDC）手动检测 Schema 差异并生成 ALTER TABLE 语句
+
+**实际场景**：
+```sql
+-- 场景1: MySQL 表新增字段
+-- MySQL: ALTER TABLE users ADD COLUMN phone VARCHAR(20);
+-- Paimon CDC 同步作业自动检测到变更，执行:
+-- ALTER TABLE paimon.users ADD COLUMN phone STRING;
+
+-- 场景2: 多个 Kafka Topic 合并
+-- Topic A: {id: INT, name: STRING, age: INT}
+-- Topic B: {id: INT, name: STRING, city: STRING}
+-- 合并后: {id: INT, name: STRING, age: INT, city: STRING}
+
+-- 场景3: 类型自动宽化
+-- 上游: amount INT
+-- 下游: amount BIGINT
+-- 自动合并为 BIGINT（兼容 INT）
+```
+
+### 有什么坑
+
+**误区陷阱**：
+1. **误以为所有类型都能自动合并**：只有兼容类型（如 INT -> BIGINT）才能合并
+2. **误以为 nullability 会自动合并**：实际上保持当前 Schema 的 nullability，新字段强制 nullable
+3. **误以为字段顺序会保持**：新字段追加到末尾，不保证与上游顺序一致
+4. **误以为 Decimal 的 scale 可以不同**：scale 必须相同才能合并
+
+**错误配置**：
+```java
+// 错误1: 期望 Decimal(10,2) 和 Decimal(10,3) 自动合并
+// 上游: amount DECIMAL(10,2)
+// 下游: amount DECIMAL(10,3)
+// 报错: Cannot merge decimal types with different scales
+// 原因: scale 不同代表不同的精度语义
+
+// 错误2: 期望 STRING 和 INT 自动合并
+// 上游: id STRING
+// 下游: id INT
+// 报错: Cannot merge incompatible types
+// 原因: 不在兼容类型列表中
+
+// 错误3: 期望删除字段后自动同步
+// 上游: 删除了 old_column
+// 下游: old_column 仍然存在
+// 原因: SchemaMergingUtils 只处理新增和类型变更，不处理删除
+```
+
+**生产环境注意事项**：
+1. **allowExplicitCast 参数**：设为 true 允许收窄转换（如 BIGINT -> INT），有数据丢失风险
+2. **highestFieldId 递增**：频繁合并会导致 highestFieldId 快速增长，影响元数据大小
+3. **委托模式 vs 直接模式**：Hive Catalog 需要使用委托模式，否则 Metastore 不同步
+4. **合并频率控制**：高频合并会产生大量 Schema 版本，建议批量合并
+
+**性能陷阱**：
+```java
+// 陷阱1: 每条数据都触发 Schema 合并检查
+// 在 Flink CDC 中，每个 RowData 都调用 mergeSchema()
+// 建议: 缓存上次合并的 Schema，只在检测到差异时才合并
+
+// 陷阱2: 大 Schema 的递归合并开销
+// 包含100个字段的 ROW 类型，每次合并都需要递归比较
+// 建议: 避免过深的嵌套结构
+
+// 陷阱3: 委托模式的 Catalog 调用开销
+// 每次合并都调用 Catalog.alterTable()，涉及网络请求
+// 建议: 批量收集变更，一次性提交
+```
+
+### 核心概念解释
+
+**术语定义**：
+1. **Schema 合并 (Schema Merging)**：
+   - 将两个 Schema 合并为一个兼容的 Schema
+   - 保留两个 Schema 的所有字段（并集）
+   - 类型冲突时选择更宽的类型
+
+2. **兼容类型 (Compatible Types)**：
+   - 可以安全合并的类型对（如 INT 和 BIGINT）
+   - 通过 `DataTypeCasts.supportsCompatibleCast()` 判断
+   - 比隐式转换更严格（同一类型族内）
+
+3. **类型宽化 (Type Widening)**：
+   - 选择两个类型中更宽的类型作为合并结果
+   - 例如：INT + BIGINT → BIGINT
+   - 例如：CHAR(10) + CHAR(20) → CHAR(20)
+
+4. **字段 ID 分配 (Field ID Assignment)**：
+   - 新字段从 `highestFieldId + 1` 开始分配
+   - 嵌套类型的子字段递归分配
+   - 通过 `ReassignFieldId.reassign()` 实现
+
+5. **委托模式 (Delegation Mode)**：
+   - 生成 SchemaChange 列表交给 Catalog 处理
+   - 适用于需要同步外部 Metastore 的场景
+   - 通过 `SchemaModification.alterSchema()` 回调
+
+**概念关系**：
+```
+合并流程:
+  当前 Schema (base)
+      +
+  目标 Schema (update)
+      ↓
+  mergeSchemas() 递归合并
+      ├── 已有字段: 递归合并类型
+      ├── base 独有字段: 保留
+      └── update 独有字段: 追加（分配新 ID，强制 nullable）
+      ↓
+  新 Schema (id = base.id + 1)
+      ↓
+  委托模式: diffSchemaChanges() → SchemaChange 列表 → Catalog.alterTable()
+  直接模式: SchemaManager.commit()
+```
+
+**与其他系统对比**：
+| 系统 | 自动演进 | 类型合并规则 | 字段 ID 分配 |
+|------|---------|------------|------------|
+| Paimon | 内置 SchemaMergingUtils | Compatible + Implicit | highestFieldId 递增 |
+| Iceberg | 需外部工具 | 仅宽化 | last-column-id 递增 |
+| Hudi | 内置 Schema Evolution | Avro 规则 | 无字段 ID |
+| Delta Lake | 需外部工具 | Spark 规则 | 无字段 ID |
+
+### 设计理念
+
+**为什么这样设计**：
+
+1. **为什么保持 base 的 nullability？**
+   - **权衡**：可能与上游 Schema 的 nullability 不一致，但更安全
+   - **好处**：避免将 nullable 改为 NOT NULL 导致旧数据违反约束
+   - **保守策略**：CDC 数据源的 nullability 信息可能不准确
+
+2. **为什么新字段强制 nullable？**
+   - **权衡**：与上游 Schema 可能不一致，但保证了读时演进的正确性
+   - **好处**：旧数据文件中不存在新字段，只能返回 null
+   - **一致性**：与 AddColumn 的约束保持一致
+
+3. **为什么 Decimal 的 scale 必须相同？**
+   - **权衡**：限制了合并的灵活性，但避免了精度语义错误
+   - **好处**：DECIMAL(10,2) 和 DECIMAL(10,3) 代表不同的小数位数，自动合并可能导致数据错误
+   - **实际案例**：金额字段的小数位数不能随意改变
+
+4. **为什么需要委托模式？**
+   - **权衡**：增加了实现复杂度，但支持了外部 Metastore 同步
+   - **好处**：Hive Catalog 需要同步更新 Hive Metastore，直接模式无法满足
+   - **扩展性**：支持自定义 SchemaModification 实现
+
+**架构演进**：
+```
+早期版本:
+  └── 仅支持顶层字段的合并
+
+当前版本:
+  ├── 支持嵌套类型的递归合并（ROW、ARRAY、MAP）
+  ├── 支持委托模式
+  ├── 支持 diffSchemaChanges 差异检测
+  └── 支持 allowExplicitCast 参数
+```
+
+**业界对比**：
+- **Iceberg**：需要外部工具（如 Flink CDC）手动检测差异并生成 ALTER TABLE
+- **Hudi**：内置 Avro Schema Evolution，但基于字段名，不支持列重命名
+- **Delta Lake**：需要外部工具，且基于字段名
+
+---
 
 Paimon 支持从 CDC 数据源（MySQL、Kafka 等）同步数据时自动演进表 Schema。当上游数据源的表结构发生变化时，Paimon 会自动检测差异并更新 Schema。
 
@@ -1465,6 +2149,185 @@ Spark 的实现比 Flink 简洁，因为 Spark 没有非物理列的概念。
 ---
 
 ## 14. 类型转换规则体系 (DataTypeCasts)
+
+### 解决什么问题
+
+**核心业务问题**：
+1. **类型变更的安全性判断**：INT 能否改为 BIGINT？STRING 能否改为 INT？
+2. **CDC 场景的类型兼容性**：上游 MySQL 的 TINYINT 对应 Paimon 的什么类型？
+3. **显式转换的风险控制**：BIGINT -> INT 会丢失数据，是否允许？
+4. **嵌套类型的转换规则**：`ARRAY<INT>` 能否改为 `ARRAY<BIGINT>`？
+
+**没有这个设计的后果**：
+- 允许不安全的类型转换（如 BIGINT -> INT），导致数据溢出或丢失
+- 禁止安全的类型转换（如 INT -> BIGINT），限制了 Schema 演进的灵活性
+- CDC 同步时类型不匹配，写入失败
+- 缺乏统一的类型转换规则，不同引擎（Flink、Spark）行为不一致
+
+**实际场景**：
+```sql
+-- 场景1: 安全的宽化转换（隐式）
+ALTER TABLE t MODIFY COLUMN age BIGINT;  -- INT -> BIGINT，允许
+ALTER TABLE t MODIFY COLUMN price DOUBLE;  -- FLOAT -> DOUBLE，允许
+
+-- 场景2: 有风险的收窄转换（显式，默认禁止）
+ALTER TABLE t MODIFY COLUMN id INT;  -- BIGINT -> INT，默认禁止
+-- 需要设置 'disable-explicit-type-casting' = 'false' 才允许
+
+-- 场景3: 不兼容的转换（禁止）
+ALTER TABLE t MODIFY COLUMN name INT;  -- STRING -> INT，禁止
+-- 报错: Column type STRING cannot be converted to INT
+
+-- 场景4: CDC 类型映射
+-- MySQL TINYINT -> Paimon TINYINT (隐式兼容)
+-- MySQL BIGINT -> Paimon BIGINT (隐式兼容)
+```
+
+### 有什么坑
+
+**误区陷阱**：
+1. **误以为所有数值类型都能互转**：FLOAT -> INT 是显式转换，默认禁止
+2. **误以为 CHAR 和 VARCHAR 可以随意互转**：CHAR -> VARCHAR 隐式，VARCHAR -> CHAR 显式
+3. **误以为 TIMESTAMP 和 DATE 可以互转**：实际上不支持
+4. **误以为 Compatible 规则比 Implicit 规则宽松**：实际上更严格（同类型族内）
+
+**错误配置**：
+```java
+// 错误1: 期望 STRING -> INT 自动转换
+ALTER TABLE t MODIFY COLUMN id INT;  -- 原类型 STRING
+// 报错: Column type STRING cannot be converted to INT
+// 原因: 不在隐式或显式转换规则中
+
+// 错误2: 期望 TIMESTAMP -> DATE 转换
+ALTER TABLE t MODIFY COLUMN dt DATE;  -- 原类型 TIMESTAMP
+// 报错: Column type TIMESTAMP cannot be converted to DATE
+// 原因: 时间类型之间不支持转换（除了 precision 变化）
+
+// 错误3: 开启显式转换后数据溢出
+-- 设置 'disable-explicit-type-casting' = 'false'
+ALTER TABLE t MODIFY COLUMN big_value INT;  -- 原类型 BIGINT，值为 10000000000
+-- 查询时: 数据溢出，返回错误的值
+```
+
+**生产环境注意事项**：
+1. **显式转换的数据丢失风险**：BIGINT -> INT、DOUBLE -> FLOAT 可能溢出或丢失精度
+2. **Decimal 的 precision 和 scale**：只能增加 precision，scale 必须保持不变
+3. **CHAR/VARCHAR 的长度**：VARCHAR -> CHAR 可能截断数据
+4. **时间类型的 precision**：只能增加 precision（如 TIMESTAMP(3) -> TIMESTAMP(6)）
+
+**性能陷阱**：
+```java
+// 陷阱1: 频繁的类型转换开销
+// 表有1000个文件，每个文件都需要 INT -> BIGINT 转换
+// 大规模查询时 CPU 开销显著
+// 建议: 执行 compaction 统一类型
+
+// 陷阱2: 嵌套类型的递归转换
+// ARRAY<MAP<STRING, ROW<a INT, b INT>>> 中 INT -> BIGINT
+// 需要递归构建多层 CastExecutor
+// 建议: 避免在深层嵌套类型上修改类型
+```
+
+### 核心概念解释
+
+**术语定义**：
+1. **隐式转换 (Implicit Cast)**：
+   - 无信息丢失的安全转换
+   - 例如：INT -> BIGINT、FLOAT -> DOUBLE
+   - 用于 Schema Merge（CDC）和手动 ALTER TABLE
+
+2. **显式转换 (Explicit Cast)**：
+   - 可能丢失信息的转换
+   - 例如：BIGINT -> INT、VARCHAR -> CHAR
+   - 默认禁止，需配置 `disable-explicit-type-casting = false`
+
+3. **兼容转换 (Compatible Cast)**：
+   - 同一类型族内的转换
+   - 例如：CHAR(10) 和 CHAR(20) 兼容
+   - 用于 CDC 场景的类型合并判断
+
+4. **类型族 (Type Family)**：
+   - 一组相关的类型
+   - 例如：数值族（TINYINT、SMALLINT、INT、BIGINT）
+   - 例如：字符族（CHAR、VARCHAR）
+
+5. **CastExecutor**：
+   - 运行时类型转换器
+   - 通过 `CastExecutors.resolve()` 获取
+   - 必须同时满足 `DataTypeCasts.supportsCast()` 和 `CastExecutors.resolve() != null`
+
+**概念关系**：
+```
+转换规则层次:
+  Compatible (最严格)
+      ↓
+  Implicit (安全)
+      ↓
+  Explicit (有风险)
+      ↓
+  不支持
+
+判断流程:
+  DataTypeCasts.supportsCast(source, target, allowExplicit)
+      ├── implicitCastingRules.contains(source -> target) → true
+      ├── allowExplicit && explicitCastingRules.contains(source -> target) → true
+      └── false
+
+  CastExecutors.resolve(source, target)
+      ├── 存在对应的 CastExecutor → 返回实例
+      └── 不存在 → null
+```
+
+**与其他系统对比**：
+| 系统 | 转换规则 | 显式转换 | 嵌套类型 |
+|------|---------|---------|---------|
+| Paimon | 三级规则（Implicit/Explicit/Compatible） | 可配置 | 支持 |
+| Iceberg | 仅宽化转换 | 不支持 | 支持 |
+| Hudi | Avro 规则 | 有限支持 | 支持 |
+| Delta Lake | Spark 规则 | 支持 | 支持 |
+
+### 设计理念
+
+**为什么这样设计**：
+
+1. **为什么需要三级转换规则？**
+   - **权衡**：增加了规则复杂度，但提供了更精细的控制
+   - **好处**：CDC 场景用 Compatible，手动变更用 Implicit，高级用户用 Explicit
+   - **灵活性**：不同场景有不同的安全性要求
+
+2. **为什么默认禁止显式转换？**
+   - **权衡**：限制了灵活性，但避免了数据丢失
+   - **好处**：防止误操作（如 BIGINT -> INT 导致溢出）
+   - **保守策略**：数据安全优先于操作便利性
+
+3. **为什么 Compatible 规则比 Implicit 规则更严格？**
+   - **权衡**：CDC 场景下限制了类型合并的灵活性
+   - **好处**：避免跨类型族的合并（如 INT 和 FLOAT 合并为 DOUBLE）
+   - **语义清晰**：同类型族内的合并更符合直觉
+
+4. **为什么需要同时检查 DataTypeCasts 和 CastExecutors？**
+   - **权衡**：增加了检查步骤，但保证了运行时的正确性
+   - **好处**：理论上可转换但缺少实现的情况会被拦截
+   - **防御性编程**：避免运行时找不到转换器导致崩溃
+
+**架构演进**：
+```
+早期版本:
+  └── 仅支持基本类型的隐式转换
+
+当前版本:
+  ├── 三级转换规则（Implicit/Explicit/Compatible）
+  ├── 支持嵌套类型的递归转换
+  ├── 支持 Decimal 的 precision 变化
+  └── 支持 TIMESTAMP 的 precision 变化
+```
+
+**业界对比**：
+- **Iceberg**：只允许安全的宽化转换，更保守
+- **Hudi**：基于 Avro 规则，支持更多转换，但可能不安全
+- **Delta Lake**：基于 Spark 规则，灵活性高，但依赖 Spark 引擎
+
+---
 
 **源码位置**: `paimon-api/src/main/java/org/apache/paimon/types/DataTypeCasts.java`
 

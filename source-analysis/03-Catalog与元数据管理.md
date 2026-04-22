@@ -100,6 +100,161 @@ Apache Paimon 的 Catalog 体系是整个数据湖管理的核心枢纽。它负
 
 ## 二、Catalog 接口体系
 
+### 解决什么问题
+
+**核心业务问题：**
+1. **统一的元数据管理入口**：数据湖需要管理数据库、表、分区、快照、标签等多种元数据对象，如果没有统一的抽象层，每个计算引擎（Flink/Spark/Hive）都需要实现自己的元数据管理逻辑，导致重复开发和不一致。
+2. **多种存储后端的适配**：不同的部署场景需要不同的元数据存储方案——小规模场景可以直接用文件系统，企业场景需要集成 Hive Metastore，云原生场景需要 REST API。
+3. **零外部依赖的部署**：传统数据湖（如 Hive）强依赖 MySQL/PostgreSQL 存储元数据，增加了部署复杂度和故障点。
+
+**没有这个设计的后果：**
+- 每个计算引擎需要自己实现表的创建、删除、Schema 演进逻辑，代码重复且容易出现不一致
+- 无法在不同的元数据存储后端之间切换，被绑定到特定的基础设施
+- 无法通过装饰器模式灵活地添加缓存、权限控制等横切关注点
+
+**实际场景：**
+```java
+// 场景1: 开发环境使用本地文件系统
+Map<String, String> options = new HashMap<>();
+options.put("warehouse", "/tmp/paimon");
+options.put("metastore", "filesystem");
+Catalog catalog = CatalogFactory.createCatalog(CatalogContext.create(options));
+
+// 场景2: 生产环境集成 Hive Metastore
+options.put("metastore", "hive");
+options.put("uri", "thrift://hive-metastore:9083");
+Catalog catalog = CatalogFactory.createCatalog(CatalogContext.create(options));
+
+// 场景3: 云原生环境使用 REST Catalog
+options.put("metastore", "rest");
+options.put("uri", "https://catalog-server.example.com");
+Catalog catalog = CatalogFactory.createCatalog(CatalogContext.create(options));
+```
+
+### 有什么坑
+
+**误区陷阱：**
+1. **系统表不能直接 DDL**：尝试 `DROP TABLE my_table$snapshots` 会抛异常。系统表是虚拟的，只能通过原始表操作。
+2. **分支表不能直接 DDL**：尝试 `DROP TABLE my_table$branch_dev` 会失败。分支需要通过 `BranchManager.dropBranch()` 删除。
+3. **FileSystemCatalog 不支持 alterDatabase**：因为文件系统目录没有属性存储能力，尝试修改数据库属性会抛 `UnsupportedOperationException`。
+
+**错误配置：**
+```java
+// 错误：忘记配置 warehouse
+Map<String, String> options = new HashMap<>();
+options.put("metastore", "filesystem");
+// 缺少 warehouse 配置
+Catalog catalog = CatalogFactory.createCatalog(...); // 抛异常
+
+// 错误：在对象存储上使用 renameTable
+options.put("warehouse", "s3://bucket/warehouse");
+catalog.renameTable(from, to); // S3 的 rename 不是原子的，可能导致数据不一致
+```
+
+**生产环境注意事项：**
+1. **对象存储必须启用锁机制**：S3/OSS 等对象存储的原子操作能力有限，必须配置 `CatalogLockFactory`（如基于 MySQL 的锁）来保证并发安全。
+2. **缓存配置要合理**：`CachingCatalog` 默认启用，但如果多个进程共享同一个 warehouse，缓存过期时间不能太长，否则会读到过期的元数据。
+3. **避免频繁的 invalidateTable**：每次调用都会清空缓存，导致下次访问需要重新读取文件系统，影响性能。
+
+**性能陷阱：**
+```java
+// 陷阱：在循环中反复 getTable
+for (String tableName : catalog.listTables(db)) {
+    Table table = catalog.getTable(Identifier.create(db, tableName));
+    // 如果缓存未启用，每次都会读取文件系统
+}
+
+// 优化：启用缓存并批量操作
+options.put("cache.enabled", "true");
+options.put("cache.expire-after-access", "10min");
+```
+
+### 核心概念解释
+
+**Catalog（目录）：**
+元数据管理的统一接口，类似于关系数据库中的 `INFORMATION_SCHEMA`。它管理数据库、表、分区、快照等所有元数据对象。
+
+**FileSystemCatalog vs HiveCatalog：**
+- **FileSystemCatalog**：将元数据直接存储为文件系统上的文件（JSON 格式），零外部依赖，适合小规模部署和开发环境。
+- **HiveCatalog**：将元数据存储在 Hive Metastore 中，适合已有 Hive 基础设施的企业环境，可以与 Hive 表共存。
+
+**装饰器模式（Decorator Pattern）：**
+通过 `DelegateCatalog` 实现的设计模式，允许在不修改原始 Catalog 的情况下动态添加功能：
+```
+PrivilegedCatalog (权限控制)
+  → CachingCatalog (缓存)
+    → FileSystemCatalog (实际存储)
+```
+
+**SPI（Service Provider Interface）：**
+Java 的插件机制，通过 `META-INF/services/org.apache.paimon.catalog.CatalogFactory` 文件声明实现类，运行时动态加载。这使得用户可以自定义 Catalog 实现而无需修改 Paimon 核心代码。
+
+**Identifier（标识符）：**
+Paimon 中表的完整标识，格式为 `{database}.{table}[$branch_{name}][$systemTable]`。例如：
+- `my_db.my_table` - 普通表
+- `my_db.my_table$snapshots` - 系统表
+- `my_db.my_table$branch_dev` - 分支表
+- `my_db.my_table$branch_dev$files` - 分支的系统表
+
+### 设计理念
+
+**为什么这样设计：**
+
+1. **接口与实现分离**：`Catalog` 接口定义了"做什么"，`FileSystemCatalog`/`HiveCatalog` 定义了"怎么做"。这使得上层代码（Flink/Spark）不需要关心底层存储细节。
+
+2. **模板方法模式**：`AbstractCatalog` 实现了通用逻辑（参数校验、系统表判断），子类只需实现 `xxxImpl()` 方法。这避免了每个实现都重复处理边界条件。
+
+3. **装饰器链的灵活组合**：通过装饰器模式，可以在运行时动态组合功能：
+   ```java
+   // 开发环境：只需基础功能
+   Catalog catalog = new FileSystemCatalog(...);
+   
+   // 生产环境：添加缓存和权限
+   catalog = new CachingCatalog(catalog);
+   catalog = new PrivilegedCatalog(catalog);
+   ```
+
+4. **能力探测而非异常处理**：通过 `supportsListObjectsPaged()`、`supportsVersionManagement()` 等方法，上层代码可以优雅降级，而不是捕获异常：
+   ```java
+   if (catalog.supportsListObjectsPaged()) {
+       // 使用分页 API
+   } else {
+       // 回退到全量列表
+   }
+   ```
+
+**权衡取舍：**
+
+1. **FileSystemCatalog 的简单性 vs 功能限制**：
+   - 优势：零外部依赖，部署简单，适合小规模场景
+   - 劣势：不支持数据库属性、分页列表等高级功能
+
+2. **乐观锁 vs 悲观锁**：
+   - Paimon 选择乐观锁（基于文件原子创建），避免了分布式锁的复杂性
+   - 代价是在高并发场景下可能需要多次重试
+
+3. **缓存一致性 vs 性能**：
+   - `CachingCatalog` 提升了读取性能，但在多进程场景下可能读到过期数据
+   - 通过 `cache.expire-after-access` 配置平衡一致性和性能
+
+**架构演进：**
+
+Paimon 的 Catalog 设计经历了以下演进：
+1. **v0.1-0.3**：只有 FileSystemCatalog，功能简单
+2. **v0.4-0.6**：引入 HiveCatalog，支持企业级部署
+3. **v0.7-0.9**：引入 CachingCatalog 装饰器，优化性能
+4. **v1.0+**：引入 RESTCatalog，支持云原生架构
+
+**业界对比：**
+
+| 特性 | Paimon | Iceberg | Delta Lake |
+|------|--------|---------|------------|
+| 默认 Catalog | FileSystemCatalog | HadoopCatalog | 无独立 Catalog（依赖 Spark） |
+| 零外部依赖 | ✅ | ✅ | ❌（需要 Spark Metastore） |
+| Hive 集成 | ✅ | ✅ | ✅ |
+| REST Catalog | ✅ | ✅ | ❌ |
+| 装饰器模式 | ✅ | ✅ | ❌ |
+
 ### 2.1 类层次结构
 
 ```
@@ -502,6 +657,180 @@ Identifier 是 Paimon 中标识表/系统表/分支的统一标识符:
 
 ## 三、Schema 演进机制
 
+### 解决什么问题
+
+**核心业务问题：**
+1. **表结构变更的向后兼容性**：业务需求变化时需要添加列、修改列类型、删除列，但已有的数据文件不能重写（成本太高），必须支持新旧 Schema 共存。
+2. **并发 Schema 变更的安全性**：多个用户可能同时修改表结构（如添加不同的列），需要保证变更不会相互覆盖或产生冲突。
+3. **Schema 历史的可追溯性**：需要知道每个数据文件是用哪个版本的 Schema 写入的，以便在读取时正确解析。
+
+**没有这个设计的后果：**
+- 每次 Schema 变更都需要重写所有历史数据，成本极高且不可行
+- 并发变更会导致后提交的覆盖先提交的，丢失变更
+- 无法读取旧版本的数据文件，或者读取时数据错乱
+
+**实际场景：**
+```java
+// 场景1: 业务需要添加新字段
+// 表中已有 1TB 数据，不可能重写
+ALTER TABLE user_events ADD COLUMN user_age INT;
+
+// 场景2: 两个团队同时修改 Schema
+// 团队A: ALTER TABLE orders ADD COLUMN discount DECIMAL(10,2);
+// 团队B: ALTER TABLE orders ADD COLUMN tax DECIMAL(10,2);
+// 如果没有乐观锁，后提交的会覆盖先提交的
+
+// 场景3: 读取历史数据
+// 数据文件 file-1.parquet 用 schema-0 写入（3列）
+// 数据文件 file-2.parquet 用 schema-1 写入（4列）
+// 查询时需要自动对齐列，缺失的列填充 null
+```
+
+### 有什么坑
+
+**误区陷阱：**
+1. **新增列必须可空**：尝试 `ADD COLUMN age INT NOT NULL` 会失败。因为旧数据文件没有这一列，读取时只能填充 null。
+   ```java
+   // 错误
+   SchemaChange.addColumn("age", DataTypes.INT(), null, false); // nullable=false 会抛异常
+   
+   // 正确
+   SchemaChange.addColumn("age", DataTypes.INT(), null, true); // nullable=true
+   ```
+
+2. **不能删除主键或分区键**：尝试 `DROP COLUMN partition_date` 会失败，因为这会破坏表的分区结构。
+   ```java
+   // 错误：删除分区键
+   SchemaChange.dropColumn("partition_date"); // 抛异常
+   ```
+
+3. **类型变更有严格限制**：只能进行"安全"的类型转换（如 INT → BIGINT），不能进行可能丢失精度的转换（如 BIGINT → INT）。
+   ```java
+   // 安全的类型变更
+   SchemaChange.updateColumnType("age", DataTypes.BIGINT()); // INT → BIGINT ✅
+   
+   // 不安全的类型变更
+   SchemaChange.updateColumnType("amount", DataTypes.INT()); // BIGINT → INT ❌
+   ```
+
+**错误配置：**
+```java
+// 错误：在高并发场景下未配置足够的重试次数
+options.put("commit.max-retries", "1"); // 太少，容易失败
+// 正确
+options.put("commit.max-retries", "10");
+```
+
+**生产环境注意事项：**
+1. **Schema 变更需要停写吗？** 不需要。Paimon 的乐观锁机制允许在写入过程中变更 Schema，但可能导致写入重试。
+2. **Schema ID 会回收吗？** 不会。即使删除列，`highestFieldId` 也会持续增长，确保字段 ID 永不重复。
+3. **Schema 文件会被清理吗？** 不会。所有历史 Schema 文件都会保留，因为旧的数据文件可能仍然引用它们。
+
+**性能陷阱：**
+```java
+// 陷阱：频繁的 Schema 变更导致 schema 文件过多
+for (int i = 0; i < 1000; i++) {
+    schemaManager.commitChanges(SchemaChange.setOption("key" + i, "value"));
+    // 每次都会生成新的 schema-{id} 文件
+}
+
+// 优化：批量提交变更
+List<SchemaChange> changes = new ArrayList<>();
+for (int i = 0; i < 1000; i++) {
+    changes.add(SchemaChange.setOption("key" + i, "value"));
+}
+schemaManager.commitChanges(changes); // 只生成一个新 schema 文件
+```
+
+### 核心概念解释
+
+**Schema vs TableSchema：**
+- **Schema**：用户提供的表结构定义（字段、主键、分区键、配置），不包含内部信息。
+- **TableSchema**：持久化的完整表结构，包含 Schema ID、字段 ID、创建时间等内部信息。
+
+**字段 ID（Field ID）：**
+每个字段都有一个全局唯一的 ID，用于在 Schema 演进时追踪字段的身份。即使字段被重命名，ID 也不变。
+```java
+// schema-0: id=0, name="user_id", type=BIGINT
+// schema-1: 重命名字段
+// id=0, name="uid", type=BIGINT  // ID 不变，name 变了
+```
+
+**highestFieldId：**
+已分配的最大字段 ID。删除字段后，ID 不会回收，新字段从 `highestFieldId + 1` 开始分配。这确保了字段 ID 的唯一性。
+
+**SchemaChange：**
+表示一次 Schema 变更操作的抽象，支持多态序列化（用于 REST API）。常见类型：
+- `AddColumn` - 添加列
+- `DropColumn` - 删除列
+- `RenameColumn` - 重命名列
+- `UpdateColumnType` - 修改列类型
+- `SetOption` - 设置表配置
+- `RemoveOption` - 删除表配置
+
+**乐观锁（Optimistic Locking）：**
+不使用分布式锁，而是通过"读取-计算-写入-检查"的方式实现并发控制：
+1. 读取当前最新 Schema（如 schema-5）
+2. 基于 schema-5 计算新 Schema（schema-6）
+3. 尝试原子写入 schema-6
+4. 如果写入失败（别人已经写了 schema-6），回到步骤 1 重试
+
+### 设计理念
+
+**为什么这样设计：**
+
+1. **独立的 Schema 文件而非嵌入 Snapshot**：
+   - 优势：Schema 变更不需要重写 Snapshot，操作更轻量
+   - 优势：多个 Snapshot 可以共享同一个 Schema，节省存储
+   - 劣势：读取时需要额外的 IO 获取 Schema 文件
+
+2. **字段 ID 永不回收**：
+   - 确保了字段身份的唯一性，即使字段被删除后重新添加同名字段，也会分配新的 ID
+   - 避免了"删除列A → 添加列A"导致的数据混淆
+
+3. **乐观锁而非悲观锁**：
+   - 避免了分布式锁的复杂性和性能开销
+   - 在低冲突场景下性能更好
+   - 代价是高冲突场景下需要多次重试
+
+4. **新增列必须可空**：
+   - 这是向后兼容性的必然要求
+   - 旧数据文件没有新列的数据，读取时只能填充 null
+   - 如果允许 NOT NULL，会导致旧数据无法读取
+
+**权衡取舍：**
+
+1. **Schema 文件数量 vs 查询性能**：
+   - 每次变更都生成新文件，导致 schema 目录下文件数量增长
+   - 但查询时只需读取最新的 schema 文件，不影响性能
+   - 历史 schema 文件用于读取旧数据文件
+
+2. **类型变更的安全性 vs 灵活性**：
+   - Paimon 只允许"安全"的类型转换（如 INT → BIGINT）
+   - 这保证了数据不会丢失精度，但限制了灵活性
+   - 如果需要不安全的转换，必须通过 `INSERT OVERWRITE` 重写数据
+
+3. **并发性能 vs 一致性**：
+   - 乐观锁在低冲突场景下性能好，但高冲突场景下会频繁重试
+   - 可以通过配置 `commit.max-retries` 和 `commit.max-retry-wait` 调整
+
+**架构演进：**
+
+Paimon 的 Schema 演进机制经历了以下版本：
+- **v1 (Paimon 0.4-0.6)**：基础的 Schema 演进，支持添加/删除列
+- **v2 (Paimon 0.7-0.8)**：增加了字段 ID 追踪，支持列重命名
+- **v3 (Paimon 0.9+)**：增加了嵌套字段的支持，支持复杂类型的 Schema 演进
+
+**业界对比：**
+
+| 特性 | Paimon | Iceberg | Delta Lake |
+|------|--------|---------|------------|
+| Schema 存储 | 独立文件 (schema-{id}) | 嵌入 metadata.json | 嵌入 _delta_log |
+| 字段 ID | ✅ 永不回收 | ✅ 永不回收 | ❌ 无字段 ID |
+| 并发控制 | 乐观锁（文件原子创建） | 乐观锁（CAS on metadata） | 乐观锁（日志追加） |
+| 类型变更 | 严格限制（安全转换） | 严格限制 | 较宽松 |
+| 嵌套字段 | ✅ 支持 | ✅ 支持 | ✅ 支持 |
+
 ### 3.1 TableSchema 完整字段
 
 > 源码: `paimon-api/src/main/java/org/apache/paimon/schema/TableSchema.java`
@@ -696,6 +1025,196 @@ public Path toSchemaPath(long schemaId) {
 
 ## 四、Snapshot 管理
 
+### 解决什么问题
+
+**核心业务问题：**
+1. **时间旅行（Time Travel）**：用户需要查询历史某个时间点的数据，如"查询昨天下午3点的订单表"。
+2. **增量消费**：流式处理需要知道"从上次消费到现在新增了哪些数据"，而不是每次都扫描全表。
+3. **数据回滚**：发现数据错误后需要回滚到之前的正确状态，如"回滚到1小时前的快照"。
+4. **精确一次语义（Exactly-Once）**：分布式写入场景下，需要防止同一批数据被重复提交。
+
+**没有这个设计的后果：**
+- 无法查询历史数据，只能看到最新状态
+- 增量消费需要对比两次全量扫描的结果，效率极低
+- 数据错误后无法恢复，只能从备份重新导入
+- 分布式写入可能产生重复数据，破坏数据一致性
+
+**实际场景：**
+```sql
+-- 场景1: 时间旅行查询
+SELECT * FROM orders /*+ OPTIONS('scan.timestamp-millis'='1704067200000') */;
+
+-- 场景2: 增量消费
+SELECT * FROM orders /*+ OPTIONS('scan.mode'='from-snapshot', 'scan.snapshot-id'='100') */;
+
+-- 场景3: 数据回滚
+CALL sys.rollback_to('my_db.orders', 95); -- 回滚到 snapshot-95
+
+-- 场景4: 精确一次写入
+// Flink checkpoint 100 提交了 snapshot-50
+// 如果 checkpoint 100 失败重启，重新提交时会检测到 snapshot-50 已存在，跳过提交
+```
+
+### 有什么坑
+
+**误区陷阱：**
+1. **Snapshot 不是数据备份**：Snapshot 只是元数据的快照，底层数据文件是共享的。删除 Snapshot 不会立即删除数据文件，但过期后会清理。
+   ```java
+   // 误区：以为删除 snapshot 就删除了数据
+   snapshotManager.deleteSnapshot(100); // 只删除 snapshot-100 文件
+   // 数据文件仍然存在，直到没有任何 snapshot 引用它们
+   ```
+
+2. **commitIdentifier 不是全局唯一的**：它只在同一个 `commitUser` 内唯一。不同的 commitUser 可以有相同的 commitIdentifier。
+   ```java
+   // 正确的去重判断
+   boolean isDuplicate = (snapshot.commitUser().equals(myUser) 
+                          && snapshot.commitIdentifier() == myIdentifier
+                          && snapshot.commitKind() == myKind);
+   ```
+
+3. **Snapshot 过期配置要谨慎**：如果 `snapshot.time-retained` 设置太短，可能导致正在运行的长查询失败（查询的 Snapshot 被删除了）。
+   ```java
+   // 危险配置
+   options.put("snapshot.time-retained", "5min"); // 太短
+   // 如果有查询运行超过5分钟，可能读取失败
+   
+   // 安全配置
+   options.put("snapshot.time-retained", "1h");
+   options.put("snapshot.num-retained.min", "10"); // 至少保留10个
+   ```
+
+**错误配置：**
+```java
+// 错误：只配置了 time-retained，没有配置 num-retained.min
+options.put("snapshot.time-retained", "10min");
+// 如果10分钟内提交了100个 snapshot，全部会被保留，占用大量空间
+
+// 正确：同时配置时间和数量限制
+options.put("snapshot.time-retained", "1h");
+options.put("snapshot.num-retained.min", "10");
+options.put("snapshot.num-retained.max", "100");
+```
+
+**生产环境注意事项：**
+1. **LATEST hint 文件可能不准确**：在高并发写入场景下，hint 文件可能指向一个不是最新的 Snapshot。Paimon 会自动验证并回退到目录扫描。
+2. **Snapshot 过期是异步的**：配置 `snapshot.time-retained` 后，过期的 Snapshot 不会立即删除，需要等待后台任务执行。
+3. **Watermark 只增不减**：即使回滚到旧 Snapshot，watermark 也不会回退，这是为了保证流式处理的正确性。
+
+**性能陷阱：**
+```java
+// 陷阱：频繁调用 latestSnapshot() 导致大量文件系统扫描
+for (int i = 0; i < 1000; i++) {
+    Snapshot snapshot = snapshotManager.latestSnapshot();
+    // 如果 LATEST hint 失效，每次都会扫描目录
+}
+
+// 优化：使用缓存
+Snapshot snapshot = snapshotManager.latestSnapshot(); // 只查询一次
+for (int i = 0; i < 1000; i++) {
+    // 使用缓存的 snapshot
+}
+```
+
+### 核心概念解释
+
+**Snapshot（快照）：**
+表在某个时间点的完整数据视图入口。它不包含实际数据，只包含指向数据文件的元数据（通过 ManifestList）。
+
+**Snapshot ID：**
+全局单调递增的快照编号，从 1 开始。每次提交都会生成新的 Snapshot ID。
+
+**commitUser + commitIdentifier：**
+用于精确一次语义的去重机制：
+- `commitUser`：提交者的唯一标识（如 Flink job ID）
+- `commitIdentifier`：提交者内部的单调递增序列号（如 Flink checkpoint ID）
+- 组合起来可以唯一标识一次提交
+
+**CommitKind（提交类型）：**
+- `APPEND`：追加新数据，不删除已有文件
+- `COMPACT`：压缩合并，不改变逻辑数据
+- `OVERWRITE`：覆写分区或删除文件
+- `ANALYZE`：收集统计信息
+
+**base/delta/changelog 三分法：**
+- `baseManifestList`：截至本次提交的所有有效数据文件（合并后的全量）
+- `deltaManifestList`：本次提交的增量变更（新增/删除的文件）
+- `changelogManifestList`：CDC 变更日志文件（可选）
+
+**Watermark（水位线）：**
+流式处理中的事件时间进度标记。Snapshot 记录了提交时的 watermark，用于流式读取的断点续传。
+
+**LATEST hint 文件：**
+位于 `{snapshot_dir}/LATEST` 的提示文件，记录最新的 Snapshot ID，用于快速定位，避免每次都扫描目录。
+
+### 设计理念
+
+**为什么这样设计：**
+
+1. **base/delta 分离的核心价值**：
+   - 全量查询只需读取 base，性能高
+   - 增量消费只需读取 delta，避免对比全量
+   - Snapshot 过期时只需扫描 delta 即可知道哪些文件可以删除
+   ```java
+   // 全量读取
+   List<ManifestFileMeta> files = manifestList.readDataManifests(snapshot);
+   // 只读取 base + delta
+   
+   // 增量读取
+   List<ManifestFileMeta> delta = manifestList.readDeltaManifests(snapshot);
+   // 只读取 delta，效率高
+   ```
+
+2. **Snapshot 只是元数据，不是数据副本**：
+   - 多个 Snapshot 共享底层数据文件，节省存储空间
+   - 创建 Snapshot 是 O(1) 操作，只需写入一个小的 JSON 文件
+   - 代价是需要引用计数机制来管理数据文件的生命周期
+
+3. **commitIdentifier 的精确一次语义**：
+   - 分布式写入场景下，同一批数据可能因为重试被提交多次
+   - 通过 `(commitUser, commitIdentifier, commitKind)` 三元组去重
+   - 如果发现已存在相同的 Snapshot，直接返回成功，不重复提交
+
+4. **LATEST hint 文件的优化**：
+   - 避免每次都扫描目录（对象存储上的 list 操作很慢）
+   - 但 hint 可能不准确（并发写入、缓存延迟），需要验证
+   - 验证方法：检查 hint 指向的 Snapshot ID + 1 是否存在
+
+**权衡取舍：**
+
+1. **Snapshot 数量 vs 存储空间**：
+   - 每个 Snapshot 都是一个文件，过多会占用空间和 inode
+   - 通过 `snapshot.num-retained.max` 限制数量
+   - 通过 `snapshot.time-retained` 自动过期
+
+2. **LATEST hint 的准确性 vs 性能**：
+   - hint 文件可能不准确，但大多数情况下是准确的
+   - 准确时只需 1-2 次文件操作，不准确时回退到目录扫描
+   - 这是一个"乐观假设"的优化
+
+3. **Watermark 只增不减 vs 回滚灵活性**：
+   - 保证流式处理的单调性，避免数据重复消费
+   - 代价是回滚后 watermark 不会回退，可能导致部分数据被跳过
+   - 这是流式语义的必然要求
+
+**架构演进：**
+
+Snapshot 格式经历了三个版本：
+- **v1 (Paimon 0.4-0.6)**：基础的 Snapshot，只有 manifestList 字段
+- **v2 (Paimon 0.7-0.8)**：增加了 base/delta 分离，增加了 commitKind
+- **v3 (Paimon 0.9+)**：增加了 changelogManifestList、watermark、statistics、nextRowId 等字段
+
+**业界对比：**
+
+| 特性 | Paimon | Iceberg | Delta Lake |
+|------|--------|---------|------------|
+| Snapshot 格式 | JSON 文件 | Avro 文件 | JSON 日志 |
+| 增量追踪 | base/delta 分离 | added_snapshot_id 标记 | 日志追加 |
+| Changelog 支持 | ✅ 原生支持 | ❌ 需要计算 diff | ❌ 需要计算 diff |
+| Watermark | ✅ 原生支持 | ❌ 无 | ❌ 无 |
+| 精确一次 | commitUser + commitIdentifier | sequence number | txn version |
+| LATEST hint | ✅ 有 | ❌ 无 | ✅ 有（_last_checkpoint） |
+
 ### 4.1 Snapshot 完整字段表格
 
 > 源码: `paimon-api/src/main/java/org/apache/paimon/Snapshot.java`
@@ -854,6 +1373,190 @@ Paimon 维护了一个 LATEST hint 文件（位于 `{snapshot_dir}/LATEST`），
 ---
 
 ## 五、Tag 和 Branch 机制
+
+### 解决什么问题
+
+**核心业务问题：**
+1. **数据版本管理**：需要为重要的数据版本打标签，如"2024年度财报数据"、"v1.0发布版本"，防止被自动过期删除。
+2. **并行开发隔离**：多个团队需要在同一张表上进行独立的开发和测试，互不干扰，类似 Git 的分支功能。
+3. **A/B 测试**：需要在生产数据的基础上创建实验分支，测试新的数据处理逻辑，不影响生产环境。
+4. **数据快照保留**：某些快照需要长期保留（如月末快照），但又不想保留所有中间快照。
+
+**没有这个设计的后果：**
+- 重要的历史数据会被自动过期删除，无法追溯
+- 多团队开发时相互干扰，测试数据污染生产数据
+- 无法进行安全的实验，只能在生产环境直接修改
+- 需要手动管理快照保留策略，容易出错
+
+**实际场景：**
+```sql
+-- 场景1: 为月末快照打标签
+CALL sys.create_tag('my_db.orders', 'month_end_2024_01', 100);
+
+-- 场景2: 创建开发分支进行测试
+CALL sys.create_branch('my_db.orders', 'dev_team_a', 'month_end_2024_01');
+-- 在分支上进行开发
+INSERT INTO `my_db.orders$branch_dev_team_a` VALUES (...);
+
+-- 场景3: 测试通过后合并到主分支
+CALL sys.fast_forward('my_db.orders', 'dev_team_a');
+
+-- 场景4: 设置 Tag 自动过期
+CALL sys.create_tag('my_db.orders', 'daily_backup', 100, '7 d'); -- 7天后自动删除
+```
+
+### 有什么坑
+
+**误区陷阱：**
+1. **Tag 不是数据副本**：Tag 只是对 Snapshot 的引用，底层数据文件是共享的。删除 Tag 不会立即删除数据，但如果没有其他引用，数据会被清理。
+   ```java
+   // 误区：以为 Tag 是独立的数据副本
+   tagManager.createTag(snapshot, "backup", null, null, false);
+   // Tag 只是引用，不会复制数据文件
+   ```
+
+2. **分支不能直接 DDL**：尝试 `DROP TABLE my_table$branch_dev` 会失败，必须使用 `BranchManager.dropBranch()`。
+   ```sql
+   -- 错误
+   DROP TABLE my_table$branch_dev; -- 抛异常
+   
+   -- 正确
+   CALL sys.drop_branch('my_db.my_table', 'dev');
+   ```
+
+3. **fast_forward 不是 merge**：`fast_forward` 只是将主分支的指针移动到分支的最新 Snapshot，不会合并冲突。如果主分支在此期间有新提交，fast_forward 会失败。
+   ```java
+   // 场景：主分支和分支都有新提交
+   // main: snapshot-100 → snapshot-101
+   // dev:  snapshot-100 → snapshot-102
+   branchManager.fastForward("dev"); // 失败，因为 main 已经前进到 101
+   ```
+
+**错误配置：**
+```java
+// 错误：Tag TTL 设置太短
+tagManager.createTag(snapshot, "important", Duration.ofHours(1), ...);
+// 1小时后 Tag 就会被删除，可能还没来得及使用
+
+// 错误：创建分支时忘记指定 Tag
+branchManager.createBranch("dev"); // 从最新 Schema 创建空分支
+// 如果想从某个历史版本创建分支，必须先打 Tag
+```
+
+**生产环境注意事项：**
+1. **Tag 会阻止数据清理**：被 Tag 引用的 Snapshot 和数据文件不会被过期删除，即使超过了 `snapshot.time-retained`。
+2. **分支共享数据文件**：分支创建时不会复制数据文件，只复制元数据（Schema/Snapshot/Tag）。新写入的数据会生成新文件。
+3. **删除分支要谨慎**：`dropBranch` 会删除分支独有的数据文件。如果分支有重要数据，删除前要先 fast_forward 或导出。
+
+**性能陷阱：**
+```java
+// 陷阱：频繁创建和删除 Tag
+for (int i = 0; i < 1000; i++) {
+    tagManager.createTag(snapshot, "temp_" + i, null, null, false);
+    tagManager.deleteTag("temp_" + i, ...);
+}
+// 每次都会进行文件 IO，性能差
+
+// 优化：使用 Snapshot 的 num-retained 配置，而不是手动管理 Tag
+options.put("snapshot.num-retained.min", "1000");
+```
+
+### 核心概念解释
+
+**Tag（标签）：**
+对某个 Snapshot 的命名引用，类似 Git Tag。Tag 的物理文件内容就是被标记 Snapshot 的完整 JSON（可能附加 TTL 信息）。
+
+**Tag TTL（Time To Live）：**
+Tag 的自动过期时间。创建 Tag 时可以指定 `timeRetained`，到期后 Tag 会被自动删除。
+
+**Branch（分支）：**
+表的独立演进路径，拥有自己的 Schema、Snapshot、Tag，但共享底层数据文件。类似 Git 的分支。
+
+**Main Branch（主分支）：**
+默认的分支，名称为 `"main"`。所有表创建时都在主分支上。
+
+**Fast Forward（快进）：**
+将分支的最新状态合并到主分支。要求主分支没有新的提交（即分支是主分支的"直接后继"）。
+
+**写时复制（Copy-on-Write）：**
+分支创建时不复制数据文件，只复制元数据。新写入的数据会生成新文件，不会修改已有文件。
+
+### 设计理念
+
+**为什么这样设计：**
+
+1. **Tag 即 Snapshot 副本**：
+   - Tag 文件的内容就是 Snapshot 的 JSON，加上可选的 TTL 信息
+   - 这使得 Tag 的实现非常简单，不需要额外的数据结构
+   - 读取 Tag 就是读取 Snapshot，无需额外的映射表
+   ```java
+   // Tag 文件内容
+   {
+     "version": 3,
+     "id": 100,
+     "schemaId": 5,
+     "baseManifestList": "manifest-list-xxx",
+     ...
+     "tagCreateTime": "2024-01-01T00:00:00",  // Tag 特有字段
+     "tagTimeRetained": "PT168H"              // Tag 特有字段
+   }
+   ```
+
+2. **分支共享数据文件的写时复制**：
+   - 分支创建是 O(1) 操作，只需复制少量元数据文件
+   - 节省存储空间，避免大量数据复制
+   - 新写入的数据会生成新文件，不会影响其他分支
+   ```
+   main:   snapshot-100 → file-1, file-2
+   branch: snapshot-100 → file-1, file-2  (共享)
+           snapshot-101 → file-1, file-2, file-3  (file-3 是新的)
+   ```
+
+3. **分支路径的文件系统布局**：
+   - 主分支：`{table}/schema/`, `{table}/snapshot/`, `{table}/tag/`
+   - 其他分支：`{table}/branch/branch-{name}/schema/`, `{table}/branch/branch-{name}/snapshot/`
+   - 数据文件和 manifest 文件在 `{table}/manifest/` 和 `{table}/data/` 下共享
+
+4. **fast_forward 的限制**：
+   - 只允许"快进"式合并，不支持"三方合并"
+   - 这简化了实现，避免了复杂的冲突解决逻辑
+   - 如果需要合并有冲突的分支，需要手动处理
+
+**权衡取舍：**
+
+1. **Tag 阻止数据清理 vs 存储成本**：
+   - Tag 会阻止被引用的数据文件被删除，可能导致存储空间持续增长
+   - 通过 Tag TTL 机制自动清理过期 Tag
+   - 需要在数据保留和存储成本之间平衡
+
+2. **分支隔离 vs 数据共享**：
+   - 分支之间逻辑隔离，但物理共享数据文件
+   - 优势：创建分支快速，节省存储
+   - 劣势：删除分支时需要判断哪些文件是独有的，逻辑复杂
+
+3. **fast_forward 的简单性 vs 灵活性**：
+   - 只支持快进式合并，不支持复杂的合并策略
+   - 优势：实现简单，不需要冲突解决
+   - 劣势：如果主分支有新提交，无法自动合并
+
+**架构演进：**
+
+Tag 和 Branch 机制的演进：
+- **v0.4-0.6**：只有 Snapshot，没有 Tag 和 Branch
+- **v0.7-0.8**：引入 Tag 机制，支持命名快照
+- **v0.9+**：引入 Branch 机制，支持并行开发
+- **v1.0+**：增加 Tag TTL 自动过期功能
+
+**业界对比：**
+
+| 特性 | Paimon | Iceberg | Delta Lake |
+|------|--------|---------|------------|
+| Tag 支持 | ✅ 原生支持 | ✅ 通过 Ref（1.5+） | ❌ 无 |
+| Branch 支持 | ✅ 原生支持 | ✅ 通过 Ref（1.5+） | ❌ 无 |
+| Tag TTL | ✅ 支持 | ❌ 无 | - |
+| Fast Forward | ✅ 支持 | ✅ 支持 | - |
+| 写时复制 | ✅ 是 | ✅ 是 | - |
+| 文件系统布局 | 独立目录 | 通过 Ref 文件 | - |
 
 ### 5.1 TagManager 标签管理
 
@@ -1031,6 +1734,202 @@ public void createBranch(String branchName, String tagName, boolean ignoreIfExis
 ---
 
 ## 六、Manifest 三级结构
+
+### 解决什么问题
+
+**核心业务问题：**
+1. **大表的元数据可伸缩性**：一个大表可能包含数百万个数据文件，如果全部记录在 Snapshot 中，每次提交都需要重写整个文件，代价极高。
+2. **增量提交的效率**：每次提交只涉及少量文件的变更，不应该重写所有文件的元数据。
+3. **查询时的文件过滤**：查询时需要根据分区、桶、LSM level 等条件快速过滤出相关的数据文件，避免读取所有元数据。
+4. **Manifest 文件的碎片化**：随着提交次数增加，Manifest 文件数量也会增加，需要周期性合并以减少读取时的 IO 次数。
+
+**没有这个设计的后果：**
+- Snapshot 文件会随着表的增长而无限膨胀，最终无法处理
+- 每次提交都需要重写所有文件的元数据，性能极差
+- 查询时需要读取所有数据文件的元数据，无法快速过滤
+- 元数据文件碎片化严重，影响查询性能
+
+**实际场景：**
+```java
+// 场景1: 大表的增量提交
+// 表有 1,000,000 个数据文件
+// 本次提交只新增了 10 个文件
+// 如果没有三级结构，需要重写包含 1,000,010 个文件的元数据
+// 有了三级结构，只需写入包含 10 个文件的新 ManifestFile
+
+// 场景2: 分区过滤
+// 查询 WHERE partition_date = '2024-01-01'
+// ManifestFileMeta 的 partitionStats 记录了每个 ManifestFile 的分区范围
+// 可以快速跳过不相关的 ManifestFile，避免读取其内容
+
+// 场景3: Manifest 合并
+// 经过 100 次提交，产生了 100 个小的 ManifestFile
+// 合并为 10 个大的 ManifestFile，减少读取时的 IO 次数
+```
+
+### 有什么坑
+
+**误区陷阱：**
+1. **ManifestFileMeta 的统计信息可能为空**：`minBucket`、`maxBucket`、`minLevel`、`maxLevel` 等字段是后来添加的优化字段，旧版本生成的 ManifestFileMeta 中这些字段为 null。
+   ```java
+   // 错误：直接使用可能为 null 的字段
+   if (meta.minBucket() == 0) { ... } // NPE 风险
+   
+   // 正确：先判空
+   if (meta.minBucket() != null && meta.minBucket() == 0) { ... }
+   ```
+
+2. **ManifestEntry 的 ADD/DELETE 不是物理操作**：它们是逻辑操作记录，不会立即修改文件系统。
+   ```java
+   // 误区：以为 DELETE entry 会立即删除文件
+   ManifestEntry entry = new ManifestEntry(FileKind.DELETE, partition, bucket, file);
+   // 文件仍然存在于文件系统，只是逻辑上被标记为删除
+   ```
+
+3. **Manifest 合并不是实时的**：合并在提交时触发，但有阈值限制（`manifest.merge-min-count`）。如果 ManifestFile 数量未达到阈值，不会合并。
+   ```java
+   // 配置了合并阈值
+   options.put("manifest.merge-min-count", "30");
+   // 只有当 ManifestFile 数量 >= 30 时才会触发合并
+   ```
+
+**错误配置：**
+```java
+// 错误：manifest.target-file-size 设置太小
+options.put("manifest.target-file-size", "1MB"); // 太小
+// 导致 ManifestFile 数量过多，查询时需要读取大量小文件
+
+// 错误：manifest.merge-min-count 设置太大
+options.put("manifest.merge-min-count", "1000"); // 太大
+// 导致 ManifestFile 长期不合并，碎片化严重
+
+// 推荐配置
+options.put("manifest.target-file-size", "8MB");
+options.put("manifest.merge-min-count", "30");
+options.put("manifest.full-compaction-threshold-size", "16MB");
+```
+
+**生产环境注意事项：**
+1. **ManifestList 文件不会被清理**：即使 Snapshot 被删除，其引用的 ManifestList 文件也不会立即删除。需要等待 Snapshot 过期后，后台任务才会清理。
+2. **Manifest 缓存要合理配置**：`CachingCatalog` 会缓存 Manifest 文件内容，但如果缓存配置不当，可能占用大量内存。
+3. **对象存储上的 Manifest 读取性能**：对象存储的小文件读取性能较差，建议增大 `manifest.target-file-size`。
+
+**性能陷阱：**
+```java
+// 陷阱：频繁读取 ManifestFile 内容
+for (ManifestFileMeta meta : manifestList.read(...)) {
+    List<ManifestEntry> entries = manifestFile.read(meta.fileName(), meta.fileSize());
+    // 每次都会进行文件 IO
+}
+
+// 优化：利用 ManifestFileMeta 的统计信息过滤
+for (ManifestFileMeta meta : manifestList.read(...)) {
+    if (!partitionFilter.test(meta.partitionStats())) {
+        continue; // 跳过不相关的 ManifestFile
+    }
+    List<ManifestEntry> entries = manifestFile.read(meta.fileName(), meta.fileSize());
+}
+```
+
+### 核心概念解释
+
+**三级结构：**
+```
+Snapshot (JSON 文件)
+  ↓ 引用
+ManifestList (二进制文件, 包含 ManifestFileMeta 列表)
+  ↓ 引用
+ManifestFile (二进制文件, 包含 ManifestEntry 列表)
+  ↓ 引用
+Data Files (实际数据文件)
+```
+
+**ManifestList（清单列表）：**
+包含多个 `ManifestFileMeta` 的二进制文件。Snapshot 通过 `baseManifestList`、`deltaManifestList`、`changelogManifestList` 三个字段引用不同类型的 ManifestList。
+
+**ManifestFileMeta（清单文件元数据）：**
+ManifestFile 的"摘要信息"，包含文件名、大小、ADD/DELETE 数量、分区统计信息等。用于快速过滤不需要读取的 ManifestFile。
+
+**ManifestFile（清单文件）：**
+包含多个 `ManifestEntry` 的二进制文件。每个 ManifestEntry 表示一个数据文件的添加或删除操作。
+
+**ManifestEntry（清单条目）：**
+表示一个数据文件的逻辑操作（ADD 或 DELETE），包含分区、桶、文件元数据等信息。
+
+**FileKind（文件操作类型）：**
+- `ADD (0)`：文件添加
+- `DELETE (1)`：文件删除
+
+**Manifest 合并（Manifest Merge）：**
+将多个小的 ManifestFile 合并为少量大的 ManifestFile，减少读取时的 IO 次数。合并时会消除 DELETE entries（如果对应的 ADD entry 也在合并范围内）。
+
+### 设计理念
+
+**为什么这样设计：**
+
+1. **三级结构的核心价值**：
+   - **可伸缩性**：支持数百万个数据文件，Snapshot 文件大小保持恒定（只包含 ManifestList 的文件名）
+   - **增量写入**：每次提交只需写入新的 ManifestFile 和 ManifestList，不需要重写所有元数据
+   - **快速过滤**：通过 ManifestFileMeta 的统计信息快速跳过不相关的 ManifestFile
+
+2. **ManifestFileMeta 的统计信息**：
+   - `partitionStats`：记录分区字段的 min/max/null count，支持分区过滤
+   - `minBucket`/`maxBucket`：支持桶级过滤
+   - `minLevel`/`maxLevel`：支持 LSM level 过滤
+   - 这些统计信息使得查询时可以跳过大量不相关的 ManifestFile，大幅提升性能
+
+3. **ADD/DELETE 的逻辑操作**：
+   - ManifestEntry 不直接修改文件系统，只记录逻辑操作
+   - 通过合并所有 ManifestEntry 可以得到有效文件列表
+   - 这使得提交操作是纯粹的追加写入，不需要修改已有文件
+
+4. **Manifest 合并的必要性**：
+   - 随着提交次数增加，ManifestFile 数量也会增加
+   - 过多的小文件会导致查询时的 IO 次数过多
+   - 合并可以消除 DELETE entries，减少元数据大小
+   ```java
+   // 合并前
+   ManifestFile-1: [ADD file-1, ADD file-2]
+   ManifestFile-2: [DELETE file-1, ADD file-3]
+   ManifestFile-3: [ADD file-4]
+   
+   // 合并后
+   ManifestFile-merged: [ADD file-2, ADD file-3, ADD file-4]
+   // file-1 的 ADD 和 DELETE 被消除
+   ```
+
+**权衡取舍：**
+
+1. **三级结构的复杂性 vs 可伸缩性**：
+   - 三级结构增加了实现复杂度，需要管理多层文件
+   - 但这是支持大表的唯一方式，否则 Snapshot 文件会无限膨胀
+
+2. **ManifestFileMeta 统计信息的准确性 vs 存储开销**：
+   - 统计信息需要额外的存储空间
+   - 但可以大幅减少查询时的 IO，性价比很高
+
+3. **Manifest 合并的频率 vs 写入性能**：
+   - 频繁合并可以减少 ManifestFile 数量，提升查询性能
+   - 但合并本身需要读取和重写 ManifestFile，影响写入性能
+   - 通过 `manifest.merge-min-count` 和 `manifest.full-compaction-threshold-size` 平衡
+
+**架构演进：**
+
+Manifest 结构的演进：
+- **v0.1-0.3**：只有两级结构（Snapshot → DataFile），无法支持大表
+- **v0.4-0.6**：引入三级结构（Snapshot → ManifestList → ManifestFile → DataFile）
+- **v0.7-0.8**：增加 ManifestFileMeta 的统计信息（partitionStats）
+- **v0.9+**：增加 minBucket/maxBucket/minLevel/maxLevel 等优化字段
+
+**业界对比：**
+
+| 特性 | Paimon | Iceberg | Delta Lake |
+|------|--------|---------|------------|
+| 层级结构 | 三级 | 三级 | 两级（Snapshot → DataFile） |
+| 统计信息 | ✅ 丰富（分区/桶/level） | ✅ 丰富（分区/列） | ✅ 基础（分区） |
+| Manifest 合并 | ✅ 自动合并 | ✅ 自动合并 | ❌ 无 |
+| 增量追踪 | base/delta 分离 | added_snapshot_id | 日志追加 |
+| 文件格式 | 二进制（Avro） | Avro | Parquet |
 
 ### 6.1 整体架构
 
@@ -1222,6 +2121,252 @@ public enum FileKind {
 ---
 
 ## 七、Commit 流程
+
+### 解决什么问题
+
+**核心业务问题：**
+1. **并发写入的安全性**：多个写入者可能同时向同一张表提交数据，需要保证数据不会相互覆盖或产生冲突。
+2. **精确一次语义（Exactly-Once）**：分布式写入场景下，同一批数据可能因为重试被提交多次，需要自动去重。
+3. **数据一致性**：提交必须是原子的——要么全部成功，要么全部失败，不能出现部分成功的中间状态。
+4. **冲突检测**：对于主键表，需要检测并发写入是否产生了 key range 重叠，避免破坏主键唯一性。
+5. **APPEND 和 COMPACT 的分离**：追加新数据和压缩旧数据是两种不同的操作，需要分别提交和管理。
+
+**没有这个设计的后果：**
+- 并发写入会相互覆盖，导致数据丢失
+- 重试会产生重复数据，破坏数据一致性
+- 提交失败后可能留下不一致的中间状态
+- 主键表可能出现重复的主键值
+- 无法区分数据变更和物理优化，影响流式消费
+
+**实际场景：**
+```java
+// 场景1: 并发写入
+// 两个 Flink job 同时向同一张表写入数据
+// Job A: 提交 snapshot-100（新增 file-1, file-2）
+// Job B: 提交 snapshot-100（新增 file-3, file-4）
+// 乐观锁机制确保只有一个成功，另一个重试为 snapshot-101
+
+// 场景2: 精确一次语义
+// Flink checkpoint 100 提交了 snapshot-50
+// 如果 checkpoint 100 失败重启，重新提交时会检测到 snapshot-50 已存在
+// 通过 (commitUser, commitIdentifier, commitKind) 去重，跳过重复提交
+
+// 场景3: 冲突检测
+// 两个写入者同时向同一个 bucket 写入数据
+// Writer A: 写入 key range [1, 100]
+// Writer B: 写入 key range [50, 150]
+// 冲突检测发现 key range 重叠，拒绝提交
+
+// 场景4: APPEND/COMPACT 分离
+// 一次提交包含新数据和压缩结果
+// 生成两个 snapshot: snapshot-100 (APPEND), snapshot-101 (COMPACT)
+// 流式消费者只消费 APPEND 类型的 snapshot
+```
+
+### 有什么坑
+
+**误区陷阱：**
+1. **commit() 可能生成 0-2 个 Snapshot**：不是每次 commit 都会生成 Snapshot。如果没有变更且 `ignoreEmptyCommit=true`，不会生成 Snapshot。
+   ```java
+   // 误区：以为每次 commit 都会生成 Snapshot
+   int count = commit.commit(committable, true);
+   // count 可能是 0（无变更）、1（只有 APPEND 或 COMPACT）、2（APPEND + COMPACT）
+   ```
+
+2. **冲突检测不是全局的**：只检测变更分区内的冲突，不同分区的并发写入不会冲突。
+   ```java
+   // 不会冲突：写入不同分区
+   Writer A: INSERT INTO t PARTITION(dt='2024-01-01') ...
+   Writer B: INSERT INTO t PARTITION(dt='2024-01-02') ...
+   
+   // 可能冲突：写入相同分区
+   Writer A: INSERT INTO t PARTITION(dt='2024-01-01') ...
+   Writer B: INSERT INTO t PARTITION(dt='2024-01-01') ...
+   ```
+
+3. **OVERWRITE 会自动升级**：如果 APPEND 提交包含 DELETE 操作或 Deletion Vector，会自动升级为 OVERWRITE，启用更严格的冲突检测。
+   ```java
+   // 原本是 APPEND
+   CommitKind kind = CommitKind.APPEND;
+   // 但如果包含 DELETE 或 DV
+   if (hasDelete || hasDV) {
+       kind = CommitKind.OVERWRITE; // 自动升级
+   }
+   ```
+
+**错误配置：**
+```java
+// 错误：commit.max-retries 设置太小
+options.put("commit.max-retries", "1"); // 太少
+// 在高并发场景下容易失败
+
+// 错误：commit.timeout 设置太短
+options.put("commit.timeout", "10s"); // 太短
+// 如果冲突检测需要读取大量文件，可能超时
+
+// 推荐配置
+options.put("commit.max-retries", "10");
+options.put("commit.timeout", "5min");
+options.put("commit.min-retry-wait", "10ms");
+options.put("commit.max-retry-wait", "10s");
+```
+
+**生产环境注意事项：**
+1. **对象存储必须启用锁**：S3/OSS 等对象存储的原子操作能力有限，必须配置 `CatalogLock` 来保证并发安全。
+2. **重试会增加延迟**：在高并发场景下，重试次数可能很多，导致提交延迟增加。需要监控 `retryCount` 指标。
+3. **冲突检测会读取大量文件**：如果变更的分区包含大量数据文件，冲突检测需要读取所有文件的元数据，影响性能。
+
+**性能陷阱：**
+```java
+// 陷阱：频繁的小批量提交
+for (int i = 0; i < 1000; i++) {
+    commit.commit(singleRecord, true);
+    // 每次都会进行冲突检测和 Manifest 合并，性能差
+}
+
+// 优化：批量提交
+List<CommitMessage> batch = new ArrayList<>();
+for (int i = 0; i < 1000; i++) {
+    batch.add(singleRecord);
+}
+commit.commit(ManifestCommittable.fromMessages(batch), true);
+```
+
+### 核心概念解释
+
+**CommitMessage（提交消息）：**
+表示一次写入操作产生的文件变更，包含新增的数据文件、删除的数据文件、changelog 文件、索引文件等。
+
+**ManifestCommittable（清单可提交对象）：**
+包含多个 `CommitMessage` 的聚合对象，表示一次完整的提交。
+
+**CommitKind（提交类型）：**
+- `APPEND`：追加新数据，不删除已有文件
+- `COMPACT`：压缩合并，不改变逻辑数据
+- `OVERWRITE`：覆写分区或删除文件
+- `ANALYZE`：收集统计信息
+
+**乐观锁（Optimistic Locking）：**
+不使用分布式锁，而是通过"读取-计算-写入-检查"的方式实现并发控制。如果写入失败（别人已经写了相同的 Snapshot ID），则重试。
+
+**冲突检测（Conflict Detection）：**
+检查并发写入是否产生了数据冲突，如 key range 重叠、桶数不一致等。
+
+**去重检测（Deduplication）：**
+通过 `(commitUser, commitIdentifier, commitKind)` 三元组判断提交是否已经完成，避免重复提交。
+
+**回滚（Rollback）：**
+当检测到冲突且允许回滚时，尝试删除冲突的文件，然后重试提交。
+
+**增量冲突检测优化：**
+重试时不重新读取所有 base 数据文件，而是在上次读取的基础上增量更新。
+
+### 设计理念
+
+**为什么这样设计：**
+
+1. **APPEND 和 COMPACT 分离提交**：
+   - 语义清晰：APPEND 表示新数据，COMPACT 表示物理优化
+   - 流式消费者可以只消费 APPEND 类型的 Snapshot
+   - 冲突处理不同：APPEND 可能需要回滚，COMPACT 不需要
+   ```java
+   // 一次 commit 可能生成两个 Snapshot
+   commit(committable) {
+       if (hasAppend) {
+           tryCommit(..., CommitKind.APPEND, ...); // snapshot-100
+       }
+       if (hasCompact) {
+           tryCommit(..., CommitKind.COMPACT, ...); // snapshot-101
+       }
+   }
+   ```
+
+2. **乐观锁的核心价值**：
+   - 避免了分布式锁的复杂性和性能开销
+   - 在低冲突场景下性能更好（大多数情况下一次成功）
+   - 代价是高冲突场景下需要多次重试
+   ```java
+   while (true) {
+       Snapshot latest = snapshotManager.latestSnapshot();
+       Snapshot newSnapshot = buildSnapshot(latest.id() + 1, ...);
+       boolean success = fileIO.tryToWriteAtomic(snapshotPath, newSnapshot);
+       if (success) break; // 成功
+       // 失败则重试
+   }
+   ```
+
+3. **精确一次语义的去重机制**：
+   - 分布式写入场景下，同一批数据可能因为重试被提交多次
+   - 通过 `(commitUser, commitIdentifier, commitKind)` 三元组去重
+   - 如果发现已存在相同的 Snapshot，直接返回成功
+   ```java
+   // 检查是否已经提交
+   for (long id = lastSnapshot.id() + 1; id <= latestSnapshot.id(); id++) {
+       Snapshot s = snapshotManager.snapshot(id);
+       if (s.commitUser().equals(myUser) 
+           && s.commitIdentifier() == myIdentifier
+           && s.commitKind() == myKind) {
+           return SuccessCommitResult; // 已经提交过了
+       }
+   }
+   ```
+
+4. **冲突检测的多层次检查**：
+   - 桶数一致性：同一分区内的所有文件必须具有相同的 totalBuckets
+   - Key Range 重叠：主键表的文件 key range 不能重叠
+   - 删除文件存在性：要删除的文件必须存在于 base 中
+   - Row ID 范围冲突：Row Tracking 场景下的 ID 范围不能重叠
+
+5. **增量冲突检测优化**：
+   - 重试时不重新读取所有 base 数据文件
+   - 在上次读取的基础上增量更新（读取 [lastSnapshot, latestSnapshot] 之间的变更）
+   - 大幅减少重试时的 IO 开销
+   ```java
+   if (isRetry && hasBaseDataFiles) {
+       baseDataFiles = previousBaseDataFiles;
+       List<SimpleFileEntry> incremental = scanner.readIncrementalChanges(
+           previousSnapshot, latestSnapshot, changedPartitions);
+       baseDataFiles.addAll(incremental);
+       baseDataFiles = FileEntry.mergeEntries(baseDataFiles);
+   }
+   ```
+
+**权衡取舍：**
+
+1. **乐观锁 vs 悲观锁**：
+   - 乐观锁：低冲突场景性能好，高冲突场景需要多次重试
+   - 悲观锁：性能稳定，但需要分布式锁服务，增加复杂度
+   - Paimon 选择乐观锁，通过配置 `commit.max-retries` 和随机退避平衡
+
+2. **冲突检测的粒度 vs 性能**：
+   - 细粒度检测（key range 级别）可以减少误判，提高并发度
+   - 但需要读取所有文件的元数据，影响性能
+   - 通过增量检测优化减少重试时的开销
+
+3. **APPEND/COMPACT 分离 vs 提交次数**：
+   - 分离提交使得语义清晰，流式消费更高效
+   - 但一次 commit 可能生成两个 Snapshot，增加元数据数量
+   - 通过 Snapshot 过期机制自动清理
+
+**架构演进：**
+
+Commit 流程的演进：
+- **v0.1-0.3**：简单的乐观锁，无冲突检测
+- **v0.4-0.6**：增加冲突检测，支持 key range 检查
+- **v0.7-0.8**：增加 APPEND/COMPACT 分离，增加去重检测
+- **v0.9+**：增加增量冲突检测优化，增加 Deletion Vector 支持
+
+**业界对比：**
+
+| 特性 | Paimon | Iceberg | Delta Lake |
+|------|--------|---------|------------|
+| 并发控制 | 乐观锁 | 乐观锁 | 乐观锁 |
+| 冲突检测 | 分区/桶/key range | 分区/文件 | 分区/文件 |
+| 精确一次 | commitUser + commitIdentifier | sequence number | txn version |
+| 重试策略 | 随机退避 + 超时 | 固定次数 | 固定次数 |
+| APPEND/COMPACT 分离 | ✅ 是 | ❌ 否 | ❌ 否 |
+| 增量冲突检测 | ✅ 支持 | ❌ 无 | ❌ 无 |
+| 回滚机制 | ✅ 支持 | ❌ 无 | ❌ 无 |
 
 ### 7.1 FileStoreCommitImpl.commit() 完整流程
 

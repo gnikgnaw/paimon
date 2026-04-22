@@ -60,6 +60,90 @@
 
 ## 一、LSM Merge-Tree 核心原理
 
+### 解决什么问题
+
+**核心业务问题**：如何在数据湖场景下高效支持高频实时更新（upsert/delete）操作？
+
+传统数据湖（如 Iceberg）采用不可变文件模型，每次更新要么重写整个文件（COW，写放大严重），要么产生删除文件在读时合并（MOR，读放大严重）。对于 CDC 实时入湖、实时数仓等场景，每秒可能有数千到数万次更新操作，传统模型无法承受。
+
+**没有 LSM-Tree 的后果**：
+- 写放大失控：每次更新一条记录需要重写整个 128MB 文件
+- 小文件爆炸：为了降低写放大，只能产生大量小文件，导致读性能急剧下降
+- 无法支持流式写入：批处理模型无法满足秒级延迟要求
+
+**实际场景**：
+- MySQL binlog 实时同步到数据湖，每秒数千次 upsert
+- 实时数仓的维度表更新，需要支持高频点查和批量更新
+- IoT 设备状态表，每个设备每秒上报多次状态变更
+
+### 有什么坑
+
+**误区陷阱**：
+1. **误以为 Level0 文件越少越好**：Level0 文件是 LSM-Tree 的正常状态，过度追求减少 Level0 会导致写入阻塞
+2. **混淆 SortedRun 和 Level**：一个 Level 可能包含多个 SortedRun（Level0），也可能只有一个 SortedRun（高层）
+3. **忽略 Sequence Number 的重要性**：Sequence Number 决定了数据的新旧，错误理解会导致数据丢失
+
+**错误配置**：
+```java
+// 错误：trigger 和 stop-trigger 设置相同，没有缓冲空间
+'num-sorted-run.compaction-trigger' = '5',
+'num-sorted-run.stop-trigger' = '5'  // 应该至少是 8
+
+// 错误：target-file-size 设置过小，产生大量小文件
+'target-file-size' = '16MB'  // 默认 128MB 更合理
+```
+
+**生产环境注意事项**：
+- 监控 `numberOfSortedRuns()` 指标，超过 stop-trigger 说明 Compaction 跟不上
+- 写入密集时考虑 `write-only=true` + 独立 Compaction 作业
+- 注意多 Job 并发写同一个 bucket 的场景，TreeSet 的比较器会处理但性能会下降
+
+**性能陷阱**：
+- Level0 文件过多导致读放大：每次查询需要遍历所有 Level0 文件
+- Compaction 线程数不足：默认只有一个线程，高并发写入时成为瓶颈
+- 反压机制触发过于频繁：说明 Compaction 配置不合理
+
+### 核心概念解释
+
+**LSM-Tree (Log-Structured Merge-Tree)**：一种将随机写转化为顺序写的数据结构，数据先写入内存（Write Buffer），满后 flush 到磁盘（Level0），再通过后台 Compaction 逐层合并到高层。
+
+**Levels**：LSM-Tree 的分层管理结构
+- Level0：无序文件集合，键范围可能重叠，按 sequence number 排序
+- Level1+：每层是一个 SortedRun，键范围不重叠，支持二分查找
+
+**SortedRun**：一组按 key 排序且键范围互不重叠的文件列表。Level0 的每个文件是一个独立的 SortedRun，高层的每个 Level 是一个 SortedRun。
+
+**Compaction**：后台合并过程，将多个 SortedRun 合并为一个更大的 SortedRun，同时去重和清理旧版本数据。
+
+**与其他系统对比**：
+- **vs RocksDB**：Paimon 的 LSM-Tree 参考了 RocksDB 的 Universal Compaction，但针对数据湖场景做了优化（如 Section 划分）
+- **vs Iceberg**：Iceberg 没有 LSM-Tree，是扁平的文件列表 + 元数据层
+- **vs HBase**：HBase 的 LSM-Tree 在内存中，Paimon 的在磁盘上，更适合数据湖的大数据量场景
+
+### 设计理念
+
+**为什么选择 LSM-Tree**：
+1. **写优化**：随机写转顺序写，写入吞吐量提升 10-100 倍
+2. **更新友好**：天然支持 upsert/delete，不需要额外的删除标记文件
+3. **可控的读写放大**：通过 Compaction 策略在读放大和写放大之间取得平衡
+
+**权衡取舍**：
+- **写放大 vs 读放大**：Level0 文件越多，读放大越严重；Compaction 越频繁，写放大越严重。通过 `num-sorted-run.compaction-trigger` 控制平衡点
+- **实时性 vs 资源消耗**：Compaction 消耗 CPU 和 I/O，但不 Compaction 会导致读性能下降
+- **空间放大 vs 合并频率**：保留多版本数据会占用更多空间，但过于激进的合并会影响写入
+
+**架构演进**：
+1. **早期**：简单的 Leveled Compaction（类似 LevelDB）
+2. **当前**：Universal Compaction（参考 RocksDB），更适合写入密集场景
+3. **未来**：可能引入 Tiered Compaction（Cassandra 风格），进一步降低写放大
+
+**业界对比**：
+- **RocksDB**：Paimon 借鉴了 Universal Compaction 的三级选择策略，但增加了 Section 划分来减少单次合并的数据量
+- **Cassandra**：Cassandra 的 Tiered Compaction 写放大更低，但读放大更高，适合写多读少场景
+- **ClickHouse**：ClickHouse 的 MergeTree 也是 LSM 思想，但更侧重批量插入而非单条 upsert
+
+---
+
 <a id="q-1-1"></a>
 ### 1.1 Paimon 为什么选择 LSM-Tree？与 Iceberg 的不可变文件模型有何区别？
 
@@ -366,6 +450,107 @@ private List<SortedRun> partition(List<DataFileMeta> metas) {
 
 ## 二、Snapshot 与 Manifest 管理
 
+### 解决什么问题
+
+**核心业务问题**：如何在分布式环境下实现高效的元数据管理和并发控制？
+
+数据湖需要支持：
+1. **ACID 事务**：多个 Writer 并发写入时保证数据一致性
+2. **时间旅行**：查询历史任意时刻的数据状态
+3. **增量读取**：流式消费者只读取新增的变更，不需要全表扫描
+4. **快速过期**：清理过期快照时不需要扫描所有文件
+
+**没有三层元数据架构的后果**：
+- 并发冲突频繁：所有 Writer 竞争同一个元数据文件，吞吐量受限
+- 流式读取低效：需要对比两个快照的全量文件列表才能得到增量
+- 过期操作缓慢：需要读取所有历史快照才能判断哪些文件可以删除
+
+**实际场景**：
+- 多个 Flink 作业并发写入同一张表的不同分区
+- 下游消费者实时订阅表的变更（类似 Kafka）
+- 定期清理 7 天前的快照释放存储空间
+
+### 有什么坑
+
+**误区陷阱**：
+1. **混淆 base 和 delta**：base 是全量，delta 是增量，流式读取应该读 delta 而不是 diff 两个 base
+2. **忽略 commitIdentifier 的作用**：重启后可能重复提交，必须依赖 commitIdentifier 去重
+3. **误以为一次 commit 只产生一个 Snapshot**：APPEND 和 COMPACT 会产生两个 Snapshot
+
+**错误配置**：
+```java
+// 错误：过期配置过于激进，可能删除正在使用的快照
+'snapshot.num-retained.min' = '1',  // 至少保留 3-5 个
+'snapshot.time-retained' = '1h'     // 至少保留 1 天
+
+// 错误：Manifest 合并阈值过小，频繁触发 Full Compaction
+'manifest.full-compaction-file-size' = '1MB'  // 默认 64MB 更合理
+```
+
+**生产环境注意事项**：
+- 监控 Manifest 文件数量，过多会影响查询性能
+- 注意 Consumer 保护机制，有消费者时快照不会过期
+- Tag 会阻止快照过期，定期清理不需要的 Tag
+- 并发写入时注意 commitIdentifier 的单调性（Flink 用 checkpoint ID）
+
+**性能陷阱**：
+- Manifest 文件过多导致查询慢：每次查询需要读取所有 Manifest 文件
+- 快照过期时间过长：占用大量存储空间
+- 没有配置 Manifest 合并：小 Manifest 文件堆积
+
+### 核心概念解释
+
+**Snapshot（快照）**：表在某个时刻的完整状态，包含三个 ManifestList 的引用：
+- `baseManifestList`：全量文件变更清单
+- `deltaManifestList`：本次新增的文件变更
+- `changelogManifestList`：本次产生的变更日志
+
+**ManifestList（清单列表）**：一个文件，包含多个 ManifestFileMeta 的列表，每个 ManifestFileMeta 指向一个 Manifest 文件。
+
+**Manifest（清单）**：一个文件，包含多个 ManifestEntry（文件条目），每个条目描述一个数据文件的元信息（路径、大小、行数、min/max 统计等）。
+
+**ManifestEntry**：单个数据文件的元信息，包含：
+- `kind`：ADD（新增）或 DELETE（删除）
+- `partition`：分区信息
+- `bucket`：bucket 编号
+- `file`：DataFileMeta（文件元信息）
+
+**commitIdentifier**：提交标识符，在 Flink 场景下对应 checkpoint ID，用于去重和保证因果序。
+
+**与其他系统对比**：
+- **vs Iceberg**：元数据结构几乎相同（Snapshot → ManifestList → Manifest → DataFile），但 Paimon 增加了 delta 和 changelog 的概念
+- **vs Hudi**：Hudi 的元数据是 Timeline（时间线），每个 instant 对应一次提交，Paimon 的 Snapshot 更接近 Iceberg
+- **vs Delta Lake**：Delta Lake 的元数据是 JSON 日志文件，Paimon 的是 Avro 二进制文件，更紧凑
+
+### 设计理念
+
+**为什么采用三层架构**：
+1. **分离关注点**：Snapshot 管理版本，ManifestList 管理分区，Manifest 管理文件
+2. **增量友好**：delta ManifestList 让流式读取和快照过期都只需读取增量
+3. **并发优化**：每个 Writer 只需写自己的 Manifest 文件，最后原子性地更新 Snapshot
+
+**为什么需要 base 和 delta 两个 ManifestList**：
+- **base**：全表扫描只需读 base，不需要回溯历史
+- **delta**：流式读取只需读 delta，不需要 diff 两个 base
+- **过期优化**：删除快照时只需读 delta 就知道哪些文件是该快照引入的
+
+**权衡取舍**：
+- **元数据大小 vs 查询性能**：Manifest 文件越多，元数据越大，但每个 Manifest 可以独立过滤，并行度更高
+- **合并频率 vs 写入性能**：频繁合并 Manifest 会影响写入吞吐，但不合并会导致 Manifest 文件堆积
+- **快照保留时间 vs 存储成本**：保留更多快照支持更长的时间旅行，但占用更多空间
+
+**架构演进**：
+1. **早期**：只有 base ManifestList，流式读取需要 diff
+2. **当前**：增加 delta ManifestList，优化流式读取和快照过期
+3. **未来**：可能引入 Manifest 索引（类似 Iceberg 的 Manifest Index），进一步加速查询
+
+**业界对比**：
+- **Iceberg**：Paimon 的元数据架构借鉴了 Iceberg，但增加了 delta 和 changelog 的概念
+- **Hudi**：Hudi 的 Timeline 是追加日志，Paimon 的 Snapshot 是独立文件，更适合对象存储
+- **Delta Lake**：Delta Lake 的 JSON 日志可读性好但体积大，Paimon 的 Avro 二进制更紧凑
+
+---
+
 <a id="q-2-1"></a>
 ### 2.1 Paimon Snapshot 的 base/delta/changelog manifest list 三分法设计有什么含义？
 
@@ -581,6 +766,118 @@ if (latestSnapshot.isPresent()) {
 ---
 
 ## 三、Merge 引擎
+
+### 解决什么问题
+
+**核心业务问题**：如何在主键表中支持多样化的数据合并语义？
+
+不同业务场景对"相同主键的多条记录如何合并"有不同需求：
+1. **CDC 去重**：只保留最新记录（deduplicate）
+2. **宽表构建**：多个数据源分别更新不同字段，需要按字段合并（partial-update）
+3. **实时指标**：对数值字段做聚合（sum/count/max 等）
+4. **日志去重**：只保留首次出现的记录（first-row）
+
+**没有灵活的 Merge 引擎的后果**：
+- 只能支持简单的去重，无法满足复杂业务需求
+- 需要在应用层做二次处理，增加延迟和复杂度
+- 无法利用存储层的优化（如 Compaction 时合并）
+
+**实际场景**：
+- 用户画像表：多个数据源分别更新基础信息、行为标签、偏好标签
+- 实时大屏：对订单金额、用户数等指标做实时聚合
+- 设备状态表：只保留设备首次上线时间
+
+### 有什么坑
+
+**误区陷阱**：
+1. **混淆 PartialUpdate 和 Aggregation**：PartialUpdate 是字段级覆盖（null 保持旧值），Aggregation 是字段级聚合（sum/max 等）
+2. **忽略 Sequence Group 的作用**：多源写入时必须配置 Sequence Group，否则会出现数据错乱
+3. **误以为 FirstRow 可以接受 DELETE**：FirstRow 默认不接受 DELETE，需要配置 `ignore-delete`
+
+**错误配置**：
+```java
+// 错误：PartialUpdate 没有配置 sequence field
+'merge-engine' = 'partial-update'
+// 缺少 'fields.{field-name}.sequence-group' 配置
+
+// 错误：Aggregation 的字段没有配置聚合函数
+'merge-engine' = 'aggregation'
+// 缺少 'fields.{field-name}.aggregate-function' 配置
+
+// 错误：FirstRow 收到 DELETE 记录会报错
+'merge-engine' = 'first-row'
+// 应该配置 'first-row.ignore-delete' = 'true'
+```
+
+**生产环境注意事项**：
+- PartialUpdate 的 Sequence Group 必须覆盖所有非主键字段
+- Aggregation 的聚合函数要考虑撤回（retract）场景
+- FirstRow 适合日志去重，但不适合需要更新的场景
+- Lookup 模式会包装 MergeFunction，注意性能开销
+
+**性能陷阱**：
+- PartialUpdate 的字段过多导致合并慢：每个字段都要逐一比较和复制
+- Aggregation 的聚合函数复杂度高：如 collect 会累积大量数据
+- Lookup 模式的 I/O 开销：每次 Compaction 都要查询历史值
+
+### 核心概念解释
+
+**MergeEngine（合并引擎）**：定义了相同主键的多条记录如何合并的策略，有四种：
+- `deduplicate`：去重，保留最新记录
+- `partial-update`：部分更新，按字段合并
+- `aggregation`：聚合，按字段应用聚合函数
+- `first-row`：保留首条记录
+
+**MergeFunction**：合并引擎的实现接口，核心方法：
+- `reset()`：重置状态
+- `add(KeyValue kv)`：添加一条记录
+- `getResult()`：获取合并结果
+
+**Sequence Number**：记录的序列号，决定了记录的新旧顺序。在 Flink 场景下通常是 event time 或 processing time。
+
+**Sequence Group**：PartialUpdate 的高级特性，允许不同字段组使用不同的序列号字段，解决多源写入的乱序问题。
+
+**FieldAggregator**：字段级聚合器，支持 20+ 种聚合函数（sum/max/collect/merge_map 等）。
+
+**与其他系统对比**：
+- **vs Flink Table**：Flink Table 的聚合是在内存中，Paimon 的聚合是在存储层，更适合大状态场景
+- **vs ClickHouse**：ClickHouse 的 ReplacingMergeTree/AggregatingMergeTree 类似，但 Paimon 的 Sequence Group 更灵活
+- **vs Hudi**：Hudi 只支持简单的 upsert，Paimon 的 Merge 引擎更丰富
+
+### 设计理念
+
+**为什么需要多种 Merge 引擎**：
+1. **业务多样性**：不同场景对合并语义的需求差异巨大
+2. **性能优化**：在存储层做合并比在计算层做更高效（减少数据传输）
+3. **简化应用**：应用层不需要关心合并逻辑，声明式配置即可
+
+**为什么 PartialUpdate 需要 Sequence Group**：
+- **问题**：多个数据源分别更新不同字段，全局序列号无法处理乱序
+- **解决**：每组字段使用各自的序列号字段，独立判断新旧
+- **代价**：配置复杂度增加，需要为每个字段指定 sequence-group
+
+**为什么 LookupMergeFunction 是装饰器模式**：
+- **灵活性**：可以包装任意 MergeFunction，不需要为每种引擎单独实现 Lookup 版本
+- **复用性**：Lookup 逻辑（查询历史值）与合并逻辑（如何合并）解耦
+- **优化**：只查询最低层的高层记录，避免读取所有历史版本
+
+**权衡取舍**：
+- **功能丰富 vs 复杂度**：四种引擎 + Sequence Group + 20+ 聚合函数，配置复杂度高
+- **存储层合并 vs 计算层合并**：存储层合并性能好但灵活性差，计算层合并灵活但性能差
+- **实时性 vs 准确性**：Lookup 模式准确但慢，INPUT 模式快但依赖输入质量
+
+**架构演进**：
+1. **早期**：只有 deduplicate，最简单的去重
+2. **中期**：增加 partial-update 和 aggregation，支持更多场景
+3. **当前**：增加 Sequence Group 和 Lookup 包装，支持复杂的多源写入
+4. **未来**：可能增加自定义 MergeFunction（UDF），支持任意合并逻辑
+
+**业界对比**：
+- **ClickHouse**：MergeTree 家族（Replacing/Aggregating/Collapsing/Versioned），思想类似但实现不同
+- **Flink Table**：Flink 的 Changelog Mode 在计算层处理，Paimon 在存储层处理
+- **Hudi**：Hudi 的 Merge 逻辑固定（upsert），不如 Paimon 灵活
+
+---
 
 <a id="q-3-1"></a>
 ### 3.1 四种 MergeFunction 的实现原理和适用场景分别是什么？
@@ -882,6 +1179,119 @@ public void add(KeyValue kv) {
 
 ## 四、Flink 集成
 
+### 解决什么问题
+
+**核心业务问题**：如何在流式计算引擎中实现数据湖的 Exactly-Once 写入和实时读取？
+
+流式数据湖需要解决：
+1. **Exactly-Once 语义**：作业重启后不能重复写入或丢失数据
+2. **分布式协调**：多个 Writer 并行写入，单个 Committer 原子提交
+3. **CDC 同步**：从 MySQL/Kafka 等数据源实时同步变更到数据湖
+4. **Lookup Join**：维表关联时需要高效查询数据湖中的维度数据
+
+**没有良好的 Flink 集成的后果**：
+- 数据一致性无法保证：重启后可能重复写入
+- 吞吐量受限：单点提交成为瓶颈
+- CDC 同步复杂：需要手动处理 schema 演进和数据转换
+- Lookup Join 性能差：每次查询都要扫描全表
+
+**实际场景**：
+- 实时数仓：Flink 作业从 Kafka 读取数据，写入 Paimon 表
+- CDC 入湖：MySQL binlog 实时同步到 Paimon
+- 维表关联：订单流 Lookup Join 用户维表（存储在 Paimon）
+
+### 有什么坑
+
+**误区陷阱**：
+1. **误以为 Writer 并行度可以任意设置**：Writer 并行度受 bucket 数量限制，超过 bucket 数会有空闲 Writer
+2. **忽略 Committer 必须是单并行度**：Committer 并行度 > 1 会导致并发冲突
+3. **混淆 checkpoint 和 commit**：checkpoint 是 Flink 的快照，commit 是 Paimon 的 Snapshot，两者不是一回事
+
+**错误配置**：
+```java
+// 错误：Committer 并行度设置为多个
+env.addSink(paimonSink).setParallelism(4);  // Committer 必须是 1
+
+// 错误：checkpoint 间隔过短，产生大量小文件
+env.enableCheckpointing(1000);  // 至少 30 秒
+
+// 错误：Lookup Join 没有配置缓存
+'lookup.cache-mode' = 'NONE'  // 应该配置 FULL 或 PARTIAL
+```
+
+**生产环境注意事项**：
+- 监控 committablesPerCheckpoint 的大小，过大说明 checkpoint 间隔过长
+- 注意 commitIdentifier 的单调性，Flink 的 checkpoint ID 是单调递增的
+- CDC 同步时注意 schema 演进的兼容性（如列类型变更）
+- Lookup Join 的缓存刷新间隔要根据维表更新频率调整
+
+**性能陷阱**：
+- Writer 并行度过高导致小文件：每个 Writer 每次 checkpoint 都会产生文件
+- Committer 成为瓶颈：所有 Writer 的 Committable 都要经过单个 Committer
+- Lookup Join 缓存未命中：频繁查询磁盘导致性能下降
+- CDC 同步的 schema 演进开销：每次 schema 变更都要更新元数据
+
+### 核心概念解释
+
+**Writer 算子**：Flink Sink 的第一阶段，负责接收数据并写入 Paimon 的 Write Buffer。每个 Writer 实例负责一个或多个 bucket。
+
+**Committer 算子**：Flink Sink 的第二阶段，负责收集所有 Writer 的 Committable 并原子提交为 Paimon Snapshot。必须是单并行度。
+
+**Committable**：Writer 在 checkpoint 时产生的提交数据，包含：
+- `identifier`：checkpoint ID
+- `fileCommittables`：本次 checkpoint 产生的文件变更（新增/删除）
+
+**Two-Phase Commit（两阶段提交）**：
+1. **Pre-commit**：checkpoint 时 Writer 将数据持久化到 operator state
+2. **Commit**：checkpoint 完成时 Committer 提交 Paimon Snapshot
+
+**CDC Sink**：专门用于 CDC 同步的 Sink，支持：
+- 自动 schema 演进
+- 分库分表合并
+- 数据类型转换
+
+**Lookup Join**：Flink SQL 的维表关联，Paimon 提供 `FileStoreLookupFunction` 实现，支持全量和部分缓存。
+
+**与其他系统对比**：
+- **vs Iceberg Flink**：Paimon 的 Committer 是单并行度，Iceberg 可以多并行度（通过乐观锁）
+- **vs Hudi Flink**：Hudi 的 Coordinator 也是单并行度，但 Hudi 的 Writer 需要处理索引更新
+- **vs Delta Lake Flink**：Delta Lake 的 Flink 集成较弱，Paimon 的集成更深入
+
+### 设计理念
+
+**为什么 Committer 必须是单并行度**：
+1. **原子性**：Snapshot 的创建必须是原子的，多个 Committer 会导致并发冲突
+2. **顺序性**：commitIdentifier 必须单调递增，多个 Committer 无法保证
+3. **简化实现**：单并行度避免了分布式协调的复杂性
+
+**为什么需要 committablesPerCheckpoint**：
+- **批量提交**：将多个 checkpoint 的 Committable 批量提交，减少 Snapshot 数量
+- **容错性**：checkpoint 完成但 commit 失败时，下次可以重试
+- **去重**：通过 commitIdentifier 去重，避免重复提交
+
+**为什么 CDC Sink 需要单独实现**：
+- **Schema 演进**：CDC 数据携带 schema 信息，需要自动更新 Paimon 表的 schema
+- **数据转换**：CDC 数据格式（如 Debezium）与 Paimon 内部格式不同，需要转换
+- **分库分表**：多个 MySQL 表合并到一个 Paimon 表，需要特殊处理
+
+**权衡取舍**：
+- **单并行度 Committer vs 吞吐量**：单并行度限制了提交吞吐量，但保证了原子性
+- **Lookup Join 缓存 vs 实时性**：全量缓存性能好但实时性差，部分缓存平衡两者
+- **CDC 自动演进 vs 兼容性**：自动演进方便但可能引入不兼容的 schema 变更
+
+**架构演进**：
+1. **早期**：简单的 Writer + Committer，不支持 CDC
+2. **中期**：增加 CDC Sink，支持 schema 演进
+3. **当前**：增加 Lookup Join 优化，支持缓存和增量刷新
+4. **未来**：可能支持多并行度 Committer（通过乐观锁）
+
+**业界对比**：
+- **Iceberg**：Iceberg 的 Committer 可以多并行度，通过乐观锁解决冲突，但实现复杂
+- **Hudi**：Hudi 的 Coordinator 也是单并行度，与 Paimon 类似
+- **Delta Lake**：Delta Lake 的 Flink 集成较弱，主要依赖 Spark
+
+---
+
 <a id="q-4-1"></a>
 ### 4.1 Flink Sink 的算子拓扑（Writer → Committer）是如何设计的？
 
@@ -1068,6 +1478,118 @@ public class FileStoreLookupFunction implements Serializable, Closeable {
 ---
 
 ## 五、Deletion Vectors 与文件索引
+
+### 解决什么问题
+
+**核心业务问题**：如何在不重写文件的情况下实现高效的行级删除和查询加速？
+
+数据湖的两大性能瓶颈：
+1. **行级删除的写放大**：传统 COW 模式删除一行需要重写整个文件（128MB）
+2. **查询的全文件扫描**：即使查询条件只匹配少量行，也要扫描整个文件
+
+**没有 DV 和文件索引的后果**：
+- 删除操作极慢：每次删除都要重写文件，写放大严重
+- 查询性能差：无法跳过不匹配的文件和行
+- 无法支持 rawConvertible：主键表无法直接暴露给引擎的原生 reader
+
+**实际场景**：
+- GDPR 合规：用户注销后需要删除其所有数据
+- 数据修正：发现错误数据后需要删除或更新
+- 高基数列查询：根据用户 ID 查询订单（ID 是高基数列）
+- 低基数列查询：根据状态字段过滤（状态是低基数列）
+
+### 有什么坑
+
+**误区陷阱**：
+1. **混淆 DV 和 Delete File**：DV 是 Paimon 的行级删除标记，Delete File 是 Iceberg 的概念
+2. **误以为 DV 会自动清理**：DV 只是标记，真正删除需要 Compaction
+3. **忽略 V1 和 V2 的差异**：V1 最大支持 21 亿行，V2 支持更大文件
+
+**错误配置**：
+```java
+// 错误：文件索引类型选择不当
+'file-index.bloom-filter.columns' = 'status'  // status 是低基数列，应该用 bitmap
+
+// 错误：Bloom Filter 的 fpp 设置过大
+'file-index.bloom-filter.fpp' = '0.1'  // 误判率 10% 太高，应该是 0.01
+
+// 错误：没有为高基数列配置索引
+// 缺少 'file-index.bloom-filter.columns' = 'user_id'
+```
+
+**生产环境注意事项**：
+- 监控 DV 文件的大小，过大说明删除操作频繁
+- 注意 DV 的 cardinality 信息，用于精确计算剩余行数
+- Bloom Filter 的误判率要根据查询模式调整
+- Bitmap 索引适合低基数列（< 1000 个不同值）
+
+**性能陷阱**：
+- DV 文件过多导致读取慢：每个数据文件都要读取对应的 DV 文件
+- 文件索引过大：Bloom Filter 的 fpp 设置过小会导致索引文件过大
+- 索引类型选择不当：高基数列用 Bitmap 会导致索引爆炸
+- 没有配置索引：查询时无法跳过不匹配的文件
+
+### 核心概念解释
+
+**Deletion Vector (DV)**：一个 RoaringBitmap，标记数据文件中哪些行已被删除。每个数据文件可以有一个对应的 DV 文件。
+
+**RoaringBitmap**：一种压缩的位图数据结构，高效存储稀疏的整数集合。Paimon 有两个版本：
+- **V1 (BitmapDeletionVector)**：基于 RoaringBitmap32，最大支持 2^31 行
+- **V2 (Bitmap64DeletionVector)**：基于 OptimizedRoaringBitmap64，最大支持 2^63 行
+
+**rawConvertible**：DataSplit 的一个属性，表示该 Split 的数据文件可以直接暴露给查询引擎的原生 reader（如 Parquet reader），无需经过 Paimon 的 Merge 逻辑。
+
+**文件索引（File Index）**：嵌入在数据文件中的索引结构，用于快速过滤不匹配的行。有四种类型：
+- **Bloom Filter**：概率型索引，适合高基数列的等值查询
+- **Bitmap**：精确索引，适合低基数列的等值查询
+- **BSI (Bit-Sliced Index)**：适合数值列的范围查询
+- **Range Bitmap**：适合有序数值列的范围查询
+
+**Predicate（谓词）**：查询条件的抽象表示，如 `age > 30`、`status IN ('active', 'pending')`。
+
+**与其他系统对比**：
+- **vs Iceberg**：Iceberg 用 Position Delete 和 Equality Delete，Paimon 用 DV，两者思想类似但实现不同
+- **vs Delta Lake**：Delta Lake 也用 DV（从 2.0 开始），但格式不同
+- **vs Parquet**：Parquet 的 Page Index 是列级统计，Paimon 的文件索引是行级索引
+
+### 设计理念
+
+**为什么需要 DV**：
+1. **降低写放大**：删除操作不需要重写文件，只需写一个小的 DV 文件
+2. **支持 rawConvertible**：主键表也能直接暴露给引擎的原生 reader，提升性能
+3. **延迟清理**：真正的物理删除可以延迟到 Compaction 时进行
+
+**为什么需要 V1 和 V2 两个版本**：
+- **V1**：32 位 RoaringBitmap，内存占用小，适合大多数场景
+- **V2**：64 位 RoaringBitmap，支持超大文件（> 21 亿行），从 Iceberg 移植
+
+**为什么需要四种文件索引**：
+- **查询模式多样**：等值查询、范围查询、IN 查询、IS NULL 查询
+- **数据特征多样**：高基数列、低基数列、数值列、字符串列
+- **性能权衡**：Bloom Filter 有误判但空间小，Bitmap 精确但空间大
+
+**为什么文件索引嵌入在数据文件中**：
+- **原子性**：数据和索引一起写入，不会出现不一致
+- **局部性**：读取数据时顺便读取索引，减少 I/O
+- **简化管理**：不需要单独管理索引文件
+
+**权衡取舍**：
+- **DV vs 重写文件**：DV 降低写放大但增加读放大（需要读 DV 文件），重写文件相反
+- **Bloom Filter vs Bitmap**：Bloom Filter 空间小但有误判，Bitmap 精确但空间大
+- **索引大小 vs 过滤效果**：索引越大过滤效果越好，但读取索引的开销也越大
+
+**架构演进**：
+1. **早期**：没有 DV，删除操作需要重写文件
+2. **中期**：引入 DV V1，支持行级删除
+3. **当前**：引入 DV V2 和四种文件索引，支持更大文件和更多查询模式
+4. **未来**：可能引入更多索引类型（如倒排索引、向量索引）
+
+**业界对比**：
+- **Iceberg**：Iceberg 的 Position Delete 和 Paimon 的 DV 思想类似，但 Iceberg 的 Delete File 是独立文件
+- **Delta Lake**：Delta Lake 2.0 引入了 DV，格式与 Paimon 不同
+- **Parquet**：Parquet 的 Page Index 是列级统计，不如 Paimon 的文件索引精确
+
+---
 
 <a id="q-5-1"></a>
 ### 5.1 DV 的 RoaringBitmap 实现和 V1/V2 格式差异是什么？
@@ -1263,6 +1785,114 @@ Paimon 的 Predicate 体系是查询下推的核心桥梁，定义在 `paimon-co
 
 ## 六、查询优化
 
+### 解决什么问题
+
+**核心业务问题**：如何在海量数据中快速定位目标数据，避免全表扫描？
+
+数据湖的查询性能挑战：
+1. **数据量大**：单表可能有 PB 级数据，数十万个文件
+2. **查询模式多样**：点查、范围查询、聚合查询、多维过滤
+3. **数据分布不均**：热点数据和冷数据混合存储
+4. **主键表的读放大**：多个 Level 的文件需要合并读取
+
+**没有多层过滤和优化的后果**：
+- 查询极慢：每次查询都要扫描所有文件
+- 资源浪费：大量 CPU 和 I/O 用于处理不相关的数据
+- 无法支持交互式查询：秒级查询变成分钟级
+
+**实际场景**：
+- 用户行为分析：根据用户 ID 查询最近 7 天的行为记录
+- 实时大屏：根据时间范围和多个维度过滤数据
+- 点查：根据主键查询单条记录（如订单详情）
+
+### 有什么坑
+
+**误区陷阱**：
+1. **忽略分区的重要性**：分区是最粗粒度的过滤，效果最显著
+2. **误以为文件索引能解决所有问题**：索引只能加速特定类型的查询
+3. **混淆 Z-Order 和普通排序**：Z-Order 是多维排序，普通排序只对单列有效
+
+**错误配置**：
+```java
+// 错误：没有配置分区键
+// 应该根据查询模式配置分区键，如按日期分区
+
+// 错误：Z-Order 列选择不当
+'sort.order' = 'z-order',
+'sort.columns' = 'id'  // 单列不需要 Z-Order，用普通排序即可
+
+// 错误：没有为常用查询列配置文件索引
+// 缺少 'file-index.bloom-filter.columns' 配置
+```
+
+**生产环境注意事项**：
+- 监控查询的文件扫描数量，过多说明过滤不够
+- 注意 Manifest 文件的统计信息是否准确（min/max）
+- Z-Order 需要定期重排（通过 Sort Compact）
+- LookupLevels 的缓存大小要根据内存调整
+
+**性能陷阱**：
+- 分区过细导致小文件：每个分区的数据量太小
+- 分区过粗导致过滤不够：每个分区的数据量太大
+- Z-Order 列选择过多：排序效果下降
+- LookupLevels 缓存未命中：频繁重建 SST 文件
+
+### 核心概念解释
+
+**多层过滤**：Paimon 的查询优化采用四层渐进式过滤：
+1. **分区过滤**：根据分区键跳过不相关的分区
+2. **Manifest 文件过滤**：根据 ManifestFileMeta 的统计信息跳过不相关的 Manifest 文件
+3. **数据文件过滤**：根据 DataFileMeta 的 min/max 统计跳过不相关的数据文件
+4. **行级过滤**：根据文件索引跳过不匹配的行
+
+**Z-Order 排序**：一种多维排序技术，将多个列的值交织成一维空间填充曲线，使得多维空间中相邻的数据点在一维空间中也尽量相邻。
+
+**Hilbert 排序**：比 Z-Order 更优的空间填充曲线，具有更好的聚簇性（clustering）。
+
+**LookupLevels**：点查优化组件，为每个数据文件构建本地 Lookup SST 文件，支持按 key 快速查找。
+
+**SimpleStats**：文件级统计信息，包含每列的 min/max/null_count。
+
+**与其他系统对比**：
+- **vs Iceberg**：Iceberg 也有多层过滤（Manifest Index → Manifest → DataFile），但没有 LookupLevels
+- **vs Delta Lake**：Delta Lake 的 Z-Order 实现类似，但 Paimon 还支持 Hilbert 排序
+- **vs ClickHouse**：ClickHouse 的主键索引（稀疏索引）与 Paimon 的 LookupLevels 思想类似
+
+### 设计理念
+
+**为什么需要多层过滤**：
+1. **渐进式优化**：每一层都大幅减少下一层的数据量，避免一次性处理海量数据
+2. **成本递增**：分区过滤几乎无成本，文件索引过滤成本较高，按层次递增
+3. **灵活性**：不同查询可以在不同层次停止，不需要走完所有层次
+
+**为什么需要 Z-Order/Hilbert 排序**：
+- **问题**：单列排序只对该列的范围查询有效，多列查询无法利用排序
+- **解决**：多维排序让每个文件在多个列上都有较紧凑的值域范围
+- **代价**：排序开销增加，需要定期重排
+
+**为什么需要 LookupLevels**：
+- **问题**：主键表的点查需要遍历所有 Level 的文件，读放大严重
+- **解决**：为每个文件构建 Lookup SST，支持 O(log n) 的点查
+- **代价**：额外的磁盘空间和构建开销
+
+**权衡取舍**：
+- **分区粒度 vs 文件数量**：分区越细过滤效果越好，但文件数量越多
+- **Z-Order 列数 vs 排序效果**：列数越多排序效果越差（维度灾难）
+- **LookupLevels 缓存 vs 内存占用**：缓存越大命中率越高，但内存占用越大
+
+**架构演进**：
+1. **早期**：只有分区过滤和文件级 min/max 统计
+2. **中期**：增加文件索引（Bloom Filter、Bitmap）
+3. **当前**：增加 Z-Order/Hilbert 排序和 LookupLevels
+4. **未来**：可能引入更多优化（如列式索引、向量索引）
+
+**业界对比**：
+- **Iceberg**：Iceberg 的 Manifest Index 与 Paimon 的 ManifestFileMeta 统计类似
+- **Delta Lake**：Delta Lake 的 Z-Order 实现与 Paimon 类似
+- **ClickHouse**：ClickHouse 的稀疏索引与 Paimon 的 LookupLevels 思想类似，但实现不同
+
+---
+
 <a id="q-6-1"></a>
 ### 6.1 多层文件过滤（分区 → Manifest → 文件 → 行）是如何工作的？
 
@@ -1386,6 +2016,123 @@ public void notifyDropFile(String file) {
 ---
 
 ## 七、运维与性能调优
+
+### 解决什么问题
+
+**核心业务问题**：如何在生产环境中保持数据湖的高性能和稳定性？
+
+数据湖的运维挑战：
+1. **小文件问题**：高频写入导致大量小文件，影响查询性能
+2. **Compaction 调优**：如何平衡写入吞吐和读取性能
+3. **存储成本**：历史快照占用大量空间，如何安全清理
+4. **性能下降**：随着数据量增长，查询和写入性能逐渐下降
+
+**没有良好的运维策略的后果**：
+- 小文件爆炸：查询性能急剧下降，元数据膨胀
+- 存储成本失控：历史快照占用大量空间
+- 写入阻塞：Compaction 跟不上写入速度
+- 数据丢失：误删正在使用的快照
+
+**实际场景**：
+- 实时数仓：每秒数千次写入，需要控制小文件数量
+- 成本优化：定期清理过期快照释放存储空间
+- 性能调优：根据业务特点调整 Compaction 参数
+- 故障恢复：快照损坏后如何恢复数据
+
+### 有什么坑
+
+**误区陷阱**：
+1. **过度追求大文件**：文件过大会导致 Compaction 耗时长
+2. **忽略 bucket 数量的影响**：bucket 数量直接影响写入并行度
+3. **误以为快照可以随意删除**：可能删除正在使用的快照
+
+**错误配置**：
+```java
+// 错误：Compaction 参数过于激进
+'num-sorted-run.compaction-trigger' = '2',  // 太小，写放大严重
+'compaction.max-size-amplification-percent' = '50'  // 太小，频繁全量合并
+
+// 错误：快照保留配置过于宽松
+'snapshot.num-retained.min' = '1',  // 太少，可能删除正在使用的快照
+'snapshot.time-retained' = '1h'     // 太短，无法支持长时间的时间旅行
+
+// 错误：bucket 数量设置不当
+'bucket' = '1024'  // 数据量小时会产生大量小文件
+```
+
+**生产环境注意事项**：
+- 监控 SortedRun 数量，超过 stop-trigger 说明 Compaction 跟不上
+- 监控文件大小分布，过多小文件或过大文件都不好
+- 注意 Consumer 保护机制，有消费者时快照不会过期
+- 定期检查 Tag，避免 Tag 阻止快照过期
+
+**性能陷阱**：
+- checkpoint 间隔过短：产生大量小文件
+- target-file-size 设置不当：过小产生小文件，过大影响 Compaction
+- 独立 Compaction 作业资源不足：Compaction 跟不上写入
+- 快照过期不及时：占用大量存储空间
+
+### 核心概念解释
+
+**小文件问题**：由于高频 checkpoint、bucket 过多、Compaction 不及时等原因，导致产生大量小文件（< 10MB），影响查询性能和元数据管理。
+
+**Compaction 参数**：
+- `num-sorted-run.compaction-trigger`：SortedRun 数量达到此值触发 Compaction
+- `num-sorted-run.stop-trigger`：达到此值阻塞写入
+- `compaction.max-size-amplification-percent`：空间放大百分比阈值
+- `target-file-size`：目标文件大小
+
+**Bucket**：分区内的数据分片单位，每个 bucket 有独立的 LSM-Tree。有三种模式：
+- **FIXED**：固定数量
+- **DYNAMIC**：动态调整
+- **UNAWARE**：无 bucket（append-only 表）
+
+**Snapshot 过期**：定期清理过期快照释放存储空间，有多重保护机制：
+- 最小保留数量
+- 最大保留数量
+- 时间保留
+- Tag 保护
+- Consumer 保护
+
+**与其他系统对比**：
+- **vs Iceberg**：Iceberg 的 Expire Snapshots 与 Paimon 类似，但 Iceberg 没有 Consumer 保护
+- **vs Hudi**：Hudi 的 Cleaner 服务负责清理，Paimon 的快照过期更灵活
+- **vs Delta Lake**：Delta Lake 的 Vacuum 命令清理过期文件，Paimon 的快照过期更自动化
+
+### 设计理念
+
+**为什么小文件是 LSM-Tree 的正常状态**：
+1. **写入优化**：每次 flush 产生小文件是 LSM-Tree 的核心机制
+2. **后台合并**：Compaction 自动将小文件合并为大文件
+3. **可控性**：通过参数控制小文件的数量和合并频率
+
+**为什么需要多重快照保护机制**：
+1. **安全性**：防止误删正在使用的快照
+2. **灵活性**：支持多种保留策略（数量、时间、Tag、Consumer）
+3. **容错性**：即使配置错误也不会导致数据丢失
+
+**为什么 bucket 数量如此重要**：
+- **写入并行度**：bucket 数量决定了 Writer 的并行度
+- **文件大小**：bucket 数量影响每个 bucket 的数据量，进而影响文件大小
+- **Compaction 效率**：bucket 数量影响 Compaction 的并行度
+
+**权衡取舍**：
+- **Compaction 频率 vs 写入吞吐**：频繁 Compaction 降低写入吞吐，但改善读性能
+- **快照保留时间 vs 存储成本**：保留更多快照支持更长的时间旅行，但占用更多空间
+- **bucket 数量 vs 文件大小**：bucket 越多文件越小，越少文件越大
+
+**架构演进**：
+1. **早期**：简单的快照过期，没有保护机制
+2. **中期**：增加 Tag 保护和 Consumer 保护
+3. **当前**：增加多重保护机制和自动化运维工具
+4. **未来**：可能引入更智能的自适应调优（如自动调整 bucket 数量）
+
+**业界对比**：
+- **Iceberg**：Iceberg 的 Expire Snapshots 和 Remove Orphan Files 与 Paimon 类似
+- **Hudi**：Hudi 的 Cleaner 服务更复杂，支持多种清理策略
+- **Delta Lake**：Delta Lake 的 Vacuum 命令较简单，Paimon 的快照过期更自动化
+
+---
 
 <a id="q-7-1"></a>
 ### 7.1 Compaction 参数调优策略有哪些？
@@ -1557,6 +2304,112 @@ public class SnapshotDeletion extends FileDeletionBase<Snapshot> {
 ---
 
 ## 八、Paimon vs Iceberg 对比
+
+### 解决什么问题
+
+**核心业务问题**：如何选择合适的数据湖格式？
+
+企业在选择数据湖格式时面临的困惑：
+1. **技术选型**：Paimon、Iceberg、Hudi、Delta Lake 各有什么优劣
+2. **场景适配**：不同业务场景应该选择哪种格式
+3. **迁移成本**：从一种格式迁移到另一种格式的成本
+4. **生态兼容**：与现有技术栈（Flink/Spark/Hive）的兼容性
+
+**没有清晰的对比认知的后果**：
+- 选型错误：选择了不适合业务场景的格式
+- 性能问题：格式的特性与业务需求不匹配
+- 迁移困难：后期发现问题但迁移成本高
+- 生态割裂：格式与现有技术栈不兼容
+
+**实际场景**：
+- 实时数仓：需要高频 upsert，Paimon 更合适
+- 批处理数仓：主要是追加和批量更新，Iceberg 更合适
+- 混合场景：既有批处理又有流处理，需要权衡
+
+### 有什么坑
+
+**误区陷阱**：
+1. **误以为 Paimon 和 Iceberg 完全不同**：两者的元数据架构非常相似
+2. **忽略生态成熟度**：Iceberg 的生态更成熟，Paimon 更年轻
+3. **混淆更新能力和更新性能**：Iceberg V2 支持更新，但性能不如 Paimon
+
+**错误认知**：
+```
+// 错误：认为 Iceberg 不支持更新
+// Iceberg V2 支持 Equality Delete 和 Position Delete
+
+// 错误：认为 Paimon 不支持批处理
+// Paimon 的 append-only 表与 Iceberg 类似
+
+// 错误：认为两者不能共存
+// 可以在同一个数据湖中同时使用 Paimon 和 Iceberg
+```
+
+**生产环境注意事项**：
+- 评估业务的更新频率，高频更新选 Paimon
+- 考虑现有技术栈，Spark 为主选 Iceberg，Flink 为主选 Paimon
+- 注意生态工具的支持情况（如 BI 工具、数据治理工具）
+- 考虑团队的技术储备和学习成本
+
+**性能陷阱**：
+- Iceberg 的 COW 模式写放大严重，不适合高频更新
+- Paimon 的 LSM-Tree 有读放大，不适合大量历史数据查询
+- Iceberg 的 MOR 模式读放大严重，需要频繁 Rewrite
+- Paimon 的 Compaction 消耗资源，需要合理配置
+
+### 核心概念解释
+
+**存储模型差异**：
+- **Paimon**：LSM-Tree（分层合并树），数据先写内存再异步合并
+- **Iceberg**：不可变文件 + Snapshot，每次写入产生新文件
+
+**更新模型差异**：
+- **Paimon**：原生支持 upsert，通过 MergeFunction 定义合并语义
+- **Iceberg**：V2 通过 Equality Delete 和 Position Delete 支持更新
+
+**元数据架构**：
+- **Paimon**：Snapshot → ManifestList (base/delta/changelog) → Manifest → DataFileMeta
+- **Iceberg**：Snapshot → ManifestList → Manifest → DataFile
+
+**小文件治理**：
+- **Paimon**：写入即治理，Compaction 自动合并
+- **Iceberg**：事后治理，Rewrite Data Files Action
+
+**与其他系统对比**：
+- **vs Hudi**：Hudi 也是 LSM 思想（MOR 模式），但实现更复杂
+- **vs Delta Lake**：Delta Lake 是 Spark 生态，Paimon 和 Iceberg 是多引擎
+
+### 设计理念
+
+**为什么 Paimon 选择 LSM-Tree**：
+1. **流式优先**：Paimon 定位于流式数据湖，LSM-Tree 天然适合高频更新
+2. **写优化**：随机写转顺序写，写入吞吐量高
+3. **自动化**：Compaction 自动处理小文件和旧版本数据
+
+**为什么 Iceberg 选择不可变文件**：
+1. **批处理优先**：Iceberg 最初定位于批处理数据湖
+2. **简单性**：不可变文件模型更简单，易于理解和实现
+3. **兼容性**：与现有批处理工具（Spark/Hive）兼容性好
+
+**权衡取舍**：
+- **Paimon**：写性能好但读放大，适合高频更新
+- **Iceberg**：读性能好但写放大（COW）或读放大（MOR），适合批处理
+
+**架构演进**：
+- **Paimon**：从流式数据湖向批流一体演进
+- **Iceberg**：从批处理数据湖向流式能力演进
+
+**业界趋势**：
+1. **批流一体**：Paimon 和 Iceberg 都在向批流一体演进
+2. **生态融合**：两者都在扩展对多引擎的支持
+3. **标准化**：可能出现统一的数据湖标准（如 Apache XTable）
+
+**选型建议**：
+- **选 Paimon**：高频 upsert、CDC 实时入湖、Flink 为主
+- **选 Iceberg**：批处理为主、Spark 为主、生态成熟度要求高
+- **混合使用**：实时表用 Paimon，历史表用 Iceberg
+
+---
 
 <a id="q-8-1"></a>
 ### 8.1 存储模型的根本差异是什么？
