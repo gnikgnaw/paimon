@@ -1,7 +1,7 @@
 # Apache Paimon Merge 引擎与聚合函数体系 -- 源码深度分析
 
-> **基于版本**: Apache Paimon 1.5-SNAPSHOT (commit 7c93bd720)
-> **分析日期**: 2026-04-15
+> **基于版本**: Apache Paimon 1.5-SNAPSHOT (commit: 55f4fd175)
+> **分析日期**: 2026-04-21
 > **核心源码路径**: `paimon-core/src/main/java/org/apache/paimon/mergetree/compact/`
 
 ---
@@ -632,7 +632,7 @@ public abstract class FieldAggregator implements Serializable {
 
 ### 6.2 所有内置聚合函数详解
 
-以下是 Paimon 内置的 **22** 种聚合函数完整列表:
+以下是 Paimon 内置的 **21** 种聚合函数完整列表（注: `first_not_null_value` 是 `first_non_null_value` 的旧名兼容别名，实际只有21个独立实现）:
 
 | # | 标识名 | 实现类 | 数据类型约束 | 支持回撤 | 说明 |
 |---|--------|--------|-------------|---------|------|

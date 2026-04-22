@@ -1,7 +1,7 @@
 # Apache Paimon Flink 集成源码深度分析
 
-> 基于 Paimon 1.5-SNAPSHOT 源码，commit: 7c93bd720
-> 分析日期: 2026-04-15
+> 基于 Paimon 1.5-SNAPSHOT 源码 (commit: 55f4fd175)
+> 分析日期: 2026-04-21
 
 ---
 

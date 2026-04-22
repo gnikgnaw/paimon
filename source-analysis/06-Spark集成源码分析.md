@@ -1,7 +1,7 @@
 # Apache Paimon Spark 集成深度源码分析
 
-> 基于 paimon 1.5-SNAPSHOT (master 分支, commit 7c93bd720)
-> 分析日期: 2026-04-15
+> 基于 paimon 1.5-SNAPSHOT (master 分支, commit: 55f4fd175)
+> 分析日期: 2026-04-21
 
 ---
 
@@ -278,7 +278,7 @@ PaimonBaseScanBuilder (abstract)    -- 基础下推: V2Filter/列裁剪/Limit
 4. 数据谓词设置到 `pushedDataFilters`，同时保留在 `postScan` 中（因为数据谓词不能保证完全由存储层过滤）
 5. 不能转换的谓词也作为 `postScan` 返回
 
-**SparkV2FilterConverter** (`SparkV2FilterConverter.scala`) 支持的谓词类型:
+**SparkV2FilterConverter** (`paimon-spark-common/.../spark/SparkV2FilterConverter.scala`) 支持的谓词类型:
 
 | Spark 谓词 | Paimon 谓词 |
 |-----------|------------|
@@ -332,7 +332,7 @@ override def pushTopN(orders: Array[SortOrder], limit: Int): Boolean = {
 
 ### 3.7 Split 的 BinPacking 优化
 
-**源码位置**: `BinPackingSplits.scala`
+**源码位置**: `paimon-spark-common/.../spark/read/BinPackingSplits.scala`
 
 **问题**: Paimon 的 Split 粒度可能很小（单个数据文件），直接每个 Split 一个 Task 会导致过多小任务。
 
@@ -391,7 +391,7 @@ graph TD
 
 #### V1 Write (旧模式)
 
-**源码位置**: `PaimonWrite.scala`, `WriteIntoPaimonTable.scala`
+**源码位置**: `paimon-spark-common/.../spark/write/PaimonWrite.scala`, `paimon-spark-common/.../spark/commands/WriteIntoPaimonTable.scala`
 
 ```scala
 class PaimonWrite extends V1Write {
@@ -830,7 +830,7 @@ Dataset<Row> datasetForWrite = packedSplits.values().stream()
 
 ### 8.1 流式读取架构
 
-**源码位置**: `PaimonMicroBatchStream.scala`, `StreamHelper.scala`
+**源码位置**: `paimon-spark-common/.../spark/sources/PaimonMicroBatchStream.scala`, `paimon-spark-common/.../spark/sources/StreamHelper.scala`
 
 ```mermaid
 sequenceDiagram
@@ -895,7 +895,7 @@ lazy val initOffset: PaimonSourceOffset = {
 
 ### 8.4 流式写入 -- PaimonSink
 
-**源码位置**: `PaimonSink.scala`
+**源码位置**: `paimon-spark-common/.../spark/sources/PaimonSink.scala`
 
 ```scala
 class PaimonSink extends Sink with SchemaHelper {

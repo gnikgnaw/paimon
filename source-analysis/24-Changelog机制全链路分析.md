@@ -1,7 +1,7 @@
 # Apache Paimon Changelog 机制全链路分析
 
-> **代码版本**: 1.5-SNAPSHOT (master 分支, commit 7c93bd720)
-> **分析日期**: 2026-04-15
+> **代码版本**: 1.5-SNAPSHOT (master 分支, commit: 55f4fd175)
+> **分析日期**: 2026-04-21
 > **分析范围**: Changelog 的产生、存储、消费、过期全生命周期
 
 ---
@@ -488,7 +488,16 @@ public ChangelogResult getResult() {
 }
 ```
 
-**关键设计决策 — 为什么只在有 Level 0 记录时产生 Changelog**: Level 0 代表新写入的数据，是"变更"的来源。如果一次压缩只涉及高层级文件（如 Level 1 到 Level 2 的升级），没有新数据参与，就没有真正的业务变更，不应该产生 Changelog。
+**关键设计决策 — 为什么只在有 Level 0 记录时产生 Changelog**: 
+
+1. **Level 0 代表新写入的数据**：Level 0 文件是 flush 写缓冲产生的，包含最新的业务变更
+2. **高层级压缩不产生业务变更**：Level 1 → Level 2 的压缩只是文件重组，没有新数据参与
+3. **避免重复 Changelog**：如果高层级压缩也产生 Changelog，会导致同一条记录的变更被重复记录
+
+**设计好处**:
+- 精确控制 Changelog 产生时机，避免冗余
+- 确保每条业务变更只产生一次 Changelog
+- 与 INPUT 模式的语义对齐（INPUT 也只在 flush 时产生 Changelog）
 
 ### 6.2 与 LookupLevels/LookupMergeFunction 的交互
 
@@ -876,7 +885,29 @@ public enum ScanMode {
 2. 如果有 → 使用 `ScanMode.CHANGELOG` 读取 Changelog 文件
 3. 如果没有 → 使用 `ScanMode.DELTA` 读取增量文件（降级）
 
-这种设计确保了：即使是 FULL_COMPACTION 模式下某些 Snapshot 没有触发全压缩（因此没有 Changelog），流式消费也不会中断，只是该 Snapshot 的记录缺少 RowKind 语义。
+**源码实现细节** (`paimon-core/.../table/source/snapshot/SnapshotReaderImpl.java:466`):
+
+```java
+public Plan readChanges() {
+    withMode(ScanMode.DELTA);  // 先设置为 DELTA 模式
+    FileStoreScan.Plan plan = scan.plan();
+    
+    // 关键: 实际读取时会检查 changelogManifestList
+    // 如果存在，会优先读取 changelog 文件
+    // 如果不存在，降级为读取 delta 文件
+    Map<BinaryRow, Map<Integer, List<ManifestEntry>>> beforeFiles =
+            groupByPartFiles(plan.files(FileKind.DELETE));
+    Map<BinaryRow, Map<Integer, List<ManifestEntry>>> afterFiles =
+            groupByPartFiles(plan.files(FileKind.ADD));
+    // ...
+}
+```
+
+**降级机制的工作方式**:
+- `readChanges()` 并非直接切换到 `ScanMode.CHANGELOG`，而是先用 `DELTA` 模式扫描
+- 在 `FileStoreScan.plan()` 内部会检查 Snapshot 的 `changelogManifestList` 字段
+- 如果存在 changelog manifest，会读取 changelog 文件；否则读取 delta 文件
+- 这种设计确保了即使某些 Snapshot 没有 Changelog（如 FULL_COMPACTION 模式下未触发全压缩），流式消费也不会中断
 
 ---
 
@@ -1331,6 +1362,91 @@ graph TB
         S --> BT[BinlogTable - _ROW_KIND + ARRAY columns]
     end
 ```
+
+---
+
+## 16. 常见问题与最佳实践
+
+### 16.1 为什么 LOOKUP 模式不适用于 FirstRow 合并引擎？
+
+**原因**: FirstRow 合并引擎的语义是"保留每个键的第一条记录"，这与 LOOKUP 模式的"查找旧值生成 UPDATE_BEFORE"逻辑冲突。
+
+**技术细节**:
+- FirstRow 的 `contains` 检查只关心"键是否已存在"，不关心旧值内容
+- LOOKUP 模式需要读取完整的旧值来生成 UPDATE_BEFORE，但 FirstRow 场景下旧值已被丢弃
+- FirstRow 有自己的 `FirstRowMergeFunctionWrapper`，通过 `contains` 过滤器直接判断是否产生 INSERT
+
+**最佳实践**: FirstRow 表应使用 `changelog-producer=input` 或 `changelog-producer=full-compaction`。
+
+### 16.2 为什么高层级压缩不产生 Changelog？
+
+**设计原因**:
+1. **避免重复记录**: Level 1 → Level 2 的压缩只是文件重组，没有新的业务变更
+2. **语义一致性**: 只有 Level 0（flush 产生）代表新写入的数据
+3. **性能优化**: 减少不必要的 Changelog 文件生成
+
+**验证方式**: 查看 `LookupChangelogMergeFunctionWrapper.merge()` 中的 `containLevel0` 判断逻辑。
+
+### 16.3 FULL_COMPACTION 模式下为什么某些 Snapshot 没有 Changelog？
+
+**原因**: FULL_COMPACTION 只在全压缩时产生 Changelog，而全压缩的触发频率远低于普通压缩。
+
+**影响**:
+- 流式消费会自动降级为 DELTA 模式读取这些 Snapshot
+- 这些 Snapshot 的记录缺少 RowKind 语义（全部为 INSERT）
+- 不影响数据完整性，只影响变更类型的识别
+
+**最佳实践**: 如果需要低延迟的 Changelog，应使用 LOOKUP 模式而非 FULL_COMPACTION。
+
+### 16.4 如何选择合适的 changelog-producer 模式？
+
+| 模式 | 适用场景 | 优点 | 缺点 |
+|------|---------|------|------|
+| **NONE** | 不需要 CDC 语义 | 无额外开销 | 无 Changelog |
+| **INPUT** | 上游已有完整 CDC 流 | 延迟最低，无额外计算 | 依赖上游 CDC 质量 |
+| **LOOKUP** | 需要 CDC 但上游无 CDC | 延迟低（L0 压缩即产生） | 需要 Lookup 索引开销 |
+| **FULL_COMPACTION** | 对延迟不敏感 | 无 Lookup 开销 | 延迟高（等待全压缩） |
+
+**决策树**:
+1. 上游有完整 CDC 流 → 选择 INPUT
+2. 上游无 CDC，需要低延迟 → 选择 LOOKUP
+3. 上游无 CDC，对延迟不敏感 → 选择 FULL_COMPACTION
+4. 不需要 CDC → 选择 NONE
+
+### 16.5 Long-Lived Changelog 的解耦模式有什么好处？
+
+**传统模式的问题**:
+- Changelog 文件与 Snapshot 绑定，Snapshot 过期时 Changelog 也被删除
+- 如果消费者延迟较大，可能导致 Changelog 被提前清理
+
+**解耦模式的好处**:
+1. **独立过期策略**: Changelog 文件有自己的 TTL（`changelog.time-retained`）
+2. **消费者保护**: 通过 `ConsumerManager` 追踪消费位点，未消费的 Changelog 不会被删除
+3. **灵活性**: 可以为 Changelog 配置更长的保留时间，而不影响 Snapshot 清理
+
+**配置示例**:
+```sql
+CREATE TABLE t (
+  ...
+) WITH (
+  'changelog-producer' = 'lookup',
+  'changelog.num-retained.max' = '100',  -- 最多保留 100 个 Changelog
+  'changelog.time-retained' = '1 h'      -- 至少保留 1 小时
+);
+```
+
+### 16.6 为什么 readChanges() 需要降级机制？
+
+**设计原因**:
+- 某些 Snapshot 可能没有 `changelogManifestList`（如 FULL_COMPACTION 模式下未触发全压缩）
+- 流式消费不能因为某个 Snapshot 缺少 Changelog 就中断
+
+**降级策略**:
+1. 优先读取 `changelogManifestList` 中的 Changelog 文件
+2. 如果不存在，降级为读取 `deltaManifestList` 中的增量文件
+3. 降级后的记录 RowKind 全部为 INSERT
+
+**最佳实践**: 使用 LOOKUP 模式可以确保每个 Snapshot 都有 Changelog，避免降级。
 
 ---
 

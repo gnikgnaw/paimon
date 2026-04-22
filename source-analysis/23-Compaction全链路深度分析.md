@@ -1,6 +1,7 @@
 # Apache Paimon Compaction 全链路深度分析
 
-> 基于 Paimon 1.5-SNAPSHOT 源码（commit: 7c93bd720），全面剖析 Compaction 机制的架构设计、策略选择、执行流程与工程细节。
+> 基于 Paimon 1.5-SNAPSHOT 源码（commit: 55f4fd175），全面剖析 Compaction 机制的架构设计、策略选择、执行流程与工程细节。
+> 分析日期: 2026-04-21
 
 ---
 

@@ -1,7 +1,7 @@
 # Flink 写入 Paimon 源码流程深度分析
 
-> 基于 Apache Paimon 1.5-SNAPSHOT (commit: 7c93bd720)
-> 分析日期: 2026-04-15
+> 基于 Apache Paimon 1.5-SNAPSHOT (commit: 55f4fd175)
+> 分析日期: 2026-04-21
 
 ---
 

@@ -1,8 +1,8 @@
 # Apache Paimon vs Apache Iceberg 全面深度对比
 
-> **分析基础**: Paimon 1.5-SNAPSHOT 源码 (commit 7c93bd720)，Iceberg 1.4.x 源码及公开设计文档
+> **分析基础**: Paimon 1.5-SNAPSHOT 源码 (commit: 55f4fd175)，Iceberg 1.4.x 源码及公开设计文档
 >
-> **分析日期**: 2026-04-15
+> **分析日期**: 2026-04-21
 
 ---
 
@@ -455,7 +455,7 @@ Iceberg Flink 读取管道：
 
 ### 8.2 Procedure 丰富度
 
-**Paimon Spark Procedures**（从源码统计约 40+ 个）：
+**Paimon Spark Procedures**（从源码统计约 30 个）：
 - **Compaction 类**: `CompactProcedure`、`CompactDatabaseProcedure`、`CompactManifestProcedure`
 - **Tag/Branch 类**: `CreateTagProcedure`、`DeleteTagProcedure`、`ReplaceTagProcedure`、`RenameTagProcedure`、`CreateBranchProcedure`、`DeleteBranchProcedure`、`RenameBranchProcedure`、`FastForwardProcedure`
 - **版本管理类**: `RollbackProcedure`、`RollbackToTimestampProcedure`、`RollbackToWatermarkProcedure`

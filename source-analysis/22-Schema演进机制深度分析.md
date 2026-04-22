@@ -1,7 +1,7 @@
 # Apache Paimon Schema 演进机制深度分析
 
-> **基于源码版本**: Apache Paimon 1.5-SNAPSHOT (commit 7c93bd720)
-> **分析日期**: 2026-04-15
+> **基于源码版本**: Apache Paimon 1.5-SNAPSHOT (commit: 55f4fd175)
+> **分析日期**: 2026-04-21
 > **分析范围**: paimon-api、paimon-core、paimon-common、paimon-flink、paimon-spark 模块中 Schema 演进相关的全部核心代码
 
 ---

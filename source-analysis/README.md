@@ -1,7 +1,7 @@
 # Apache Paimon 源码深度分析
 
 > 基于 Apache Paimon 1.5-SNAPSHOT 源码深度分析
-> 分析时间: 2026-04-15
+> 分析时间: 2026-04-21
 > 项目地址: https://github.com/apache/paimon
 
 ---

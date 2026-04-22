@@ -1,7 +1,7 @@
 # Apache Paimon Catalog 与元数据管理深度分析
 
-> 基于 Paimon 1.5-SNAPSHOT 源码分析，commit: 7c93bd720
-> 分析日期: 2026-04-15
+> 基于 Paimon 1.5-SNAPSHOT 源码分析，commit: 55f4fd175
+> 分析日期: 2026-04-21
 
 ---
 
@@ -510,7 +510,7 @@ TableSchema 是表的完整元数据定义，比用户提供的 Schema 多了 ID
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `version` | `int` | Schema 格式版本（当前 v3，Paimon 0.7=v1, 0.8=v2） |
+| `version` | `int` | Schema 格式版本（当前 v3，Paimon 0.4-0.6=v1, 0.7-0.8=v2, 0.9+=v3） |
 | `id` | `long` | Schema ID，单调递增 |
 | `fields` | `List<DataField>` | 字段列表（不可变） |
 | `highestFieldId` | `int` | 已分配的最大字段 ID（因为删除列后 ID 不会回收） |
@@ -839,7 +839,17 @@ public Snapshot latestSnapshot() {
 }
 ```
 
-**`latestSnapshotFromFileSystem()` 的查找策略: hint 文件优先 + 目录列表兜底。** 实际上 Paimon **维护了 LATEST hint 指针文件**（位于 `{snapshot_dir}/LATEST`）。`findLatest()` 内部调用 `HintFileUtils.findLatest()`，首先尝试读取 hint 文件获取快照 ID，并验证该 ID 的下一个快照不存在来确认其确实是最新的；如果 hint 文件不存在、无效或已过时，则回退到列出目录下所有快照文件取最大 ID 的方式（`findByListFiles()`）。提交成功后通过 `commitLatestHint()` 更新 hint 文件。这种设计兼顾了性能（hint 命中时只需 1-2 次文件操作）和正确性（hint 失效时自动降级到全量扫描）。
+**`latestSnapshotFromFileSystem()` 的查找策略：hint 文件优先 + 验证 + 目录列表兜底。** 
+
+Paimon 维护了一个 LATEST hint 文件（位于 `{snapshot_dir}/LATEST`），用于快速定位最新快照。`HintFileUtils.findLatest()` 的查找逻辑：
+
+1. 首先尝试读取 LATEST hint 文件获取快照 ID
+2. 如果 hint 存在且有效（> 0），验证该 ID 的下一个快照（ID+1）是否存在
+3. 只有当下一个快照不存在时，才确认 hint 指向的是真正的最新快照
+4. 如果 hint 文件不存在、无效或已过时（下一个快照存在），则回退到列出目录下所有快照文件取最大 ID 的方式（`findByListFiles()`）
+5. 提交成功后通过 `commitLatestHint()` 更新 hint 文件
+
+**为什么需要验证步骤？** hint 文件可能因为并发写入、网络延迟、文件系统缓存等原因指向一个不是最新的快照。通过验证 ID+1 是否存在，可以确保 hint 的准确性，避免返回过期的快照 ID。这种设计兼顾了性能（hint 命中时只需 1-2 次文件操作）和正确性（hint 失效时自动降级到全量扫描）。
 
 ---
 

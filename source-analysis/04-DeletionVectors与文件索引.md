@@ -1,7 +1,7 @@
 # Apache Paimon Deletion Vectors 与文件索引深度分析
 
-> 基于 Paimon 1.5-SNAPSHOT 源码分析，commit: 7c93bd720
-> 分析日期: 2026-04-15
+> 基于 Paimon 1.5-SNAPSHOT 源码分析，commit: 55f4fd175
+> 分析日期: 2026-04-21
 
 ---
 
@@ -435,7 +435,7 @@ public class DeletionVectorMeta {
 }
 ```
 
-**为什么需要 cardinality 字段**: `cardinality` 记录了该 DV 中已删除的行数。这个信息在查询计划阶段非常有用: 查询引擎可以通过 `totalRowCount - cardinality` 估算有效行数，用于代价估算和优化决策。`cardinality` 被标记为 `@Nullable` 和 `BigIntType(true)`，说明这是一个后来添加的字段，旧版本数据可能没有这个值。
+**为什么需要 cardinality 字段**: `cardinality` 记录了该 DV 中已删除的行数。这个信息在查询计划阶段非常有用: 查询引擎可以通过 `totalRowCount - cardinality` 估算有效行数，用于代价估算和优化决策。`cardinality` 被标记为 `@Nullable` 和 `BigIntType(true)`，**这是后向兼容设计，旧版本数据可能没有此字段，读取时需要容错处理**。
 
 ### 2.4 DeletionVectorIndexFileWriter 与 Rolling 写入
 
@@ -1497,7 +1497,7 @@ public RoaringBitmap32 gt(long code) {
 }
 ```
 
-**时间复杂度**: O(slices.length)，即 O(log(max_value))。对于 long 类型最多 64 次 Bitmap 运算，与数据量和基数无关。
+**时间复杂度**: O(bits)，对于 long 类型最多 64 次 Bitmap 运算，与数据量和基数无关。
 
 ### 10.4 值映射 (Value Mapper)
 
