@@ -1,19 +1,20 @@
-#  Licensed to the Apache Software Foundation (ASF) under one
-#  or more contributor license agreements.  See the NOTICE file
-#  distributed with this work for additional information
-#  regarding copyright ownership.  The ASF licenses this file
-#  to you under the Apache License, Version 2.0 (the
-#  "License"); you may not use this file except in compliance
-#  with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-#    http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing,
-#  software distributed under the License is distributed on an
-#  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-#  KIND, either express or implied.  See the License for the
-#  specific language governing permissions and limitations
-#  under the License.
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
 from pypaimon.common.options.config_options import ConfigOptions
 
 
@@ -85,6 +86,27 @@ class CatalogOptions:
     HTTP_USER_AGENT_HEADER = ConfigOptions.key(
         "header.HTTP_USER_AGENT").string_type().no_default_value().with_description("HTTP User Agent header")
     BLOB_FILE_IO_DEFAULT_CACHE_SIZE = 2 ** 31 - 1
+
+
+class SecurityOptions:
+    KERBEROS_PRINCIPAL = (
+        ConfigOptions.key("security.kerberos.login.principal")
+        .string_type()
+        .no_default_value()
+        .with_description("Kerberos principal name associated with the keytab")
+    )
+    KERBEROS_KEYTAB = (
+        ConfigOptions.key("security.kerberos.login.keytab")
+        .string_type()
+        .no_default_value()
+        .with_description("Absolute path to a Kerberos keytab file that contains the user credentials")
+    )
+    KERBEROS_USE_TICKET_CACHE = (
+        ConfigOptions.key("security.kerberos.login.use-ticket-cache")
+        .boolean_type()
+        .default_value(True)
+        .with_description("Whether to read from the Kerberos ticket cache")
+    )
 
 
 class FuseOptions:

@@ -1660,7 +1660,11 @@ public class CoreOptions implements Serializable {
                                                             + " this strategy is suitable for the number of partitions you write in a batch is much smaller than write parallelism."),
                                             text(
                                                     "hash: Hash the partitions value,"
-                                                            + " this strategy is suitable for the number of partitions you write in a batch is greater equals than write parallelism."))
+                                                            + " this strategy is suitable for the number of partitions you write in a batch is greater equals than write parallelism."),
+                                            text(
+                                                    "partition_dynamic: Dynamically adjusts shuffle strategy based on partition key traffic patterns."
+                                                            + " This mode monitors data distribution across partitions and rebalances load across downstream subtasks."
+                                                            + " Suitable when partition traffic is skewed and you want balanced write throughput."))
                                     .build());
 
     public static final ConfigOption<Boolean> METASTORE_PARTITIONED_TABLE =
@@ -1762,6 +1766,15 @@ public class CoreOptions implements Serializable {
                     .stringType()
                     .noDefaultValue()
                     .withDescription("Use customized name when creating tags in Batch mode.");
+
+    public static final ConfigOption<Duration> SCAN_PLAN_AUTO_TAG_FOR_READ_TIME_RETAINED =
+            key("scan.plan-auto-tag-for-read.time-retained")
+                    .durationType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "When set, a temporary tag will be auto-created during batch scan planning "
+                                    + "to protect the read snapshot from expiration. The value specifies the tag's TTL. "
+                                    + "Should be longer than the longest expected batch read duration.");
 
     public static final ConfigOption<Duration> SNAPSHOT_WATERMARK_IDLE_TIMEOUT =
             key("snapshot.watermark-idle-timeout")
@@ -1971,6 +1984,16 @@ public class CoreOptions implements Serializable {
                     .withDescription(
                             "When a batch job queries from a table, if a partition does not exist in the current branch, "
                                     + "the reader will try to get this partition from this fallback branch.");
+
+    public static final ConfigOption<Boolean> SCAN_FALLBACK_BRANCH_READ_FAIL_FAST =
+            key("scan.fallback-branch.read-fail-fast")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Whether to fail the read immediately when reading from a fallback branch throws. "
+                                    + "By default the failure is logged with the full stack trace and the reader "
+                                    + "falls through to the current branch, which can mask data issues. "
+                                    + "Set this to true to surface fallback branch errors to the caller instead.");
 
     public static final ConfigOption<String> SCAN_PRIMARY_BRANCH =
             key("scan.primary-branch")
@@ -2185,6 +2208,15 @@ public class CoreOptions implements Serializable {
                     .defaultValue(false)
                     .withDescription("Whether enable unique row id for append table.");
 
+    public static final ConfigOption<Boolean> ROW_TRACKING_PARTITION_GROUP_ON_COMMIT =
+            key("row-tracking.partition-group-on-commit")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription(
+                            "When row-tracking is enabled, whether to group new file metas by partition "
+                                    + "before commit, so that assigned row IDs are contiguous within each partition."
+                                    + "This is useful if you want to build global indices on this table. ");
+
     @Immutable
     public static final ConfigOption<Boolean> DATA_EVOLUTION_ENABLED =
             key("data-evolution.enabled")
@@ -2263,7 +2295,9 @@ public class CoreOptions implements Serializable {
                     .noDefaultValue()
                     .withDescription(
                             "Specifies column names that should be stored as blob type. "
-                                    + "This is used when you want to treat a BYTES column as a BLOB.");
+                                    + "This is used when you want to treat a BYTES column as a BLOB. "
+                                    + "Fields listed in blob-descriptor-field or blob-view-field "
+                                    + "are also treated as BLOB fields.");
 
     @Immutable
     public static final ConfigOption<String> BLOB_DESCRIPTOR_FIELD =
@@ -2272,8 +2306,18 @@ public class CoreOptions implements Serializable {
                     .noDefaultValue()
                     .withFallbackKeys("blob.stored-descriptor-fields")
                     .withDescription(
-                            "Comma-separated BLOB field names to store as serialized BlobDescriptor "
-                                    + "bytes inline in data files.");
+                            "Comma-separated field names to treat as BLOB fields and store "
+                                    + "as serialized BlobDescriptor bytes inline in data files.");
+
+    @Immutable
+    public static final ConfigOption<String> BLOB_VIEW_FIELD =
+            key("blob-view-field")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Comma-separated field names to treat as BLOB fields and store "
+                                    + "as serialized BlobViewStruct bytes inline in data files and "
+                                    + "resolve from upstream tables at read time.");
 
     public static final ConfigOption<Boolean> BLOB_AS_DESCRIPTOR =
             key("blob-as-descriptor")
@@ -2281,6 +2325,15 @@ public class CoreOptions implements Serializable {
                     .defaultValue(false)
                     .withDescription(
                             "Write blob field using blob descriptor rather than blob bytes.");
+
+    public static final ConfigOption<Boolean> BLOB_WRITE_NULL_ON_MISSING_FILE =
+            key("blob-write-null-on-missing-file")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Whether to write NULL for a descriptor BLOB value when the "
+                                    + "referenced file does not exist during Flink writes. When "
+                                    + "false, the write fails when the descriptor is read.");
 
     @Immutable
     public static final ConfigOption<String> BLOB_EXTERNAL_STORAGE_PATH =
@@ -2930,6 +2983,23 @@ public class CoreOptions implements Serializable {
     }
 
     /**
+     * Resolve blob fields that should be stored as serialized view metadata in data files.
+     *
+     * <p>If this option is set, the listed BLOB fields store {@code BlobViewStruct} bytes inline
+     * and resolve the actual blob content from upstream tables at read time.
+     */
+    public Set<String> blobViewField() {
+        return parseCommaSeparatedSet(BLOB_VIEW_FIELD);
+    }
+
+    /** Resolve blob fields that are stored inline in normal data files. */
+    public Set<String> blobInlineField() {
+        Set<String> fields = new HashSet<>(blobDescriptorField());
+        fields.addAll(blobViewField());
+        return fields;
+    }
+
+    /**
      * Resolve blob fields whose data should be written to external storage at write time. These
      * fields must be a subset of {@link #blobDescriptorField()}.
      */
@@ -2946,7 +3016,7 @@ public class CoreOptions implements Serializable {
      * subset of descriptor fields and therefore are also updatable.
      */
     public Set<String> updatableBlobFields() {
-        return blobDescriptorField();
+        return blobInlineField();
     }
 
     /**
@@ -3285,6 +3355,15 @@ public class CoreOptions implements Serializable {
         return Arrays.stream(string.split(",")).map(String::trim).collect(Collectors.toList());
     }
 
+    public static List<String> blobViewField(Map<String, String> options) {
+        String string = options.get(BLOB_VIEW_FIELD.key());
+        if (string == null) {
+            return Collections.emptyList();
+        }
+
+        return Arrays.stream(string.split(",")).map(String::trim).collect(Collectors.toList());
+    }
+
     public boolean sequenceFieldSortOrderIsAscending() {
         return options.get(SEQUENCE_FIELD_SORT_ORDER) == SortOrder.ASCENDING;
     }
@@ -3480,6 +3559,11 @@ public class CoreOptions implements Serializable {
         return options.get(TAG_BATCH_CUSTOMIZED_NAME);
     }
 
+    @Nullable
+    public Duration scanPlanAutoTagTimeRetained() {
+        return options.get(SCAN_PLAN_AUTO_TAG_FOR_READ_TIME_RETAINED);
+    }
+
     public Duration snapshotWatermarkIdleTimeout() {
         return options.get(SNAPSHOT_WATERMARK_IDLE_TIMEOUT);
     }
@@ -3596,6 +3680,10 @@ public class CoreOptions implements Serializable {
 
     public boolean rowTrackingEnabled() {
         return options.get(ROW_TRACKING_ENABLED);
+    }
+
+    public boolean rowTrackingPartitionGroupOnCommit() {
+        return options.get(ROW_TRACKING_PARTITION_GROUP_ON_COMMIT);
     }
 
     public boolean dataEvolutionEnabled() {
@@ -3741,6 +3829,10 @@ public class CoreOptions implements Serializable {
 
     public boolean blobAsDescriptor() {
         return options.get(BLOB_AS_DESCRIPTOR);
+    }
+
+    public boolean blobWriteNullOnMissingFile() {
+        return options.get(BLOB_WRITE_NULL_ON_MISSING_FILE);
     }
 
     public boolean postponeBatchWriteFixedBucket() {
@@ -4482,8 +4574,8 @@ public class CoreOptions implements Serializable {
     /** Partition strategy for unaware bucket partitioned append only table. */
     public enum PartitionSinkStrategy {
         NONE,
-        HASH
-        // TODO : Supports range-partition strategy.
+        HASH,
+        PARTITION_DYNAMIC
     }
 
     /** Specifies the implementation of format table. */

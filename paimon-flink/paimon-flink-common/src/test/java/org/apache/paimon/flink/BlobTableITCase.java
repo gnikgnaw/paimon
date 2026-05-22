@@ -27,6 +27,7 @@ import org.apache.paimon.fs.local.LocalFileIO;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.rest.TestHttpWebServer;
 import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.types.DataTypeRoot;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.UriReader;
 import org.apache.paimon.utils.UriReaderFactory;
@@ -46,6 +47,7 @@ import java.util.stream.Stream;
 
 import static org.apache.paimon.flink.LogicalTypeConversion.toLogicalType;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test write and read table with blob type. */
 public class BlobTableITCase extends CatalogITCaseBase {
@@ -172,6 +174,101 @@ public class BlobTableITCase extends CatalogITCaseBase {
         batchSql("ALTER TABLE blob_table_descriptor SET ('blob-as-descriptor'='false')");
         assertThat(batchSql("SELECT * FROM blob_table_descriptor"))
                 .containsExactlyInAnyOrder(Row.of(1, "paimon", blobData));
+    }
+
+    @Test
+    public void testWriteBlobViewWithBuiltInFunction() throws Exception {
+        tEnv.executeSql(
+                "CREATE TABLE upstream_blob_view (id INT, name STRING, picture BYTES)"
+                        + " WITH ('row-tracking.enabled'='true',"
+                        + " 'data-evolution.enabled'='true',"
+                        + " 'blob-field'='picture')");
+        batchSql("INSERT INTO upstream_blob_view VALUES (1, 'row1', X'48656C6C6F')");
+        batchSql("INSERT INTO upstream_blob_view VALUES (2, 'row2', X'5945')");
+
+        String fullTableName = tEnv.getCurrentDatabase() + ".upstream_blob_view";
+
+        tEnv.executeSql(
+                "CREATE TABLE downstream_blob_view (id INT, label STRING, image_ref BYTES)"
+                        + " WITH ('row-tracking.enabled'='true',"
+                        + " 'data-evolution.enabled'='true',"
+                        + " 'blob-view-field'='image_ref')");
+
+        batchSql(
+                String.format(
+                        "INSERT INTO downstream_blob_view"
+                                + " SELECT id, name, sys.blob_view('%s', 'picture', _ROW_ID)"
+                                + " FROM `upstream_blob_view$row_tracking`",
+                        fullTableName));
+
+        List<Row> result = batchSql("SELECT * FROM downstream_blob_view ORDER BY id");
+        assertThat(result).hasSize(2);
+        assertThat(result.get(0).getField(0)).isEqualTo(1);
+        assertThat(result.get(0).getField(1)).isEqualTo("row1");
+        assertThat((byte[]) result.get(0).getField(2))
+                .isEqualTo(new byte[] {72, 101, 108, 108, 111});
+        assertThat(result.get(1).getField(0)).isEqualTo(2);
+        assertThat(result.get(1).getField(1)).isEqualTo("row2");
+        assertThat((byte[]) result.get(1).getField(2)).isEqualTo(new byte[] {89, 69});
+    }
+
+    @Test
+    public void testBlobViewRejectsUnqualifiedTableName() {
+        assertThatThrownBy(
+                        () ->
+                                batchSql(
+                                        "SELECT sys.blob_view("
+                                                + "'upstream_blob_view', "
+                                                + "'picture', "
+                                                + "CAST(0 AS BIGINT))"))
+                .hasRootCauseInstanceOf(IllegalArgumentException.class)
+                .hasRootCauseMessage(
+                        "Table name must be 'database.table' or 'PAIMON.database.table', "
+                                + "but is 'upstream_blob_view'.");
+    }
+
+    @Test
+    public void testBlobViewRejectsNonBlobField() {
+        tEnv.executeSql(
+                "CREATE TABLE upstream_non_blob (id INT, picture BYTES)"
+                        + " WITH ('row-tracking.enabled'='true',"
+                        + " 'data-evolution.enabled'='true')");
+
+        String fullTableName = tEnv.getCurrentDatabase() + ".upstream_non_blob";
+        assertThatThrownBy(
+                        () ->
+                                batchSql(
+                                        "SELECT sys.blob_view("
+                                                + "'%s', "
+                                                + "'picture', "
+                                                + "CAST(0 AS BIGINT))",
+                                        fullTableName))
+                .hasRootCauseInstanceOf(IllegalArgumentException.class)
+                .hasRootCauseMessage(
+                        "Field picture in upstream table "
+                                + fullTableName
+                                + " is not a BLOB field.");
+    }
+
+    @Test
+    public void testBlobInlineFieldCanDeclareBlobWithoutBlobField() throws Exception {
+        assertSecondaryBlobFieldCanDeclareBlobWithoutBlobField(
+                "blob_descriptor_without_blob_field", "blob-descriptor-field");
+        assertSecondaryBlobFieldCanDeclareBlobWithoutBlobField(
+                "blob_view_without_blob_field", "blob-view-field");
+    }
+
+    private void assertSecondaryBlobFieldCanDeclareBlobWithoutBlobField(
+            String tableName, String optionKey) throws Exception {
+        tEnv.executeSql(
+                String.format(
+                        "CREATE TABLE %s (id INT, picture BYTES)"
+                                + " WITH ('row-tracking.enabled'='true',"
+                                + " 'data-evolution.enabled'='true',"
+                                + " '%s'='picture')",
+                        tableName, optionKey));
+
+        assertThat(paimonTable(tableName).rowType().getTypeAt(1).is(DataTypeRoot.BLOB)).isTrue();
     }
 
     @Test

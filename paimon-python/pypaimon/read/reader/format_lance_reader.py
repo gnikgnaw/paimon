@@ -1,22 +1,21 @@
-################################################################################
-#  Licensed to the Apache Software Foundation (ASF) under one
-#  or more contributor license agreements.  See the NOTICE file
-#  distributed with this work for additional information
-#  regarding copyright ownership.  The ASF licenses this file
-#  to you under the Apache License, Version 2.0 (the
-#  "License"); you may not use this file except in compliance
-#  with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
-################################################################################
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
-from typing import List, Optional, Any
+from typing import Any, List, Optional, Tuple
 
 import pyarrow as pa
 import pyarrow.dataset as ds
@@ -36,7 +35,9 @@ class FormatLanceReader(RecordBatchReader):
     """
 
     def __init__(self, file_io: FileIO, file_path: str, read_fields: List[DataField],
-                 push_down_predicate: Any, batch_size: int = 1024):
+                 push_down_predicate: Any, batch_size: int = 1024,
+                 row_range: Optional[Tuple[int, int]] = None,
+                 row_indices: Optional[List[int]] = None):
         """Initialize Lance reader."""
         import lance
 
@@ -61,7 +62,14 @@ class FormatLanceReader(RecordBatchReader):
             file_path_for_lance,
             storage_options=storage_options,
             columns=columns_for_lance)
-        pa_table = lance_reader.read_all().to_table()
+        if row_indices is not None:
+            reader_results = lance_reader.take_rows(row_indices)
+        elif row_range is not None:
+            start, end = row_range
+            reader_results = lance_reader.read_range(start, end - start)
+        else:
+            reader_results = lance_reader.read_all()
+        pa_table = reader_results.to_table()
 
         # Precompute output schema for missing fields
         if self.missing_fields:

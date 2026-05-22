@@ -1,20 +1,19 @@
-################################################################################
-#  Licensed to the Apache Software Foundation (ASF) under one
-#  or more contributor license agreements.  See the NOTICE file
-#  distributed with this work for additional information
-#  regarding copyright ownership.  The ASF licenses this file
-#  to you under the Apache License, Version 2.0 (the
-#  "License"); you may not use this file except in compliance
-#  with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-# limitations under the License.
-################################################################################
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
 import unittest
 from datetime import datetime
@@ -28,7 +27,6 @@ from pypaimon.write.commit_message import CommitMessage
 from pypaimon.write.file_store_commit import FileStoreCommit
 
 
-@patch('pypaimon.write.file_store_commit.SnapshotManager')
 @patch('pypaimon.write.file_store_commit.ManifestFileManager')
 @patch('pypaimon.write.file_store_commit.ManifestListManager')
 class TestFileStoreCommit(unittest.TestCase):
@@ -55,7 +53,7 @@ class TestFileStoreCommit(unittest.TestCase):
         )
 
     def test_generate_partition_statistics_single_partition_single_file(
-            self, mock_manifest_list_manager, mock_manifest_file_manager, mock_snapshot_manager):
+            self, mock_manifest_list_manager, mock_manifest_file_manager):
         """Test partition statistics generation with single partition and single file."""
         # Create FileStoreCommit instance
         file_store_commit = self._create_file_store_commit()
@@ -107,7 +105,7 @@ class TestFileStoreCommit(unittest.TestCase):
         self.assertEqual(stat.last_file_creation_time, expected_time)
 
     def test_generate_partition_statistics_multiple_files_same_partition(
-            self, mock_manifest_list_manager, mock_manifest_file_manager, mock_snapshot_manager):
+            self, mock_manifest_list_manager, mock_manifest_file_manager):
         """Test partition statistics generation with multiple files in same partition."""
         # Create FileStoreCommit instance
         file_store_commit = self._create_file_store_commit()
@@ -171,7 +169,7 @@ class TestFileStoreCommit(unittest.TestCase):
         self.assertEqual(stat.last_file_creation_time, expected_time)
 
     def test_generate_partition_statistics_multiple_partitions(
-            self, mock_manifest_list_manager, mock_manifest_file_manager, mock_snapshot_manager):
+            self, mock_manifest_list_manager, mock_manifest_file_manager):
         """Test partition statistics generation with multiple different partitions."""
         # Create FileStoreCommit instance
         file_store_commit = self._create_file_store_commit()
@@ -259,7 +257,7 @@ class TestFileStoreCommit(unittest.TestCase):
         self.assertEqual(stat_2.file_size_in_bytes, 2 * 1024 * 1024)
 
     def test_generate_partition_statistics_unpartitioned_table(
-            self, mock_manifest_list_manager, mock_manifest_file_manager, mock_snapshot_manager):
+            self, mock_manifest_list_manager, mock_manifest_file_manager):
         """Test partition statistics generation for unpartitioned table."""
         # Update mock table to have no partition keys
         self.mock_table.partition_keys = []
@@ -310,7 +308,7 @@ class TestFileStoreCommit(unittest.TestCase):
         self.assertEqual(stat.file_size_in_bytes, 1024 * 1024)
 
     def test_generate_partition_statistics_no_creation_time(
-            self, mock_manifest_list_manager, mock_manifest_file_manager, mock_snapshot_manager):
+            self, mock_manifest_list_manager, mock_manifest_file_manager):
         """Test partition statistics generation when file has no creation time."""
         # Create FileStoreCommit instance
         file_store_commit = self._create_file_store_commit()
@@ -347,7 +345,7 @@ class TestFileStoreCommit(unittest.TestCase):
         self.assertGreater(stat.last_file_creation_time, 0)
 
     def test_generate_partition_statistics_mismatched_partition_keys(
-            self, mock_manifest_list_manager, mock_manifest_file_manager, mock_snapshot_manager):
+            self, mock_manifest_list_manager, mock_manifest_file_manager):
         """Test partition statistics generation when partition tuple doesn't match partition keys."""
         # Create FileStoreCommit instance
         file_store_commit = self._create_file_store_commit()
@@ -393,7 +391,7 @@ class TestFileStoreCommit(unittest.TestCase):
         self.assertEqual(stat.spec, expected_spec)
 
     def test_generate_partition_statistics_empty_commit_messages(
-            self, mock_manifest_list_manager, mock_manifest_file_manager, mock_snapshot_manager):
+            self, mock_manifest_list_manager, mock_manifest_file_manager):
         """Test partition statistics generation with empty commit messages list."""
         # Create FileStoreCommit instance
         file_store_commit = self._create_file_store_commit()
@@ -405,7 +403,7 @@ class TestFileStoreCommit(unittest.TestCase):
         self.assertEqual(len(statistics), 0)
 
     def test_append_commit_inherits_index_manifest(
-            self, mock_manifest_list_manager, mock_manifest_file_manager, mock_snapshot_manager):
+            self, mock_manifest_list_manager, mock_manifest_file_manager):
         file_store_commit = self._create_file_store_commit()
 
         self.mock_table.identifier = 'default.test_table'
@@ -448,7 +446,7 @@ class TestFileStoreCommit(unittest.TestCase):
         )
 
     def test_null_partition_value(
-            self, mock_manifest_list_manager, mock_manifest_file_manager, mock_snapshot_manager):
+            self, mock_manifest_list_manager, mock_manifest_file_manager):
         from pypaimon.data.timestamp import Timestamp
         from pypaimon.manifest.schema.simple_stats import SimpleStats
         from pypaimon.schema.data_types import DataField, AtomicType

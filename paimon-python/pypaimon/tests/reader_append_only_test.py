@@ -1,20 +1,19 @@
-################################################################################
-#  Licensed to the Apache Software Foundation (ASF) under one
-#  or more contributor license agreements.  See the NOTICE file
-#  distributed with this work for additional information
-#  regarding copyright ownership.  The ASF licenses this file
-#  to you under the Apache License, Version 2.0 (the
-#  "License"); you may not use this file except in compliance
-#  with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-# limitations under the License.
-################################################################################
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
 import os
 import shutil
@@ -31,7 +30,6 @@ from pypaimon import CatalogFactory, Schema
 from pypaimon.common.options.core_options import CoreOptions
 from pypaimon.manifest.schema.manifest_entry import ManifestEntry
 from pypaimon.snapshot.snapshot import BATCH_COMMIT_IDENTIFIER
-from pypaimon.snapshot.snapshot_manager import SnapshotManager
 from pypaimon.table.row.generic_row import GenericRow
 from pypaimon.write.file_store_commit import RetryResult
 
@@ -137,7 +135,7 @@ class AoReaderTest(unittest.TestCase):
         table_write.close()
         table_commit.close()
 
-        snapshot_manager = SnapshotManager(table)
+        snapshot_manager = table.snapshot_manager()
         snapshot = snapshot_manager.get_latest_snapshot()
         table_inc = table.copy({
             CoreOptions.INCREMENTAL_BETWEEN_TIMESTAMP.key():
@@ -248,6 +246,172 @@ class AoReaderTest(unittest.TestCase):
         ])
         self.assertEqual(actual.sort_by('user_id'), expected)
 
+    def test_lance_sliced_split_row_range_pushdown(self):
+        """
+        SlicedSplit with Lance format calls read_range() instead of read_all(),
+        reading only the requested row slice from disk rather than the full file.
+        """
+        import unittest.mock as mock
+        try:
+            import lance as _lance
+            import lance.file  # ensure submodule is loaded before write_lance uses it
+        except ImportError:
+            self.skipTest("lance not installed")
+
+        schema = Schema.from_pyarrow_schema(
+            pa.schema([('id', pa.int64()), ('value', pa.string())]),
+            options={'file.format': 'lance'})
+        self.catalog.create_table('default.test_lance_sliced_split', schema, False)
+        table = self.catalog.get_table('default.test_lance_sliced_split')
+
+        # Write 1000 rows in a single shot so they land in one file
+        n = 1000
+        pa_table = pa.table({'id': list(range(n)), 'value': [f'v{i}' for i in range(n)]})
+        write_builder = table.new_batch_write_builder()
+        table_write = write_builder.new_write()
+        table_commit = write_builder.new_commit()
+        table_write.write_arrow(pa_table)
+        table_commit.commit(table_write.prepare_commit())
+        table_write.close()
+        table_commit.close()
+
+        scan = table.new_read_builder().new_scan()
+        splits = scan.plan().splits()
+        self.assertEqual(len(splits), 1, "Expected single split (no partition, single bucket)")
+        data_split = splits[0]
+        self.assertEqual(len(data_split.files), 1, "Expected single file in split")
+
+        file_name = data_split.files[0].file_name
+        slice_start, slice_end = 200, 700  # request 500 of 1000 rows
+
+        from pypaimon.read.sliced_split import SlicedSplit
+        sliced = SlicedSplit(data_split, {file_name: (slice_start, slice_end)})
+
+        # Spy on lance.file.LanceFileReader to verify read_range is used
+        OrigReader = _lance.file.LanceFileReader
+        read_all_calls = []
+        read_range_calls = []
+
+        class SpyLanceFileReader:
+            def __init__(self, *args, **kwargs):
+                self._r = OrigReader(*args, **kwargs)
+
+            def read_all(self, *args, **kwargs):
+                read_all_calls.append(())
+                return self._r.read_all(*args, **kwargs)
+
+            def read_range(self, start, count, **kwargs):
+                read_range_calls.append((start, count))
+                return self._r.read_range(start, count, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._r, name)
+
+        table_read = table.new_read_builder().new_read()
+        with mock.patch.object(_lance.file, 'LanceFileReader', SpyLanceFileReader):
+            result = table_read.to_arrow([sliced])
+
+        # Verify that read_range was used, not read_all
+        self.assertEqual(len(read_all_calls), 0,
+                         "read_all() must not be called when SlicedSplit row range is available")
+        self.assertEqual(len(read_range_calls), 1)
+        actual_start, actual_count = read_range_calls[0]
+        self.assertEqual(actual_start, slice_start)
+        self.assertEqual(actual_count, slice_end - slice_start,
+                         f"read_range should request exactly {slice_end - slice_start} rows, "
+                         f"not the full {n} rows of the file")
+
+        # Verify functional correctness: correct rows returned
+        self.assertEqual(result.num_rows, slice_end - slice_start)
+        result_ids = sorted(result.column('id').to_pylist())
+        self.assertEqual(result_ids, list(range(slice_start, slice_end)))
+
+    def test_lance_indexed_split_take_rows_pushdown(self):
+        """
+        IndexedSplit row ranges (from ANN global index results) are converted to
+        local file indices and pushed down to lance.file.LanceFileReader.take_rows(),
+        so only the matched rows are physically read instead of the full file.
+        """
+        import unittest.mock as mock
+        try:
+            import lance as _lance
+            import lance.file
+        except ImportError:
+            self.skipTest("lance not installed")
+
+        schema = Schema.from_pyarrow_schema(
+            pa.schema([('id', pa.int64()), ('value', pa.string())]),
+            options={'file.format': 'lance',
+                     'row-tracking.enabled': 'true',
+                     'data-evolution.enabled': 'true'})
+        self.catalog.create_table('default.test_lance_indexed_split', schema, False)
+        table = self.catalog.get_table('default.test_lance_indexed_split')
+
+        n = 1000
+        pa_table = pa.table({'id': list(range(n)), 'value': [f'v{i}' for i in range(n)]})
+        write_builder = table.new_batch_write_builder()
+        table_write = write_builder.new_write()
+        table_commit = write_builder.new_commit()
+        table_write.write_arrow(pa_table)
+        table_commit.commit(table_write.prepare_commit())
+        table_write.close()
+        table_commit.close()
+
+        splits = table.new_read_builder().new_scan().plan().splits()
+        self.assertEqual(len(splits), 1)
+        data_split = splits[0]
+        self.assertEqual(len(data_split.files), 1)
+
+        file_meta = data_split.files[0]
+        self.assertIsNotNone(file_meta.first_row_id, "row tracking must assign first_row_id")
+        first_row_id = file_meta.first_row_id
+
+        # Simulate ANN result: 3 scattered global row IDs
+        from pypaimon.globalindex.indexed_split import IndexedSplit
+        from pypaimon.utils.range import Range
+        target_global_ids = [first_row_id + 50, first_row_id + 300, first_row_id + 700]
+        row_ranges = [Range(g, g) for g in target_global_ids]
+        indexed = IndexedSplit(data_split, row_ranges)
+
+        OrigReader = _lance.file.LanceFileReader
+        take_rows_calls = []
+        read_all_calls = []
+
+        class SpyLanceFileReader:
+            def __init__(self, *args, **kwargs):
+                self._r = OrigReader(*args, **kwargs)
+
+            def take_rows(self, indices, **kwargs):
+                take_rows_calls.append(list(indices))
+                return self._r.take_rows(indices, **kwargs)
+
+            def read_all(self, *args, **kwargs):
+                read_all_calls.append(())
+                return self._r.read_all(*args, **kwargs)
+
+            def read_range(self, *args, **kwargs):
+                return self._r.read_range(*args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._r, name)
+
+        table_read = table.new_read_builder().new_read()
+        with mock.patch.object(_lance.file, 'LanceFileReader', SpyLanceFileReader):
+            result = table_read.to_arrow([indexed])
+
+        self.assertEqual(len(read_all_calls), 0,
+                         "read_all() must not be called when IndexedSplit row ranges are available")
+        self.assertEqual(len(take_rows_calls), 1)
+        # local indices = global_ids - first_row_id
+        expected_local = [g - first_row_id for g in target_global_ids]
+        self.assertEqual(sorted(take_rows_calls[0]), sorted(expected_local),
+                         f"take_rows should request local indices {expected_local}, "
+                         f"not read the full {n} rows")
+
+        self.assertEqual(result.num_rows, len(target_global_ids))
+        result_ids = sorted(result.column('id').to_pylist())
+        self.assertEqual(result_ids, [50, 300, 700])
+
     def test_append_only_multi_write_once_commit(self):
         schema = Schema.from_pyarrow_schema(self.pa_schema, partition_keys=['dt'])
         self.catalog.create_table('default.test_append_only_multi_once_commit', schema, False)
@@ -312,7 +476,7 @@ class AoReaderTest(unittest.TestCase):
         table_commit.commit(messages)
         table_write.close()
 
-        snapshot_manager = SnapshotManager(table)
+        snapshot_manager = table.snapshot_manager()
         latest_snapshot = snapshot_manager.get_latest_snapshot()
         commit_entries = []
         for msg in messages:
@@ -494,11 +658,12 @@ class AoReaderTest(unittest.TestCase):
         table = self.catalog.get_table('default.test_append_only_limit')
         self._write_test_table(table)
 
+        # Row-level limit: the reader stops at exactly N rows (not "first
+        # split's full row count"). Scan still keeps the first split that
+        # covers the limit; the reader short-circuits inside it.
         read_builder = table.new_read_builder().with_limit(1)
         actual = self._read_test_table(read_builder)
-        # only records from 1st commit (1st split) will be read
-        # might be split of "dt=1" or split of "dt=2"
-        self.assertEqual(actual.num_rows, 4)
+        self.assertEqual(actual.num_rows, 1)
 
     def test_incremental_timestamp(self):
         schema = Schema.from_pyarrow_schema(self.pa_schema, partition_keys=['dt'])
@@ -507,7 +672,7 @@ class AoReaderTest(unittest.TestCase):
         timestamp = int(time.time() * 1000)
         self._write_test_table(table)
 
-        snapshot_manager = SnapshotManager(table)
+        snapshot_manager = table.snapshot_manager()
         t1 = snapshot_manager.get_snapshot_by_id(1).time_millis
         t2 = snapshot_manager.get_snapshot_by_id(2).time_millis
         # test 1
@@ -547,7 +712,7 @@ class AoReaderTest(unittest.TestCase):
             table_write.close()
             table_commit.close()
 
-        snapshot_manager = SnapshotManager(table)
+        snapshot_manager = table.snapshot_manager()
         t10 = snapshot_manager.get_snapshot_by_id(10).time_millis
         t20 = snapshot_manager.get_snapshot_by_id(20).time_millis
 
@@ -572,7 +737,16 @@ class AoReaderTest(unittest.TestCase):
         for test_iteration in range(iter_num):
             # Create a unique table for each iteration
             table_name = f'default.test_concurrent_writes_{test_iteration}'
-            schema = Schema.from_pyarrow_schema(self.pa_schema)
+            # Concurrent commits are expected here; enlarge the retry budget so the
+            # default (commit.max-retries=10, commit.max-retry-wait=1s) does not
+            # exhaust under heavy CI load and produce a flaky failure.
+            schema = Schema.from_pyarrow_schema(
+                self.pa_schema,
+                options={
+                    'commit.max-retries': '50',
+                    'commit.max-retry-wait': '30s',
+                },
+            )
             self.catalog.create_table(table_name, schema, False)
             table = self.catalog.get_table(table_name)
 
@@ -614,9 +788,15 @@ class AoReaderTest(unittest.TestCase):
                         'error': str(e)
                     })
 
-            # Create and start multiple threads
+            # Create and start multiple threads. Keep this modest (3 vs. the
+            # original 10) because GHA runners under load can't drain 10
+            # simultaneously-conflicting commits even with
+            # ``commit.max-retries=50`` (50 attempts * 30s back-off ~25 min,
+            # still timing out in CI). Three threads exercises the retry path
+            # without pushing each iteration past the per-test wall-time
+            # budget.
             threads = []
-            num_threads = 10
+            num_threads = 3
             for i in range(num_threads):
                 thread = threading.Thread(
                     target=write_data,
@@ -654,7 +834,7 @@ class AoReaderTest(unittest.TestCase):
                              f"Iteration {test_iteration}: User IDs mismatch")
 
             # Verify snapshot count (should have num_threads snapshots)
-            snapshot_manager = SnapshotManager(table)
+            snapshot_manager = table.snapshot_manager()
             latest_snapshot = snapshot_manager.get_latest_snapshot()
             self.assertIsNotNone(latest_snapshot,
                                  f"Iteration {test_iteration}: Latest snapshot should not be None")

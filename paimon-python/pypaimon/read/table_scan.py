@@ -1,29 +1,28 @@
-################################################################################
-#  Licensed to the Apache Software Foundation (ASF) under one
-#  or more contributor license agreements.  See the NOTICE file
-#  distributed with this work for additional information
-#  regarding copyright ownership.  The ASF licenses this file
-#  to you under the Apache License, Version 2.0 (the
-#  "License"); you may not use this file except in compliance
-#  with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-# limitations under the License.
-################################################################################
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
-from typing import Optional
+from typing import Optional, Tuple
 
 from pypaimon.common.options.core_options import CoreOptions
 from pypaimon.common.predicate import Predicate
 
 from pypaimon.read.plan import Plan
+from pypaimon.read.scan_stats import ScanStats
 from pypaimon.read.scanner.file_scanner import FileScanner
-from pypaimon.snapshot.snapshot_manager import SnapshotManager
 from pypaimon.manifest.manifest_list_manager import ManifestListManager
 
 
@@ -46,9 +45,17 @@ class TableScan:
     def plan(self) -> Plan:
         return self.file_scanner.scan()
 
+    def scan_with_stats(self) -> Tuple[Plan, ScanStats]:
+        """Run :meth:`plan` while recording manifest / pruning counters.
+
+        Only used by :meth:`ReadBuilder.explain`; the regular read path
+        keeps going through :meth:`plan`.
+        """
+        return self.file_scanner.scan_with_stats()
+
     def _create_file_scanner(self) -> FileScanner:
         options = self.table.options.options
-        snapshot_manager = SnapshotManager(self.table)
+        snapshot_manager = self.table.snapshot_manager()
         manifest_list_manager = ManifestListManager(self.table)
         if options.contains(CoreOptions.INCREMENTAL_BETWEEN_TIMESTAMP):
             ts = options.get(CoreOptions.INCREMENTAL_BETWEEN_TIMESTAMP).split(",")
@@ -111,6 +118,23 @@ class TableScan:
             return FileScanner(
                 self.table,
                 tag_manifest_scanner,
+                self.predicate,
+                self.limit
+            )
+        elif options.contains(CoreOptions.SCAN_SNAPSHOT_ID):  # Handle snapshot-id-based reading
+            snapshot_id = int(options.get(CoreOptions.SCAN_SNAPSHOT_ID))
+
+            def snapshot_id_manifest_scanner():
+                snapshot = snapshot_manager.get_snapshot_by_id(snapshot_id)
+                if snapshot is None:
+                    raise ValueError(
+                        "Snapshot id %d does not exist" % snapshot_id
+                    )
+                return manifest_list_manager.read_all(snapshot), snapshot
+
+            return FileScanner(
+                self.table,
+                snapshot_id_manifest_scanner,
                 self.predicate,
                 self.limit
             )

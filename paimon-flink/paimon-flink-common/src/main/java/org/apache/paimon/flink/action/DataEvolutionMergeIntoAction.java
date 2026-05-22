@@ -377,8 +377,7 @@ public class DataEvolutionMergeIntoAction extends TableActionBase {
                                         coreOptions.localSortMaxNumFileHandles(),
                                         coreOptions.spillCompressOptions(),
                                         sinkParallelism,
-                                        coreOptions.writeBufferSpillDiskSize(),
-                                        coreOptions.sequenceFieldSortOrderIsAscending()))
+                                        coreOptions.writeBufferSpillDiskSize()))
                         .setParallelism(sinkParallelism);
 
         // 2. write partial columns
@@ -499,6 +498,8 @@ public class DataEvolutionMergeIntoAction extends TableActionBase {
                                     + "' through MERGE INTO. "
                                     + "Only descriptor-based BLOB columns (configured via '"
                                     + CoreOptions.BLOB_DESCRIPTOR_FIELD.key()
+                                    + "' or '"
+                                    + CoreOptions.BLOB_VIEW_FIELD.key()
                                     + "' or '"
                                     + CoreOptions.BLOB_EXTERNAL_STORAGE_FIELD.key()
                                     + "') can be updated.");

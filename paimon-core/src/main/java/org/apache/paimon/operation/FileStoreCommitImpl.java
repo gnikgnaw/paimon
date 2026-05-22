@@ -81,6 +81,7 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nullable;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -189,7 +190,7 @@ public class FileStoreCommitImpl implements FileStoreCommit {
         this.manifestList = manifestListFactory.create();
         this.indexManifestFile = indexManifestFileFactory.create();
         this.rollback = rollback;
-        this.scanner = new CommitScanner(scanSupplier.get(), indexManifestFile, options);
+        this.scanner = new CommitScanner(scanSupplier, snapshotManager, indexManifestFile, options);
         this.commitPreCallbacks = commitPreCallbacks;
         this.commitCallbacks = commitCallbacks;
         this.retryWaiter =
@@ -211,7 +212,8 @@ public class FileStoreCommitImpl implements FileStoreCommit {
                                         new StrictModeChecker(
                                                 snapshotManager,
                                                 commitUser,
-                                                scanSupplier.get(),
+                                                scanSupplier,
+                                                indexManifestFile,
                                                 id))
                         .orElse(null);
         this.conflictDetection = conflictDetectFactory.create(scanner);
@@ -545,6 +547,9 @@ public class FileStoreCommitImpl implements FileStoreCommit {
         if (!options.overwriteUpgrade()) {
             return appendFiles;
         }
+        if (options.pkClusteringOverride()) {
+            return appendFiles;
+        }
         Comparator<InternalRow> keyComparator = conflictDetection.keyComparator();
         if (keyComparator == null) {
             return appendFiles;
@@ -735,6 +740,36 @@ public class FileStoreCommitImpl implements FileStoreCommit {
         return retryCount + 1;
     }
 
+    private void checkSameBucketFromSnapshot(
+            List<ManifestEntry> deltaFiles, @Nullable Snapshot latestSnapshot) {
+        if (latestSnapshot == null) {
+            return;
+        }
+
+        Map<BinaryRow, Integer> expectedTotalBuckets =
+                conflictDetection.collectUncheckedBucketPartitions(deltaFiles);
+        if (expectedTotalBuckets.isEmpty()) {
+            return;
+        }
+
+        Map<BinaryRow, Integer> previousTotalBuckets =
+                scanner.readTotalBuckets(
+                        latestSnapshot, new ArrayList<>(expectedTotalBuckets.keySet()));
+        Optional<RuntimeException> exception =
+                conflictDetection.checkSameBucketByTotalBuckets(
+                        expectedTotalBuckets, previousTotalBuckets);
+        if (exception.isPresent()) {
+            throw exception.get();
+        }
+    }
+
+    private boolean shouldCheckSameBucket(CommitKind commitKind) {
+        return commitKind == CommitKind.APPEND
+                && bucketMode == BucketMode.HASH_FIXED
+                && options.writeOnly()
+                && !options.bucketAppendOrdered();
+    }
+
     /**
      * Try to overwrite partition.
      *
@@ -749,13 +784,8 @@ public class FileStoreCommitImpl implements FileStoreCommit {
             @Nullable Long watermark,
             Map<String, String> properties) {
         return tryCommit(
-                latestSnapshot ->
-                        scanner.readOverwriteChanges(
-                                options.bucket(),
-                                changes,
-                                indexFiles,
-                                latestSnapshot,
-                                partitionFilter),
+                scanner.overwriteChangesProvider(
+                        options.bucket(), changes, indexFiles, partitionFilter),
                 identifier,
                 watermark,
                 properties,
@@ -813,8 +843,10 @@ public class FileStoreCommitImpl implements FileStoreCommit {
             }
         }
 
+        List<BinaryRow> changedPartitions = null;
         if (strictModeChecker != null) {
-            strictModeChecker.check(newSnapshotId, commitKind);
+            changedPartitions = changedPartitions(deltaFiles, indexFiles);
+            strictModeChecker.check(newSnapshotId, commitKind, changedPartitions);
             strictModeChecker.update(newSnapshotId - 1);
         }
 
@@ -832,10 +864,18 @@ public class FileStoreCommitImpl implements FileStoreCommit {
         List<SimpleFileEntry> baseDataFiles = new ArrayList<>();
         boolean discardDuplicate =
                 options.commitDiscardDuplicateFiles() && commitKind == CommitKind.APPEND;
-        if (latestSnapshot != null && (discardDuplicate || detectConflicts)) {
+        boolean checkConflicts = latestSnapshot != null && (discardDuplicate || detectConflicts);
+        // By default, if checkConflicts is required, we do not have to do the extra check bucket
+        // here.
+        if (!checkConflicts && shouldCheckSameBucket(commitKind)) {
+            checkSameBucketFromSnapshot(deltaFiles, latestSnapshot);
+        }
+        if (checkConflicts) {
             // latestSnapshotId is different from the snapshot id we've checked for conflicts,
             // so we have to check again
-            List<BinaryRow> changedPartitions = changedPartitions(deltaFiles, indexFiles);
+            if (changedPartitions == null) {
+                changedPartitions = changedPartitions(deltaFiles, indexFiles);
+            }
             CommitFailRetryResult commitFailRetry =
                     retryResult instanceof CommitFailRetryResult
                             ? (CommitFailRetryResult) retryResult
@@ -923,6 +963,15 @@ public class FileStoreCommitImpl implements FileStoreCommit {
             baseManifestList = manifestList.write(mergeAfterManifests);
 
             if (options.rowTrackingEnabled()) {
+                if (options.rowTrackingPartitionGroupOnCommit()) {
+                    Map<BinaryRow, List<ManifestEntry>> deltaFilesByPart =
+                            deltaFiles.stream()
+                                    .collect(Collectors.groupingBy(ManifestEntry::partition));
+                    deltaFiles =
+                            deltaFilesByPart.values().stream()
+                                    .flatMap(Collection::stream)
+                                    .collect(Collectors.toList());
+                }
                 RowTrackingAssigned assigned =
                         assignRowTracking(newSnapshotId, firstRowIdStart, deltaFiles);
                 nextRowIdStart = assigned.nextRowIdStart;
@@ -1054,6 +1103,22 @@ public class FileStoreCommitImpl implements FileStoreCommit {
             long totalRecordCount,
             Pair<String, Long> baseManifestList,
             Pair<String, Long> deltaManifestList) {
+        return replaceManifestList(
+                latest,
+                totalRecordCount,
+                baseManifestList,
+                deltaManifestList,
+                latest.indexManifest(),
+                latest.nextRowId());
+    }
+
+    public boolean replaceManifestList(
+            Snapshot latest,
+            long totalRecordCount,
+            Pair<String, Long> baseManifestList,
+            Pair<String, Long> deltaManifestList,
+            @Nullable String indexManifest,
+            @Nullable Long nextRowId) {
         Snapshot newSnapshot =
                 new Snapshot(
                         latest.id() + 1,
@@ -1064,7 +1129,7 @@ public class FileStoreCommitImpl implements FileStoreCommit {
                         deltaManifestList.getRight(),
                         null,
                         null,
-                        latest.indexManifest(),
+                        indexManifest,
                         commitUser,
                         Long.MAX_VALUE,
                         CommitKind.OVERWRITE,
@@ -1076,7 +1141,7 @@ public class FileStoreCommitImpl implements FileStoreCommit {
                         latest.statistics(),
                         // if empty properties, just set to null
                         latest.properties(),
-                        latest.nextRowId());
+                        nextRowId);
 
         return commitSnapshotImpl(newSnapshot, emptyList());
     }

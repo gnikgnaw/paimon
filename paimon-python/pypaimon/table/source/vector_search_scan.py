@@ -1,20 +1,19 @@
-################################################################################
-#  Licensed to the Apache Software Foundation (ASF) under one
-#  or more contributor license agreements.  See the NOTICE file
-#  distributed with this work for additional information
-#  regarding copyright ownership.  The ASF licenses this file
-#  to you under the Apache License, Version 2.0 (the
-#  "License"); you may not use this file except in compliance
-#  with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-# limitations under the License.
-################################################################################
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
 """Vector search scan to scan index files."""
 
@@ -60,7 +59,6 @@ class VectorSearchScanImpl(VectorSearchScan):
         from pypaimon.common.options.options import Options
         from pypaimon.index.index_file_handler import IndexFileHandler
         from pypaimon.read.push_down_utils import _get_all_fields
-        from pypaimon.snapshot.snapshot_manager import SnapshotManager
         from pypaimon.snapshot.time_travel_util import TimeTravelUtil
 
         vector_column = self._vector_column
@@ -78,10 +76,11 @@ class VectorSearchScanImpl(VectorSearchScan):
 
         snapshot = TimeTravelUtil.try_travel_to_snapshot(
             Options(self._table.table_schema.options),
-            self._table.tag_manager()
+            self._table.tag_manager(),
+            self._table.snapshot_manager(),
         )
         if snapshot is None:
-            snapshot = SnapshotManager(self._table).get_latest_snapshot()
+            snapshot = self._table.snapshot_manager().get_latest_snapshot()
 
         index_file_handler = IndexFileHandler(table=self._table)
 

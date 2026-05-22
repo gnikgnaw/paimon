@@ -1,20 +1,19 @@
-################################################################################
-#  Licensed to the Apache Software Foundation (ASF) under one
-#  or more contributor license agreements.  See the NOTICE file
-#  distributed with this work for additional information
-#  regarding copyright ownership.  The ASF licenses this file
-#  to you under the Apache License, Version 2.0 (the
-#  "License"); you may not use this file except in compliance
-#  with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-# limitations under the License.
-################################################################################
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
 """Tests for VectorSearch + scalar predicate pre-filter wiring in pypaimon.
 
@@ -28,7 +27,7 @@ from unittest import mock
 
 from pypaimon.common.predicate import Predicate
 from pypaimon.common.predicate_builder import PredicateBuilder
-from pypaimon.globalindex.global_index_meta import GlobalIndexMeta
+from pypaimon.globalindex.global_index_meta import GlobalIndexIOMeta, GlobalIndexMeta
 from pypaimon.globalindex.global_index_result import GlobalIndexResult
 from pypaimon.globalindex.vector_search_result import ScoredGlobalIndexResult
 from pypaimon.index.index_file_meta import IndexFileMeta
@@ -119,6 +118,26 @@ def _patch_snapshot(testcase, entries):
 
 
 # ----------------------------- tests ---------------------------------------
+
+
+class VectorReaderFactoryTest(unittest.TestCase):
+    """Vector reader factory compatibility."""
+
+    def test_lumina_reader_accepts_new_and_legacy_identifiers(self):
+        from pypaimon.globalindex.lumina.lumina_vector_global_index_reader import (
+            LUMINA_IDENTIFIERS,
+            LuminaVectorGlobalIndexReader,
+        )
+        from pypaimon.table.source.vector_search_read import _create_vector_reader
+
+        io_meta = GlobalIndexIOMeta(file_name="vec.index", file_size=1)
+        for index_type in LUMINA_IDENTIFIERS:
+            reader = _create_vector_reader(
+                index_type, object(), "/tmp/unused", [io_meta], {})
+            try:
+                self.assertIsInstance(reader, LuminaVectorGlobalIndexReader)
+            finally:
+                reader.close()
 
 
 class VectorSearchFilterTest(unittest.TestCase):
@@ -472,11 +491,11 @@ class VectorSearchPartitionedFilterTest(unittest.TestCase):
         partition_pt2 = GenericRow([2], [self.pt_field])
         self.entries = [
             _entry(partition_pt1, field_id=2,
-                   index_type="lumina-vector-ann",
+                   index_type="lumina",
                    file_name="vec-pt1.index",
                    row_range_start=0, row_range_end=4),
             _entry(partition_pt2, field_id=2,
-                   index_type="lumina-vector-ann",
+                   index_type="lumina",
                    file_name="vec-pt2.index",
                    row_range_start=5, row_range_end=9),
         ]
@@ -519,6 +538,128 @@ class VectorSearchPartitionedFilterTest(unittest.TestCase):
                 PredicateBuilder.and_predicates(
                     [pb.equal("pt", 1), pb.equal("id", 5)]))
         self.assertIn("non-partition", str(ctx.exception))
+
+
+class VectorSearchManySplitsTest(unittest.TestCase):
+
+    def test_vector_search_with_many_splits(self):
+        from pypaimon.globalindex.vector_search_result import (
+            DictBasedScoredIndexResult,
+        )
+        from pypaimon.table.source.vector_search_read import VectorSearchReadImpl
+        from pypaimon.table.source.vector_search_split import VectorSearchSplit
+
+        num_splits = 1200
+        embedding_field = _field(1, "embedding", "FLOAT")
+        entries = [
+            _entry(None, field_id=1, index_type="lumina-vector-ann",
+                   file_name="vec-%d.index" % i,
+                   row_range_start=i, row_range_end=i)
+            for i in range(num_splits)
+        ]
+        table = _StubTable(fields=[embedding_field], entries=entries)
+        _patch_snapshot(self, entries)
+
+        def _fake_create(index_type, file_io, index_path,
+                         index_io_meta_list, options=None):
+            row_id = index_io_meta_list[0].file_name
+            row_id = int(row_id.split("-")[1].split(".")[0])
+
+            class _FakeReader:
+                def visit_vector_search(self_inner, vs):
+                    return DictBasedScoredIndexResult({row_id: float(row_id)})
+
+                def close(self_inner):
+                    pass
+
+                def __enter__(self_inner):
+                    return self_inner
+
+                def __exit__(self_inner, *a):
+                    return False
+            return _FakeReader()
+
+        splits = [
+            VectorSearchSplit(
+                row_range_start=i, row_range_end=i,
+                vector_index_files=[entries[i].index_file])
+            for i in range(num_splits)
+        ]
+
+        with mock.patch(
+                "pypaimon.table.source.vector_search_read._create_vector_reader",
+                side_effect=_fake_create):
+            reader = VectorSearchReadImpl(
+                table, limit=10, vector_column=embedding_field,
+                query_vector=[1.0], filter_=None)
+            result = reader.read(splits)
+
+        self.assertLessEqual(result.results().cardinality(), 10)
+        self.assertEqual(result.results().cardinality(), 10)
+        scores = sorted(result.score_getter()(rid) for rid in result.results())
+        self.assertEqual(scores, [float(i) for i in range(1190, 1200)])
+
+    def tearDown(self):
+        mock.patch.stopall()
+
+
+class FullTextSearchManySplitsTest(unittest.TestCase):
+
+    def test_full_text_search_with_many_splits(self):
+        from pypaimon.globalindex.vector_search_result import (
+            DictBasedScoredIndexResult,
+        )
+        from pypaimon.table.source.full_text_read import FullTextReadImpl
+        from pypaimon.table.source.full_text_search_split import (
+            FullTextSearchSplit,
+        )
+
+        num_splits = 1200
+        text_field = _field(1, "content", "STRING")
+        entries = [
+            _entry(None, field_id=1, index_type="tantivy-fulltext",
+                   file_name="ft-%d.index" % i,
+                   row_range_start=i, row_range_end=i)
+            for i in range(num_splits)
+        ]
+        table = _StubTable(fields=[text_field], entries=entries)
+        _patch_snapshot(self, entries)
+
+        def _fake_create(index_type, file_io, index_path,
+                         index_io_meta_list):
+            row_id = index_io_meta_list[0].file_name
+            row_id = int(row_id.split("-")[1].split(".")[0])
+
+            class _FakeReader:
+                def visit_full_text_search(self_inner, fts):
+                    return DictBasedScoredIndexResult({row_id: float(row_id)})
+
+                def close(self_inner):
+                    pass
+            return _FakeReader()
+
+        splits = [
+            FullTextSearchSplit(
+                row_range_start=i, row_range_end=i,
+                full_text_index_files=[entries[i].index_file])
+            for i in range(num_splits)
+        ]
+
+        with mock.patch(
+                "pypaimon.table.source.full_text_read._create_full_text_reader",
+                side_effect=_fake_create):
+            reader = FullTextReadImpl(
+                table, limit=10, text_column=text_field,
+                query_text="test")
+            result = reader.read(splits)
+
+        self.assertLessEqual(result.results().cardinality(), 10)
+        self.assertEqual(result.results().cardinality(), 10)
+        scores = sorted(result.score_getter()(rid) for rid in result.results())
+        self.assertEqual(scores, [float(i) for i in range(1190, 1200)])
+
+    def tearDown(self):
+        mock.patch.stopall()
 
 
 if __name__ == "__main__":

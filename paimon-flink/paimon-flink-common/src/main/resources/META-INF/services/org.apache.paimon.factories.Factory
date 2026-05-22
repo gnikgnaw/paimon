@@ -38,6 +38,7 @@ org.apache.paimon.flink.action.MarkPartitionDoneActionFactory
 org.apache.paimon.flink.action.CreateBranchActionFactory
 org.apache.paimon.flink.action.DeleteBranchActionFactory
 org.apache.paimon.flink.action.FastForwardActionFactory
+org.apache.paimon.flink.action.MergeBranchActionFactory
 org.apache.paimon.flink.action.RenameTagActionFactory
 org.apache.paimon.flink.action.RepairActionFactory
 org.apache.paimon.flink.action.RewriteFileIndexActionFactory
@@ -85,6 +86,7 @@ org.apache.paimon.flink.procedure.privilege.RevokePrivilegeFromUserProcedure
 org.apache.paimon.flink.procedure.RepairProcedure
 org.apache.paimon.flink.procedure.RenameTagProcedure
 org.apache.paimon.flink.procedure.FastForwardProcedure
+org.apache.paimon.flink.procedure.MergeBranchProcedure
 org.apache.paimon.flink.procedure.MarkPartitionDoneProcedure
 org.apache.paimon.flink.procedure.CopyFilesProcedure
 org.apache.paimon.flink.procedure.CloneProcedure
@@ -102,3 +104,4 @@ org.apache.paimon.flink.procedure.RemoveUnexistingManifestsProcedure
 org.apache.paimon.flink.procedure.DataEvolutionMergeIntoProcedure
 org.apache.paimon.flink.procedure.CreateGlobalIndexProcedure
 org.apache.paimon.flink.procedure.VectorSearchProcedure
+org.apache.paimon.flink.procedure.DropGlobalIndexProcedure

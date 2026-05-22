@@ -20,6 +20,7 @@ package org.apache.paimon.table;
 
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.Snapshot;
+import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.disk.IOManager;
@@ -154,12 +155,24 @@ public class FallbackReadFileStoreTable extends DelegatedFileStoreTable {
         Options branchOptions = new Options(branchSchema.options());
         branchOptions.set(CoreOptions.BRANCH, branchName);
         branchSchema = branchSchema.copy(branchOptions.toMap());
+
+        // Create branch-aware CatalogEnvironment so that REST snapshot loading
+        // targets the branch table (e.g. tableName$branch_branchName) instead of main.
+        CatalogEnvironment wrappedEnv = wrapped.catalogEnvironment();
+        CatalogEnvironment branchEnv = wrappedEnv;
+        Identifier wrappedId = wrappedEnv.identifier();
+        if (wrappedId != null) {
+            branchEnv =
+                    wrappedEnv.copy(
+                            new Identifier(
+                                    wrappedId.getDatabaseName(),
+                                    wrappedId.getTableName(),
+                                    branchName,
+                                    wrappedId.getSystemTableName()));
+        }
+
         return FileStoreTableFactory.createWithoutFallbackBranch(
-                wrapped.fileIO(),
-                wrapped.location(),
-                branchSchema,
-                new Options(),
-                wrapped.catalogEnvironment());
+                wrapped.fileIO(), wrapped.location(), branchSchema, new Options(), branchEnv);
     }
 
     protected Map<String, String> rewriteOtherOptions(Map<String, String> options) {
@@ -573,12 +586,17 @@ public class FallbackReadFileStoreTable extends DelegatedFileStoreTable {
 
         private final InnerTableRead mainRead;
         private final InnerTableRead fallbackRead;
+        private final boolean fallbackReadFailFast;
 
         private Read() {
             FileStoreTable first = wrappedFirst ? wrapped : other;
             FileStoreTable second = wrappedFirst ? other : wrapped;
             this.mainRead = first.newRead();
             this.fallbackRead = second.newRead();
+            this.fallbackReadFailFast =
+                    wrapped.coreOptions()
+                            .toConfiguration()
+                            .get(CoreOptions.SCAN_FALLBACK_BRANCH_READ_FAIL_FAST);
         }
 
         @Override
@@ -623,10 +641,23 @@ public class FallbackReadFileStoreTable extends DelegatedFileStoreTable {
                 if (fallbackSplit.isFallback()) {
                     try {
                         return fallbackRead.createReader(fallbackSplit.wrapped());
-                    } catch (Exception ignored) {
+                    } catch (Exception e) {
+                        if (fallbackReadFailFast) {
+                            if (e instanceof IOException) {
+                                throw (IOException) e;
+                            }
+                            if (e instanceof RuntimeException) {
+                                throw (RuntimeException) e;
+                            }
+                            throw new IOException(
+                                    "Failed to read fallback branch split: "
+                                            + fallbackSplit.wrapped(),
+                                    e);
+                        }
                         LOG.error(
                                 "Reading from supplemental branch has problems: {}",
-                                fallbackSplit.wrapped());
+                                fallbackSplit.wrapped(),
+                                e);
                     }
                 }
             }

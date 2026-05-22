@@ -181,6 +181,34 @@ class SchemaValidationTest {
     }
 
     @Test
+    public void testNestedRowAggregateOptionRejected() {
+        // PAIMON-6471: nested-path agg config was silently ignored, leaving the parent ROW
+        // on the default aggregator and producing wrong results without any error.
+        List<DataField> fields =
+                Arrays.asList(
+                        new DataField(0, "id", DataTypes.INT()),
+                        new DataField(
+                                1,
+                                "data",
+                                DataTypes.ROW(
+                                        DataTypes.FIELD(2, "num", DataTypes.INT()),
+                                        DataTypes.FIELD(3, "info", DataTypes.STRING()))));
+
+        Map<String, String> options = new HashMap<>();
+        options.put("merge-engine", "aggregation");
+        options.put("fields.data.num.aggregate-function", "sum");
+        options.put("fields.data.sequence-group", "data");
+        options.put(BUCKET.key(), "1");
+
+        TableSchema schema =
+                new TableSchema(1, fields, 10, emptyList(), singletonList("id"), options, "");
+
+        assertThatThrownBy(() -> validateTableSchema(schema))
+                .hasMessageContaining("Nested-field path is not supported on ROW field 'data'")
+                .hasMessageContaining("fields.data.num.aggregate-function");
+    }
+
+    @Test
     public void testChainTableAllowsNonDeduplicateMergeEngine() {
         Map<String, String> options = new HashMap<>();
         options.put(CoreOptions.CHAIN_TABLE_ENABLED.key(), "true");
@@ -340,5 +368,121 @@ class SchemaValidationTest {
                                                 options,
                                                 "")))
                 .hasMessageContaining("primary-key");
+    }
+
+    @Test
+    public void testFileIndexColumns() {
+        List<String> keys =
+                Arrays.asList(
+                        "file-index.bloom-filter.columns",
+                        "file-index.bitmap.columns",
+                        "file-index.bsi.columns",
+                        "file-index.range-bitmap.columns");
+
+        for (String key : keys) {
+            // valid: all referenced columns exist
+            Map<String, String> okOptions = new HashMap<>();
+            okOptions.put(key, "f0,f3");
+            assertThatCode(() -> validateTableSchemaExec(okOptions))
+                    .as("valid key=%s", key)
+                    .doesNotThrowAnyException();
+
+            // invalid: references a non-existent column
+            Map<String, String> badOptions = new HashMap<>();
+            badOptions.put(key, "f0,not_exist");
+            assertThatThrownBy(() -> validateTableSchemaExec(badOptions))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining(
+                            "Column 'not_exist' specified in 'file-index.<index-type>.columns' does not exist in table schema.");
+        }
+    }
+
+    @Test
+    public void testFileIndexNestedColumn() {
+        List<String> keys =
+                Arrays.asList(
+                        "file-index.bloom-filter.columns",
+                        "file-index.bitmap.columns",
+                        "file-index.bsi.columns",
+                        "file-index.range-bitmap.columns");
+
+        for (String key : keys) {
+            // valid: nested syntax on a map column with string key
+            Map<String, String> okOptions = new HashMap<>();
+            okOptions.put(key, "m[k]");
+            assertThatCode(() -> validateTableSchemaWithMapField(okOptions))
+                    .doesNotThrowAnyException();
+
+            // invalid: nested syntax on a non-map column
+            Map<String, String> nonMapOptions = new HashMap<>();
+            nonMapOptions.put(key, "f3[k]");
+            assertThatThrownBy(() -> validateTableSchemaWithMapField(nonMapOptions))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining(
+                            "Column 'f3' is configured as nested column in 'file-index.<index-type>.columns' but is not a map type.");
+
+            // invalid: nested syntax on a map column with non-string key
+            Map<String, String> nonStringKeyOptions = new HashMap<>();
+            nonStringKeyOptions.put(key, "mi[k]");
+            assertThatThrownBy(() -> validateTableSchemaWithMapField(nonStringKeyOptions))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining(
+                            "Column 'mi' is configured as nested column in 'file-index.<index-type>.columns', but its map key type is INT. Only CHAR/VARCHAR/STRING is supported.");
+        }
+    }
+
+    private void validateTableSchemaWithMapField(Map<String, String> options) {
+        List<DataField> fields =
+                Arrays.asList(
+                        new DataField(0, "f0", DataTypes.INT()),
+                        new DataField(1, "f1", DataTypes.INT()),
+                        new DataField(2, "f2", DataTypes.INT()),
+                        new DataField(3, "f3", DataTypes.STRING()),
+                        new DataField(4, "m", DataTypes.MAP(DataTypes.STRING(), DataTypes.INT())),
+                        new DataField(5, "mi", DataTypes.MAP(DataTypes.INT(), DataTypes.INT())));
+        options.put(BUCKET.key(), String.valueOf(-1));
+        validateTableSchema(
+                new TableSchema(1, fields, 10, emptyList(), singletonList("f1"), options, ""));
+    }
+
+    @Test
+    public void testFileFormatPerLevelRejectsIncompatibleSchema() {
+        List<DataField> fields =
+                Arrays.asList(
+                        new DataField(0, "k", DataTypes.INT()),
+                        new DataField(1, "v", DataTypes.TIMESTAMP(9)));
+        Map<String, String> options = new HashMap<>();
+        options.put(BUCKET.key(), String.valueOf(-1));
+        options.put(CoreOptions.FILE_FORMAT_PER_LEVEL.key(), "0:avro");
+
+        assertThatThrownBy(
+                        () ->
+                                validateTableSchema(
+                                        new TableSchema(
+                                                1,
+                                                fields,
+                                                10,
+                                                emptyList(),
+                                                singletonList("k"),
+                                                options,
+                                                "")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("file.format.per.level")
+                .hasMessageContaining("0:avro")
+                .hasMessageContaining("TIMESTAMP");
+    }
+
+    @Test
+    public void testFileFormatPerLevelAcceptsCompatibleSchema() {
+        List<DataField> fields =
+                Arrays.asList(
+                        new DataField(0, "k", DataTypes.INT()),
+                        new DataField(1, "v", DataTypes.TIMESTAMP(9)));
+        Map<String, String> options = new HashMap<>();
+        options.put(BUCKET.key(), String.valueOf(-1));
+        options.put(CoreOptions.FILE_FORMAT_PER_LEVEL.key(), "0:parquet");
+
+        validateTableSchema(
+                new TableSchema(1, fields, 10, emptyList(), singletonList("k"), options, ""));
     }
 }

@@ -1,20 +1,20 @@
-################################################################################
-#  Licensed to the Apache Software Foundation (ASF) under one
-#  or more contributor license agreements.  See the NOTICE file
-#  distributed with this work for additional information
-#  regarding copyright ownership.  The ASF licenses this file
-#  to you under the Apache License, Version 2.0 (the
-#  "License"); you may not use this file except in compliance
-#  with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-# limitations under the License.
-################################################################################
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
 import logging
 import os
 import re
@@ -32,15 +32,12 @@ from pyarrow._fs import FileSystem
 
 from pypaimon.common.file_io import FileIO
 from pypaimon.common.options import Options
-from pypaimon.common.options.config import OssOptions, S3Options
+from pypaimon.common.options.config import OssOptions, S3Options, SecurityOptions
 from pypaimon.common.options.options_utils import OptionsUtils
 from pypaimon.common.uri_reader import UriReaderFactory
 from pypaimon.filesystem.jindo_file_system_handler import JindoFileSystemHandler, JINDO_AVAILABLE
 from pypaimon.schema.data_types import (AtomicType, DataField,
                                         PyarrowFieldParser)
-from pypaimon.table.row.blob import Blob, BlobData, BlobDescriptor
-from pypaimon.table.row.generic_row import GenericRow
-from pypaimon.table.row.row_kind import RowKind
 from pypaimon.write.blob_format_writer import BlobFormatWriter
 
 
@@ -256,12 +253,76 @@ class PyArrowFileIO(FileIO):
         )
         os.environ['CLASSPATH'] = class_paths.stdout.strip()
 
-        host, port_str = splitport(netloc)
-        return pafs.HadoopFileSystem(
-            host=host,
-            port=int(port_str),
-            user=os.environ.get('HADOOP_USER_NAME', 'hadoop')
+        principal = (self.properties.get(SecurityOptions.KERBEROS_PRINCIPAL)
+                     or self._get_property("security.principal"))
+        keytab = (self.properties.get(SecurityOptions.KERBEROS_KEYTAB)
+                  or self._get_property("security.keytab"))
+        use_ticket_cache = self.properties.get(SecurityOptions.KERBEROS_USE_TICKET_CACHE)
+
+        if bool(principal) != bool(keytab):
+            raise ValueError(
+                "security.kerberos.login.principal and security.kerberos.login.keytab "
+                "must be both set or both unset")
+
+        # Resolve (host, port) for pafs.HadoopFileSystem.
+        # - ViewFS URIs delegate to fs.defaultFS (host='default') so libhdfs
+        #   resolves the mount table from core-site.xml.
+        # - HDFS HA URIs carry a nameservice without a port; also delegate to
+        #   fs.defaultFS to avoid int(None) on the missing port.
+        # - Explicit "host:port" URIs connect directly.
+        if scheme == 'viewfs' or not netloc:
+            host, port = 'default', 0
+        else:
+            parsed_host, port_str = splitport(netloc)
+            if port_str is None:
+                host, port = 'default', 0
+            else:
+                host, port = parsed_host, int(port_str)
+
+        kerb_ticket = None
+        if principal and keytab:
+            self._kerberos_login_from_keytab(principal, keytab)
+            kerb_ticket = self._get_ticket_cache_path()
+            if not kerb_ticket:
+                raise RuntimeError(
+                    "kinit succeeded but no ticket cache path could be determined. "
+                    "Set the KRB5CCNAME environment variable to specify the cache location.")
+        elif use_ticket_cache:
+            cache_path = self._get_ticket_cache_path()
+            if cache_path and os.path.exists(cache_path):
+                kerb_ticket = cache_path
+
+        if kerb_ticket:
+            return pafs.HadoopFileSystem(host=host, port=port, kerb_ticket=kerb_ticket)
+        else:
+            return pafs.HadoopFileSystem(
+                host=host,
+                port=port,
+                user=os.environ.get('HADOOP_USER_NAME', 'hadoop')
+            )
+
+    @staticmethod
+    def _kerberos_login_from_keytab(principal: str, keytab: str):
+        if not os.path.isfile(keytab):
+            raise FileNotFoundError(f"Kerberos keytab file not found: {keytab}")
+        if not os.access(keytab, os.R_OK):
+            raise PermissionError(f"Kerberos keytab file is not readable: {keytab}")
+        subprocess.run(
+            ['kinit', '-kt', keytab, principal],
+            check=True, capture_output=True, text=True
         )
+
+    @staticmethod
+    def _get_ticket_cache_path() -> Optional[str]:
+        cc = os.environ.get('KRB5CCNAME')
+        if cc:
+            if cc.startswith('FILE:'):
+                return cc[5:]
+            return cc
+        default_path = f'/tmp/krb5cc_{os.getuid()}'
+        if os.path.exists(default_path):
+            return default_path
+        return None
 
     def new_input_stream(self, path: str):
         path_str = self.to_filesystem_path(path)
@@ -590,9 +651,6 @@ class PyArrowFileIO(FileIO):
         try:
             if data.num_columns != 1:
                 raise RuntimeError(f"Blob format only supports a single column, got {data.num_columns} columns")
-            column = data.column(0)
-            if column.null_count > 0:
-                raise RuntimeError("Blob format does not support null values")
             field = data.schema[0]
             if pyarrow.types.is_large_binary(field.type):
                 fields = [DataField(0, field.name, AtomicType("BLOB"))]
@@ -605,31 +663,7 @@ class PyArrowFileIO(FileIO):
             with self.new_output_stream(path) as output_stream:
                 writer = BlobFormatWriter(output_stream)
                 for i in range(num_rows):
-                    col_data = records_dict[field_name][i]
-                    if hasattr(fields[0].type, 'type') and fields[0].type.type == "BLOB":
-                        if hasattr(col_data, 'as_py'):
-                            col_data = col_data.as_py()
-                        if isinstance(col_data, str):
-                            col_data = col_data.encode('utf-8')
-                        if isinstance(col_data, bytearray):
-                            col_data = bytes(col_data)
-
-                        if isinstance(col_data, bytes):
-                            if BlobDescriptor.is_blob_descriptor(col_data):
-                                descriptor = BlobDescriptor.deserialize(col_data)
-                                uri_reader = self.uri_reader_factory.create(descriptor.uri)
-                                blob_data = Blob.from_descriptor(uri_reader, descriptor)
-                            else:
-                                blob_data = BlobData(col_data)
-                        else:
-                            raise RuntimeError(
-                                "Blob field value must be bytes/blob or serialized BlobDescriptor bytes."
-                            )
-                        row_values = [blob_data]
-                    else:
-                        row_values = [col_data]
-                    row = GenericRow(row_values, fields, RowKind.INSERT)
-                    writer.add_element(row)
+                    writer.write_value(records_dict[field_name][i], fields, self.uri_reader_factory)
                 writer.close()
 
         except Exception as e:
