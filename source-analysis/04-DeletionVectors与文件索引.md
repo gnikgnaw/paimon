@@ -1,4044 +1,557 @@
-# Apache Paimon Deletion Vectors 与文件索引深度分析
+# Apache Paimon Deletion Vector 机制源码深度分析
 
-> 基于 Paimon 1.5-SNAPSHOT 源码分析，commit: 55f4fd175
-> 分析日期: 2026-04-21
+> **版本**：1.5-SNAPSHOT　**源码模块**：`paimon-core`（`org.apache.paimon.deletionvectors`，配置项在 `paimon-api` 的 `CoreOptions`）　**核对日期**：2026-06
+
+**一句话定位**：Deletion Vector（DV）用一个 **per-data-file 的位图** 把"哪些行已失效"记下来，让主键表读取时**跳过 LSM merge、按行过滤**直接读最新文件——这就是 Paimon 的 **MOW（merge-on-write）**模式，把 merge-on-read 的代价从"每次查询"转移到"后台一次 compaction"。
+
+读完本文你应能回答：① DV 到底是文件级的还是行级的、行号是相对谁的偏移；② MOW 模式下 DV 是在 WriteBuffer flush 时生成、还是在 **lookup compaction** 时生成（这是旧稿讲糊的关键）；③ DV 与 LSM 各 level 的关系——为什么"Level 0 在 compaction 前对读不可见"；④ 一个 bucket 的 DV 为什么整体重写而不是追加，`modified` 标记省了什么；⑤ 读路径上 DV 如何按行过滤、与文件索引返回的 selection 如何叠加；⑥ Append 表的 DELETE 为什么比 PK 表的 DV 维护更复杂（Rolling + touched 索引文件重写）；⑦ "行级标删（MOW）"对比"整文件重写（COW）"各自的代价边界，什么时候 DV 反而变成累赘；⑧ V1/V2 两种位图格式的差异与 Iceberg 兼容点。
+
+> 阅读约定：本文每个机制按"① 要解决什么问题 → ② 设计原理与取舍 → ③ 关键源码（精选片段 + `路径:行号`）→ ④ 风险/陷阱/边界 → ⑤ 收益与代价"组织。源码行号以本次核对为准；与旧稿不符处用"（已修正）"标注。文件索引（Bloom/Bitmap/BSI/Range Bitmap）的内部结构由 **13 号文档主讲**，本文只在读路径交汇处点到并交叉引用，不重复展开。
 
 ---
 
 ## 目录
 
-- [1. DeletionVector 接口体系](#1-deletionvector-接口体系)
-  - [1.1 继承层次总览](#11-继承层次总览)
-  - [1.2 DeletionVector 接口定义](#12-deletionvector-接口定义)
-  - [1.3 BitmapDeletionVector (V1)](#13-bitmapdeletionvector-v1)
-  - [1.4 Bitmap64DeletionVector (V2)](#14-bitmap64deletionvector-v2)
-  - [1.5 V1/V2 序列化格式与 Magic Number](#15-v1v2-序列化格式与-magic-number)
-  - [1.6 反序列化分派机制](#16-反序列化分派机制)
-  - [1.7 Factory 模式与延迟加载](#17-factory-模式与延迟加载)
-- [2. DV 文件组织](#2-dv-文件组织)
-  - [2.1 DeletionVectorsIndexFile 索引文件](#21-deletionvectorsindexfile-索引文件)
-  - [2.2 DeletionFileWriter 写入器](#22-deletionfilewriter-写入器)
-  - [2.3 DeletionVectorMeta 元数据](#23-deletionvectormeta-元数据)
-  - [2.4 DeletionVectorIndexFileWriter 与 Rolling 写入](#24-deletionvectorindexfilewriter-与-rolling-写入)
-  - [2.5 DV 索引文件物理布局](#25-dv-索引文件物理布局)
-- [3. BucketedDvMaintainer 维护机制](#3-bucketeddvmaintainer-维护机制)
-  - [3.1 核心职责与数据结构](#31-核心职责与数据结构)
-  - [3.2 notifyNewDeletion 增量删除通知](#32-notifynewdeletion-增量删除通知)
-  - [3.3 mergeNewDeletion 合并删除向量](#33-mergenewdeletion-合并删除向量)
-  - [3.4 removeDeletionVectorOf 移除操作](#34-removedeletionvectorof-移除操作)
-  - [3.5 Factory 模式与状态恢复](#35-factory-模式与状态恢复)
-  - [3.6 写入输出与 modified 跟踪](#36-写入输出与-modified-跟踪)
-- [4. DV 在读路径中的应用](#4-dv-在读路径中的应用)
-  - [4.1 ApplyDeletionVectorReader 行级过滤](#41-applydeletionvectorreader-行级过滤)
-  - [4.2 ApplyDeletionFileRecordIterator 迭代过滤](#42-applydeletionfilerecorditerator-迭代过滤)
-  - [4.3 读路径全链路分析](#43-读路径全链路分析)
-- [5. DV 在写路径中的应用](#5-dv-在写路径中的应用)
-  - [5.1 Lookup 模式下标记旧行删除](#51-lookup-模式下标记旧行删除)
-  - [5.2 Compaction 时 DV 合并](#52-compaction-时-dv-合并)
-  - [5.3 DV 生命周期总结](#53-dv-生命周期总结)
-- [6. Append 表的 DV](#6-append-表的-dv)
-  - [6.1 BaseAppendDeleteFileMaintainer 接口](#61-baseappenddeletefilemaintainer-接口)
-  - [6.2 AppendDeleteFileMaintainer (Unaware Bucket)](#62-appenddeletefilemaintainer-unaware-bucket)
-  - [6.3 BucketedAppendDeleteFileMaintainer (Bucketed)](#63-bucketedappenddeletefilemaintainer-bucketed)
-  - [6.4 Append 表与 PK 表 DV 差异对比](#64-append-表与-pk-表-dv-差异对比)
-- [7. 文件索引 SPI 体系](#7-文件索引-spi-体系)
-  - [7.1 FileIndexer/FileIndexerFactory 接口设计](#71-fileindexerfileindexerfactory-接口设计)
-  - [7.2 SPI 加载机制](#72-spi-加载机制)
-  - [7.3 FileIndexFormat 存储格式 (Header + Body)](#73-fileindexformat-存储格式-header--body)
-  - [7.4 FileIndexWriter 写入接口](#74-fileindexwriter-写入接口)
-  - [7.5 FileIndexReader 读取接口](#75-fileindexreader-读取接口)
-- [8. Bloom Filter 索引](#8-bloom-filter-索引)
-  - [8.1 BloomFilterFileIndex 实现](#81-bloomfilterfileindex-实现)
-  - [8.2 BloomFilter64 底层结构](#82-bloomfilter64-底层结构)
-  - [8.3 FastHash 哈希策略](#83-fasthash-哈希策略)
-  - [8.4 序列化格式](#84-序列化格式)
-  - [8.5 仅支持 Equal 的设计决策](#85-仅支持-equal-的设计决策)
-  - [8.6 参数调优 (items/fpp)](#86-参数调优-itemsfpp)
-- [9. Bitmap 倒排索引](#9-bitmap-倒排索引)
-  - [9.1 BitmapFileIndex 核心思想](#91-bitmapfileindex-核心思想)
-  - [9.2 V1 格式 (BitmapFileIndexMeta)](#92-v1-格式-bitmapfileindexmeta)
-  - [9.3 V2 格式 (BitmapFileIndexMetaV2) 二级索引优化](#93-v2-格式-bitmapfileindexmetav2-二级索引优化)
-  - [9.4 支持的谓词类型](#94-支持的谓词类型)
-  - [9.5 单值优化](#95-单值优化)
-  - [9.6 ApplyBitmapIndexRecordReader 行级下推](#96-applybitmapindexrecordreader-行级下推)
-- [10. BSI (Bit-Sliced Index)](#10-bsi-bit-sliced-index)
-  - [10.1 BitSliceIndexBitmapFileIndex 核心原理](#101-bitsliceindexbitmapfileindex-核心原理)
-  - [10.2 正负数分组策略](#102-正负数分组策略)
-  - [10.3 范围查询 O(bits) 复杂度](#103-范围查询-obits-复杂度)
-  - [10.4 值映射 (Value Mapper)](#104-值映射-value-mapper)
-  - [10.5 支持的数据类型与谓词](#105-支持的数据类型与谓词)
-- [11. Range Bitmap 索引](#11-range-bitmap-索引)
-  - [11.1 RangeBitmapFileIndex 架构](#111-rangebitmapfileindex-架构)
-  - [11.2 ChunkedDictionary 分块字典](#112-chunkeddictionary-分块字典)
-  - [11.3 BitSliceIndexBitmap 内部 BSI](#113-bitsliceindexbitmap-内部-bsi)
-  - [11.4 TopN 查询加速](#114-topn-查询加速)
-  - [11.5 与 BSI 索引的差异](#115-与-bsi-索引的差异)
-- [12. FileIndexResult 三态逻辑](#12-fileindexresult-三态逻辑)
-  - [12.1 REMAIN/SKIP/BitmapIndexResult 三种状态](#121-remainskipbitmapindexresult-三种状态)
-  - [12.2 AND/OR 运算语义](#122-andor-运算语义)
-  - [12.3 BitmapIndexResult 的延迟计算](#123-bitmapindexresult-的延迟计算)
-- [13. FileIndexPredicate 评估流程](#13-fileindexpredicate-评估流程)
-  - [13.1 谓词评估入口](#131-谓词评估入口)
-  - [13.2 FileIndexPredicateTest 访问者模式](#132-fileindexpredicatetest-访问者模式)
-  - [13.3 TopN 评估](#133-topn-评估)
-- [14. 全局索引](#14-全局索引)
-  - [14.1 GlobalIndexMeta 架构](#141-globalindexmeta-架构)
-  - [14.2 BTree 全局索引](#142-btree-全局索引)
-  - [14.3 用途: 跨分区更新](#143-用途-跨分区更新)
-- [15. Predicate 体系](#15-predicate-体系)
-  - [15.1 LeafPredicate 叶子谓词](#151-leafpredicate-叶子谓词)
-  - [15.2 CompoundPredicate 组合谓词](#152-compoundpredicate-组合谓词)
-  - [15.3 FunctionVisitor 双重分派](#153-functionvisitor-双重分派)
-  - [15.4 Predicate 多层下推](#154-predicate-多层下推)
-- [16. Lookup 机制](#16-lookup-机制)
-  - [16.1 StateFactory 接口](#161-statefactory-接口)
-  - [16.2 RocksDB 状态后端](#162-rocksdb-状态后端)
-  - [16.3 InMemory 状态后端](#163-inmemory-状态后端)
-  - [16.4 LRU Cache 策略](#164-lru-cache-策略)
-- [17. 与 Iceberg DV 对比](#17-与-iceberg-dv-对比)
+- [1. 快速理解（核心问题 / 概念速查 / 高频陷阱）](#1-快速理解核心问题--概念速查--高频陷阱)
+  - [1.1 核心问题：DV 把 merge 代价从"读"挪到"写"](#11-核心问题dv-把-merge-代价从读挪到写)
+  - [1.2 核心概念速查表](#12-核心概念速查表)
+  - [1.3 高频生产陷阱](#13-高频生产陷阱)
+- [2. DV 的数据结构：BitmapDeletionVector(V1) 与 Bitmap64DeletionVector(V2)](#2-dv-的数据结构bitmapdeletionvectorv1-与-bitmap64deletionvectorv2)
+  - [2.1 接口分层与 checkedDelete](#21-接口分层与-checkeddelete)
+  - [2.2 V1/V2 序列化格式与 Magic Number 分派](#22-v1v2-序列化格式与-magic-number-分派)
+- [3. DV 文件组织：索引文件 + dvRanges 元数据](#3-dv-文件组织索引文件--dvranges-元数据)
+  - [3.1 一个 bucket 一个索引文件：DeletionVectorsIndexFile / DeletionFileWriter](#31-一个-bucket-一个索引文件deletionvectorsindexfile--deletionfilewriter)
+  - [3.2 单文件写入 vs Rolling 写入](#32-单文件写入-vs-rolling-写入)
+- [4. BucketedDvMaintainer：DV 的内存维护与增量提交](#4-bucketeddvmaintainerdv-的内存维护与增量提交)
+- [5. MOW 写路径：DV 在 lookup compaction 时生成（核心）](#5-mow-写路径dv-在-lookup-compaction-时生成核心)
+  - [5.1 DV 不是在 flush 时生成，而是在 compaction 时](#51-dv-不是在-flush-时生成而是在-compaction-时)
+  - [5.2 DV 与 LSM 各 level 的关系](#52-dv-与-lsm-各-level-的关系)
+  - [5.3 compaction 如何"消除"旧 DV](#53-compaction-如何消除旧-dv)
+  - [5.4 DV 生命周期串讲](#54-dv-生命周期串讲)
+- [6. DV 读路径：按行过滤与装饰器](#6-dv-读路径按行过滤与装饰器)
+- [7. Append 表的 DV：行级 DELETE 与 Rolling 维护](#7-append-表的-dv行级-delete-与-rolling-维护)
+- [8. MOW vs COW vs MOR：行级标删的取舍边界](#8-mow-vs-cow-vs-mor行级标删的取舍边界)
+- [9. 文件索引交汇点（详见 13 号文档）](#9-文件索引交汇点详见-13-号文档)
+- [10. 与 Iceberg DV 对比](#10-与-iceberg-dv-对比)
+- [11. 设计决策总结](#11-设计决策总结)
 
 ---
 
-## 1. DeletionVector 接口体系
+## 1. 快速理解（核心问题 / 概念速查 / 高频陷阱）
 
-### 解决什么问题
+### 1.1 核心问题：DV 把 merge 代价从"读"挪到"写"
 
-**核心业务问题**: 主键表的更新操作需要标记旧版本数据为"已删除",但传统的 LSM-tree 需要在读取时合并多个层级的数据才能得到最新版本,这导致读取性能远低于 Append-Only 表。
+**① 要解决什么问题**
 
-**没有 DV 的后果**:
-- 每次读取都要执行 merge-on-read,扫描多个文件并合并相同 key 的记录
-- 读取延迟是 Append 表的 3-10 倍
-- CPU 和内存开销显著增加
+主键表用 LSM merge-tree 存储，同一个 key 的多个版本散落在 Level 0 到 Level N 的不同文件里。没有任何额外机制时，读取必须把命中的多层文件做归并（merge-on-read，MOR），按 sequenceNumber 取最新版本、丢弃 DELETE——这条归并链路（`SortMergeReader` → `DropDeleteReader`，详见 [01 §5.3](01-核心存储引擎分析.md)）是主键表读取慢于 Append 表 3–10 倍的根因。
 
-**实际场景**: 
-```sql
--- 用户表频繁更新
-UPDATE user_table SET status = 'active' WHERE user_id = 12345;
+**② 设计原理与取舍**
 
--- 没有 DV: 读取时需要合并 Level-0 到 Level-N 的所有版本
--- 有 DV: 直接读取最新文件,跳过被 DV 标记删除的旧行,性能接近 Append 表
-```
+DV 的思路：既然旧版本注定要被丢弃，何不在**写入侧**就把"某文件第 N 行已被新版本顶替"记下来？读取时直接逐文件顺序读、用位图按行号跳过失效行，**完全不做跨文件归并**。这就把 merge 的 CPU/内存代价从"每次查询都付"变成"后台 compaction 付一次"。
 
-### 有什么坑
+| 方案 | merge 时机 | 读取代价 | 写入代价 | 适用 |
+|------|-----------|---------|---------|------|
+| **MOR**（无 DV） | 每次读都归并多层 | 高（读放大随 run 数线性增长） | 低（纯追加） | 写多读少、changelog 流读 |
+| **MOW**（DV） | compaction 时归并并生成 DV | 低（顺序读 + 位图跳行，接近 Append） | 中（compaction 时做 lookup） | 读多、点查/OLAP、batch 读 |
+| **COW**（整文件重写） | 写入时重写整个数据文件 | 最低（文件即最新） | 极高（改一行重写整文件） | Paimon 不用于主键表 |
 
-**1. V1/V2 格式混用陷阱**
-```java
-// 错误: 文件行数超过 2^31-1 但使用 V1 格式
-BitmapDeletionVector dv = new BitmapDeletionVector();
-dv.delete(3_000_000_000L);  // 抛出 IllegalArgumentException
-```
-**解决**: 大文件必须使用 V2 格式 (`bitmap64 = true`)
+一句话设计哲学：**用一次性的 compaction 写放大，换取每次查询都省掉的 merge 读放大。** DV 不是"删除数据"，而是"标记某物理行在逻辑上已失效"。
 
-**2. 字节序混淆**
-- V1 使用 Big-Endian
-- V2 使用 Little-Endian
-- 手动解析时必须注意字节序转换
+**关键澄清（旧稿最大的坑）**：DV 的本质是**行级**标记，但它**不是在 `write()`/flush 时生成的**。Level 0 文件刚 flush 出来时还没有 DV、对读不可见；DV 是在 **lookup compaction** 把 Level 0 推向高层时，发现某个 key 在更高 level 已有旧版本，才调用 `notifyNewDeletion(旧文件, 旧行号)` 生成的（见 §5）。理解这一点是读懂 MOW 的钥匙。
 
-**3. 重复删除的性能陷阱**
-```java
-// 错误: 每次都调用 delete,即使已删除
-for (long pos : positions) {
-    dv.delete(pos);  // 重复删除不会报错,但浪费 CPU
-}
+### 1.2 核心概念速查表
 
-// 正确: 使用 checkedDelete 避免重复操作
-for (long pos : positions) {
-    if (dv.checkedDelete(pos)) {
-        modified = true;  // 只有新删除才标记
-    }
-}
-```
+| 概念 | 一句话定义 | 关键源码 |
+|------|-----------|---------|
+| **DeletionVector** | 记录某数据文件中已失效行号的位图接口；读侧只需 `isDeleted(long)` | `DeletionVector.java:44` |
+| **BitmapDeletionVector** | V1 实现，基于 `RoaringBitmap32`，行号上限 2^31-1 | `BitmapDeletionVector.java:34` |
+| **Bitmap64DeletionVector** | V2 实现，基于 `OptimizedRoaringBitmap64`，与 Iceberg 兼容 | `Bitmap64DeletionVector.java:38` |
+| **DeletionVectorsIndexFile** | 一个物理 `.index` 文件，顺序存放多个数据文件的 DV | `DeletionVectorsIndexFile.java:44` |
+| **DeletionVectorMeta / dvRanges** | `(dataFileName, offset, length, cardinality)`，定位 DV 在索引文件中的位置 | `DeletionVectorMeta.java:33` |
+| **BucketedDvMaintainer** | 在内存里维护单个 (partition,bucket) 的 `文件名→DV` 映射，提交时整体重写 | `BucketedDvMaintainer.java:35` |
+| **notifyNewDeletion** | 标记"某文件某行已删"，靠 `checkedDelete` 去重并置 `modified` | `BucketedDvMaintainer.java:61` |
+| **LookupChangelogMergeFunctionWrapper** | compaction 时 lookup 旧版本并触发 `notifyNewDeletion` 的地方 | `LookupChangelogMergeFunctionWrapper.java:126` |
+| **ApplyDeletionVectorReader** | 读路径装饰器，逐行用 DV 过滤 | `ApplyDeletionVectorReader.java:31` |
+| **BaseAppendDeleteFileMaintainer** | Append 表 DELETE 的 DV 维护器（分桶/无桶两实现） | `BaseAppendDeleteFileMaintainer.java:52` |
 
-**4. 生产环境注意事项**
-- DV 文件不会自动清理,依赖 Compaction 消除
-- 如果 Compaction 不及时,DV 文件会持续增长
-- 监控指标: `dv_file_count`, `dv_total_size`, `dv_cardinality`
+### 1.3 高频生产陷阱
 
-### 核心概念解释
+**陷阱 1：以为开 DV 后"写完立刻能查到/查不到旧值"。** MOW 下 Level 0 文件在 compaction 生成 DV 之前对读不可见（官方 table-mode 明确 "files with level 0 will only be visible after compaction"）。所以 MOW 表的 compaction 必须**同步**执行；若被改成纯异步 compaction，新写数据会出现可见延迟。排障口诀：MOW 表"刚写的数据查不到/旧数据没删干净"，先查 compaction 是不是被异步化了。
 
-**DeletionVector (删除向量)**
-- 本质: 一个 Bitmap,记录数据文件中哪些行已被删除
-- 行号: 从 0 开始的文件内偏移量
-- 压缩: 使用 Roaring Bitmap 压缩存储
+**陷阱 2：超大文件（行数 > 2^31-1）却用了 V1。** `BitmapDeletionVector.delete()` 会把 `long position` 强转 int，`checkPosition`（`BitmapDeletionVector.java:118`）在越界时抛 `IllegalArgumentException` 快速失败。单文件可能逼近 21 亿行时需开 `deletion-vectors.bitmap64=true` 用 V2；且 **只有 V2 才与 Iceberg DV 格式兼容**。
 
-**V1 vs V2**
-| 维度 | V1 (BitmapDeletionVector) | V2 (Bitmap64DeletionVector) |
-|------|--------------------------|----------------------------|
-| 底层结构 | RoaringBitmap32 | OptimizedRoaringBitmap64 |
-| 最大行数 | 2^31-1 (21亿) | 2^63 (理论无限) |
-| Magic Number | 1581511376 | 1681511377 |
-| 字节序 | Big-Endian | Little-Endian |
-| RLE 压缩 | 无 | 序列化前自动 RLE |
+**陷阱 3：DV 不会自动消失，只能靠 compaction 收敛。** DV 累积越多，读时被标删的行越多（白读 I/O），写时 lookup 命中越频繁。若更新极频繁而 compaction 跟不上，会出现"读 1000 行实际有效 200 行"的浪费。监控 `dvRanges` 里 `cardinality` 之和占 `rowCount` 的比例，过高说明 compaction 滞后。
 
-**与其他系统对比**
-- **Iceberg Position Delete**: 独立的 delete 文件,需要与 data 文件 join
-- **Paimon DV**: 嵌入式 Bitmap,读取时直接过滤,无需 join
-- **Delta Lake DV**: 类似 Paimon,但与 Checkpoint 机制耦合
+**陷阱 4：DV 索引文件目标大小默认 2MB，无桶 Append 表尤其敏感。** `deletion-vector.index-file.target-size` 默认 `2 MB`（`CoreOptions.java:1875`，已修正旧稿"默认值可能不适合"的含糊表述）。Rolling 写入是"写完一个 DV 再判断是否超限"，故单文件实际可能略超目标值（最多超出一个 DV 的大小）。
 
-### 设计理念
+**陷阱 5：误以为 DV 在每次提交都重写。** `BucketedDvMaintainer` 用 `modified` 标记，只有真正产生新增/移除时才在 `writeDeletionVectorsIndex()` 写新文件（`BucketedDvMaintainer.java:115`）。`checkedDelete` 对已删行返回 `false`、不置 `modified`，所以重复标记同一行不会触发多余的小文件。
 
-**为什么采用 Bitmap 而非 Delete 文件**
-1. **读取性能**: Bitmap 的 `isDeleted(position)` 是 O(1) 操作,而 Delete 文件需要 join
-2. **空间效率**: Roaring Bitmap 对稀疏和密集删除都有极致压缩
-3. **增量更新**: Bitmap 支持 OR 合并,适合增量写入
+**陷阱 6：把 Append 表 DELETE 的代价当成和 PK 表一样。** 无桶 Append 表的 DV 分散在多个 Rolling 索引文件里，删一个数据文件的若干行，要把它所在索引文件中**其它未改动的 DV 也重写到新文件**、旧索引文件整体 DELETE（`AppendDeleteFileMaintainer.writeUnchangedDeletionVector`，`:146`）。频繁小批 DELETE 会放大索引文件写。
 
-**为什么需要两个版本**
-- V1 设计时未预见超大文件场景
-- V2 参考 Iceberg 格式,保证兼容性和扩展性
-- 通过 Magic Number 自动识别,无需外部版本号
+**陷阱 7：DV 与数据文件必须同一次提交。** DV 的 `IndexFileMeta` 打进 `IndexIncrement`，与数据文件的增量在同一个 Snapshot 原子提交。若分两次提交，中间崩溃会出现"新版本可见但旧版本未标删"的数据重复——这由提交层保证（详见 [01 §13 提交流程](01-核心存储引擎分析.md)）。
 
-**权衡取舍**
-- **优势**: 读取性能接近 Append 表,无需 merge-on-read
-- **代价**: 写入时需要 Lookup 旧记录位置,增加写入延迟
-- **适用场景**: 读多写少的 OLAP 场景,不适合高频更新的 OLTP
+---
 
-**架构演进**
-```
-Phase 1: 纯 LSM-tree (merge-on-read)
-  -> 读取慢,写入快
+## 2. DV 的数据结构：BitmapDeletionVector(V1) 与 Bitmap64DeletionVector(V2)
 
-Phase 2: 引入 DV (merge-on-read + DV 过滤)
-  -> 读取快,写入略慢
+### 2.1 接口分层与 checkedDelete
 
-Phase 3: Compaction 消除 DV (后台异步)
-  -> 长期稳定,无 DV 累积
-```
-
-### 1.1 继承层次总览
+DV 接口刻意分两层：读路径只依赖 `DeletionVectorJudger.isDeleted(long)`，写路径才需要 `DeletionVector`（`delete`/`merge`/`serializeTo`/`checkedDelete`）。这是接口隔离——读侧组件拿到一个 DV 只为按行判定，无需感知写入细节。
 
 ```
-DeletionVectorJudger (接口, 仅提供 isDeleted(long) 判定能力)
-  |
-  +-- DeletionVector (接口, 完整 DV 操作能力)
-        |
-        +-- BitmapDeletionVector     (V1, 基于 RoaringBitmap32, 最大 2^31-1 行)
-        |   源码: paimon-core/.../deletionvectors/BitmapDeletionVector.java
-        |
-        +-- Bitmap64DeletionVector   (V2, 基于 OptimizedRoaringBitmap64, 最大 2^63 行)
-            源码: paimon-core/.../deletionvectors/Bitmap64DeletionVector.java
+DeletionVectorJudger          isDeleted(long)          ← 读路径唯一所需
+  └─ DeletionVector           delete / merge / serializeTo / checkedDelete
+       ├─ BitmapDeletionVector       (V1, RoaringBitmap32, 行号 ≤ 2^31-1)
+       └─ Bitmap64DeletionVector     (V2, OptimizedRoaringBitmap64, 与 Iceberg 兼容)
 ```
 
-**为什么采用两层接口设计**: `DeletionVectorJudger` 仅暴露 `isDeleted(long)` 方法，这是读路径唯一需要的能力。`DeletionVector` 继承 `DeletionVectorJudger` 并添加了写入能力 (`delete`, `merge`, `serializeTo`)。这种分离遵循接口隔离原则，读路径的组件不需要感知 DV 的写入细节。
-
-### 1.2 DeletionVector 接口定义
-
-源码路径: `paimon-core/src/main/java/org/apache/paimon/deletionvectors/DeletionVector.java` (L44-L196)
+`checkedDelete` 是去重的关键（`DeletionVector.java:66`）。接口默认实现是"先 `isDeleted` 再 `delete`"，但 V1 覆盖为底层 `RoaringBitmap32.checkedAdd` 一次原子完成（`BitmapDeletionVector.java:64-68`），少一次查找：
 
 ```java
-public interface DeletionVector extends DeletionVectorJudger {
-    // 写入操作
-    void delete(long position);                    // 标记指定行位置为已删除
-    void merge(DeletionVector deletionVector);     // 合并另一个 DV (OR 语义)
-    boolean checkedDelete(long position);           // 标记删除并返回是否为新增删除 (L66-L73)
-    
-    // 状态查询
-    boolean isEmpty();                              // 是否没有任何删除标记
-    long getCardinality();                          // 已删除的行数
-    
-    // 序列化
-    int serializeTo(DataOutputStream out);          // 序列化到输出流，返回写入字节数
-    
-    // 继承自 DeletionVectorJudger
-    boolean isDeleted(long position);               // 判断某行是否被标记为删除
+// BitmapDeletionVector.java:64
+@Override
+public boolean checkedDelete(long position) {
+    checkPosition(position);                       // 校验不超过 Integer.MAX_VALUE
+    return roaringBitmap.checkedAdd((int) position); // 新增返回 true，已存在返回 false
 }
 ```
 
-接口还提供了一系列静态工厂方法:
+返回值是 `modified` 标记的来源：`BucketedDvMaintainer.notifyNewDeletion` 仅当 `checkedDelete` 返回 `true` 才把 `modified` 置真（见 §4）。这样重复标记同一行不会触发多余的 DV 文件写入。
 
-- `read(FileIO, DeletionFile)` (L88-L95): 从文件系统读取 DV，通过 `DeletionFile` 中的 path/offset/length 定位
-- `read(DataInputStream, Long)` (L97-L146): 核心反序列化方法，通过 Magic Number 判断 V1/V2 格式
-- `factory(BucketedDvMaintainer)` (L152-L157): 创建 DV 工厂，委托给 `dvMaintainer::deletionVectorOf`
-- `serializeToBytes` / `deserializeFromBytes` (L171-L190): 便捷的序列化/反序列化工具方法
+V1 与 V2 的差异只在底层位图和序列化字节序，行为接口完全一致：
 
-`checkedDelete` 方法 (L66-L73) 的默认实现值得关注: 它先检查 `isDeleted`，如果已存在则返回 `false`（不是新删除），否则调用 `delete` 并返回 `true`。`BitmapDeletionVector` 覆盖了这个方法 (L65-L68)，直接调用底层 `RoaringBitmap32.checkedAdd`，原子地完成检查与添加，避免了两次查找。
+| 维度 | V1 `BitmapDeletionVector` | V2 `Bitmap64DeletionVector` |
+|------|---------------------------|------------------------------|
+| 底层位图 | `RoaringBitmap32` | `OptimizedRoaringBitmap64`（注释 "Mostly copied from iceberg"，`:36`） |
+| 行号上限 | `RoaringBitmap32.MAX_VALUE` = 2^31-1 | 理论 2^63 |
+| position 处理 | 强转 int，`checkPosition` 越界即抛 | 直接存 long，无溢出风险 |
+| Magic Number | `1581511376`（`:36`） | `1681511377`（`:40`） |
+| 序列化字节序 | Big-Endian（Java 默认） | Little-Endian（与 Iceberg/Roaring 原生一致） |
+| 额外处理 | 无 | `serializeTo` 前 `runLengthEncode()` 做游程编码（`:94`） |
+| 升级 | — | `fromBitmapDeletionVector()` 支持 V1→V2（`:56`） |
 
-**为什么 checkedDelete 需要返回 boolean**: 调用方（如 `BucketedDvMaintainer.notifyNewDeletion`）通过返回值判断是否产生了新的修改，从而设置 `modified` 标记。如果一个 position 已经被删除过，重复删除不应该触发新的 DV 文件写入。
+**为什么需要两个版本**：V1 设计时未预见单文件逾 21 亿行的场景；V2 为兼容 Iceberg V3 DV 格式而引入（Little-Endian + 64 位 Roaring）。两者通过 Magic Number 自动识别，DV 数据块自包含、无需外部版本号，因此**新旧格式可在同一张表里混存**。
 
-### 1.3 BitmapDeletionVector (V1)
+### 2.2 V1/V2 序列化格式与 Magic Number 分派
 
-源码路径: `paimon-core/src/main/java/org/apache/paimon/deletionvectors/BitmapDeletionVector.java` (L34-L147)
+反序列化入口 `DeletionVector.read(DataInputStream, Long)`（`DeletionVector.java:97`）通过 Magic Number 自动分派 V1/V2。两种格式都是 `[bitmapLength][magic][bitmap_data][crc]`，关键差别在 magic 的字节序，以及 `bitmapLength` 的口径：
 
-核心实现:
-- 底层数据结构: `RoaringBitmap32` -- Roaring Bitmap 的 32 位版本
-- 最大行数限制: `RoaringBitmap32.MAX_VALUE` (2^31 - 1 = 2,147,483,647)
-- Magic Number: `1581511376` (L36)
+```
+V1: [bitmapLength(BE)][magic=1581511376(BE)][roaring_data][crc]
+        bitmapLength = magic + 数据 的长度（= length 字段值本身）
+V2: [bitmapLength(BE)][magic=1681511377(LE)][bitmap64_data(LE)][crc]
+        bitmapLength = magic + 数据；总长度 = bitmapLength + LENGTH_SIZE(4) + CRC_SIZE(4)
+```
 
 ```java
-public class BitmapDeletionVector implements DeletionVector {
-    public static final int MAGIC_NUMBER = 1581511376;
-    private final RoaringBitmap32 roaringBitmap;
-    
-    public void delete(long position) {
-        checkPosition(position);              // 校验不超过 Integer.MAX_VALUE
-        roaringBitmap.add((int) position);    // 强转为 int 存储
-    }
-    
-    public boolean isDeleted(long position) {
-        checkPosition(position);
-        return roaringBitmap.contains((int) position);
-    }
-    
-    public void merge(DeletionVector deletionVector) {
-        if (deletionVector instanceof BitmapDeletionVector) {
-            roaringBitmap.or(((BitmapDeletionVector) deletionVector).roaringBitmap);
-        } else {
-            throw new RuntimeException("Only instance with the same class type can be merged.");
-        }
-    }
-}
-```
-
-序列化格式 (`serializeTo` 方法, L87-L101):
-1. 先将 `Magic Number + Bitmap 数据` 写入临时缓冲区
-2. 写入缓冲区长度 (4 字节 int) -- **返回值是 Magic+Bitmap 的长度，不含 Length 和 CRC 字段**
-3. 写入缓冲区内容
-4. 写入 CRC32 校验和 (4 字节 int)
-
-**为什么 V1 中 position 要 checkPosition**: V1 使用 32 位 Roaring Bitmap，position 被强转为 int。如果文件行数超过 2^31-1 但使用了 V1 格式，会导致溢出。`checkPosition` (L118-L123) 在这种情况下抛出 `IllegalArgumentException`，快速失败而非静默数据错误。
-
-### 1.4 Bitmap64DeletionVector (V2)
-
-源码路径: `paimon-core/src/main/java/org/apache/paimon/deletionvectors/Bitmap64DeletionVector.java` (L38-L189)
-
-核心实现:
-- 底层数据结构: `OptimizedRoaringBitmap64` -- Roaring Bitmap 的 64 位版本
-- 最大行数: `OptimizedRoaringBitmap64.MAX_VALUE` (理论支持 2^63 行)
-- Magic Number: `1681511377` (L40)
-- 注释: "Mostly copied from iceberg" (L37) -- 与 Iceberg V3 DV 格式兼容
-
-```java
-public class Bitmap64DeletionVector implements DeletionVector {
-    public static final int MAGIC_NUMBER = 1681511377;
-    private final OptimizedRoaringBitmap64 roaringBitmap;
-    
-    public void delete(long position) {
-        roaringBitmap.add(position);   // 直接使用 long，无需类型转换
-    }
-    
-    public int serializeTo(DataOutputStream out) throws IOException {
-        roaringBitmap.runLengthEncode();  // 序列化前做 RLE 编码压缩
-        // ... 写入 [length][magic+bitmap_data][crc]
-    }
-}
-```
-
-关键设计差异:
-1. **字节序**: V2 使用 **Little-Endian** 字节序 (L125-L135)，与 Iceberg DV 兼容; V1 使用 Java 默认的 **Big-Endian**
-2. **无需 checkPosition**: `long` 类型直接存储，无溢出风险
-3. **RLE 编码**: 序列化前调用 `runLengthEncode()` (L94)，对连续的删除位置做游程编码压缩
-4. **类型转换**: 提供 `fromBitmapDeletionVector` (L56-L61) 方法，支持从 V1 升级到 V2
-
-### 1.5 V1/V2 序列化格式与 Magic Number
-
-**V1 格式 (BitmapDeletionVector):**
-
-```
-+------------------+--------------------+--------------------+------------+
-| Bitmap Length    | Magic Number        | Roaring Bitmap Data | CRC32     |
-| (4 bytes, BE)    | (4 bytes, BE)       | (变长)              | (4 bytes) |
-| = Magic+Data长度 | 1581511376          |                     |           |
-+------------------+--------------------+--------------------+------------+
-                   |<--- Bitmap Length 覆盖的范围 --->|
-```
-
-- `Bitmap Length`: Magic Number + Bitmap 数据的总长度
-- CRC32 校验范围: Magic Number + Bitmap 数据
-
-**V2 格式 (Bitmap64DeletionVector):**
-
-```
-+------------------+--------------------+--------------------+------------+
-| Bitmap Length    | Magic Number        | Bitmap64 Data      | CRC32     |
-| (4 bytes, BE)    | (4 bytes, LE!)      | (变长, LE)         | (4 bytes) |
-| = Magic+Data长度 | 1681511377          |                     |           |
-+------------------+--------------------+--------------------+------------+
-                   |<--- Bitmap Length 覆盖的范围 --->|
-```
-
-- `Bitmap Length`: 注意这里记录的是 `Magic + Bitmap Data` 的长度 (不含 Length 字段和 CRC 字段本身)
-- Magic Number 使用 Little-Endian 写入
-- CRC32 校验范围: Magic Number + Bitmap64 数据
-
-**为什么选择不同的字节序**: V2 设计参考了 Iceberg 的 DV 格式，Iceberg 使用 Little-Endian（与 Roaring Bitmap 的原生序列化一致）。V1 使用 Java 标准的 Big-Endian。反序列化时通过 `toLittleEndianInt()` (L168-L171) 方法做字节序转换来识别 Magic Number。
-
-### 1.6 反序列化分派机制
-
-`DeletionVector.read(DataInputStream, Long)` (L97-L146) 是 DV 反序列化的核心入口:
-
-```java
+// DeletionVector.java:97  —— 行号已核对
 static DeletionVector read(DataInputStream dis, @Nullable Long length) throws IOException {
-    int bitmapLength = dis.readInt();      // 读取 bitmap 数据长度
-    int magicNumber = dis.readInt();       // 读取 Magic Number
-    
-    if (magicNumber == BitmapDeletionVector.MAGIC_NUMBER) {
-        // V1: Big-Endian Magic, 直接匹配
-        // 校验 length 一致性...
-        byte[] bytes = new byte[bitmapLength - MAGIC_NUMBER_SIZE_BYTES];
-        dis.readFully(bytes);
-        dis.skipBytes(4);  // 跳过 CRC
+    int bitmapLength = dis.readInt();
+    int magicNumber  = dis.readInt();
+    if (magicNumber == BitmapDeletionVector.MAGIC_NUMBER) {          // V1：BE magic 直接命中
+        byte[] bytes = new byte[bitmapLength - BitmapDeletionVector.MAGIC_NUMBER_SIZE_BYTES];
+        dis.readFully(bytes); dis.skipBytes(4);                      // 跳过 CRC
         return BitmapDeletionVector.deserializeFromByteBuffer(ByteBuffer.wrap(bytes));
-    } else if (toLittleEndianInt(magicNumber) == Bitmap64DeletionVector.MAGIC_NUMBER) {
-        // V2: Little-Endian Magic, 需要字节序转换后匹配
-        // 校验 length 一致性 (扣除 LENGTH_SIZE_BYTES 和 CRC_SIZE_BYTES)...
-        byte[] bytes = new byte[bitmapLength - MAGIC_NUMBER_SIZE_BYTES];
-        dis.readFully(bytes);
-        dis.skipBytes(4);  // 跳过 CRC
+    } else if (toLittleEndianInt(magicNumber) == Bitmap64DeletionVector.MAGIC_NUMBER) { // V2：转 LE 再比
+        byte[] bytes = new byte[bitmapLength - Bitmap64DeletionVector.MAGIC_NUMBER_SIZE_BYTES];
+        dis.readFully(bytes); dis.skipBytes(4);
         return Bitmap64DeletionVector.deserializeFromBitmapDataBytes(bytes);
-    } else {
-        throw new RuntimeException("Invalid magic number: " + magicNumber);
     }
+    throw new RuntimeException("Invalid magic number: " + magicNumber);
 }
 ```
 
-**为什么通过 Magic Number 而非版本号区分格式**: DV 数据可能存储在不同版本的文件中混合存在。Magic Number 自包含在每个 DV 数据块内，使得每个 DV 都能独立反序列化，无需外部元数据辅助。注意 V2 的 `bitmapLength` 含义与 V1 不同: V2 中 `length = bitmapLength + LENGTH_SIZE_BYTES + CRC_SIZE_BYTES`。
+**为什么用 Magic Number 而不是外部版本号**：DV 数据块自包含，每个 DV 独立可解析，因此**同一张表、甚至同一个索引文件**里可以混存 V1/V2，无需任何全局元数据协调升级。`length` 参数（来自 `DeletionVectorMeta.length`）用于做一致性校验，注意 V2 的 `bitmapLength` 不含 length/crc 字段，校验时要先扣除（`DeletionVector.java:118-130`）。
 
-### 1.7 Factory 模式与延迟加载
+**Factory 的三种来源**（`DeletionVector.java:148-169`）决定读侧 DV 从哪来：① `emptyFactory()` 恒返回空（无 DV 场景）；② `factory(BucketedDvMaintainer)` 从内存 map 取（写进程内复用，方法引用 `dvMaintainer::deletionVectorOf`）；③ `factory(FileIO, files, deletionFiles)` 按需从文件读，**懒加载**——一个 Split 多个数据文件，只有真正要读某文件时才打开它的 DV，避免把整 bucket 的 DV 全拉进内存。
 
-接口提供了三种 Factory 模式 (L148-L169):
-
-```java
-// 1. 空工厂 - 永远返回 Optional.empty()
-static Factory emptyFactory() { return fileName -> Optional.empty(); }
-
-// 2. 基于 DvMaintainer 的工厂 - 从内存中的 map 查找
-static Factory factory(@Nullable BucketedDvMaintainer dvMaintainer) {
-    if (dvMaintainer == null) return emptyFactory();
-    return dvMaintainer::deletionVectorOf;   // 方法引用
-}
-
-// 3. 基于文件的工厂 - 按需从文件系统读取 DV
-static Factory factory(FileIO fileIO, List<DataFileMeta> files, 
-                        @Nullable List<DeletionFile> deletionFiles) {
-    DeletionFile.Factory factory = DeletionFile.factory(files, deletionFiles);
-    return fileName -> {
-        Optional<DeletionFile> deletionFile = factory.create(fileName);
-        if (deletionFile.isPresent()) {
-            return Optional.of(DeletionVector.read(fileIO, deletionFile.get()));
-        }
-        return Optional.empty();
-    };
-}
-```
-
-**为什么需要 Factory 模式**: 读路径中一个 Split 可能包含多个数据文件，每个文件可能有或没有 DV。Factory 模式允许调用方只在需要时才加载 DV，避免一次性加载所有 DV 到内存。方案 3 的延迟加载特性尤其重要: DV 文件可能很大，按需读取可以减少内存压力。
+**⑤ 收益与代价**：用位图而非独立 delete 文件，`isDeleted(pos)` 是 O(1) 内存判定、无需 join；Roaring 对稀疏/密集删除都极致压缩；OR 合并天然支持增量。代价是位图必须整块加载到内存才能判定（不能像 B+Tree 那样部分加载），所以单个 DV 不宜过大——这也是 §3 要把 DV 切成"每数据文件一个、索引文件按 size 滚动"的原因。
 
 ---
 
-## 2. DV 文件组织
+## 3. DV 文件组织：索引文件 + dvRanges 元数据
 
-### 解决什么问题
+### 3.1 一个 bucket 一个索引文件：DeletionVectorsIndexFile / DeletionFileWriter
 
-**核心业务问题**: 一个 bucket 可能有成百上千个数据文件,每个文件都可能有 DV。如何高效地存储、索引和读取这些 DV?
+**① 要解决什么问题**
 
-**没有合理组织的后果**:
-- 每个数据文件一个 DV 文件 -> 小文件泛滥,元数据爆炸
-- 所有 DV 放一个文件 -> 读取单个 DV 需要扫描整个文件
-- 无索引 -> 无法快速定位某个数据文件的 DV
+一个 bucket 可能有成百上千个数据文件，其中相当一部分有 DV。两种朴素方案都不行：每个数据文件一个 DV 文件 → 对象存储小文件爆炸；所有 DV 塞一个文件又没索引 → 读单个 DV 要扫全文件。
 
-**实际场景**:
+**② 设计原理与取舍**
+
+Paimon 选"**一个物理索引文件顺序存放多个 DV + 一张 offset 表**"：DV 顺序追加进 `.index` 文件，每个 DV 在文件中的位置由 `DeletionVectorMeta(dataFileName, offset, length, cardinality)` 记录，这张表（`IndexFileMeta.dvRanges()`）随 `IndexFileMeta` 进 manifest。读时按 offset/length 精确 seek，写时纯顺序追加。
+
+物理布局（`DeletionVectorsIndexFile.java:44`，类型标识 `"DELETION_VECTORS"`，文件首字节版本号 `VERSION_ID_V1 = 1`）：
+
 ```
-Bucket-0 有 1000 个数据文件,其中 300 个有删除操作
-- 方案1: 300 个独立 DV 文件 -> HDFS 小文件问题
-- 方案2: 1 个大 DV 文件 + 索引 -> Paimon 的选择
+.index 文件:  [version(1B)=1][DV_A: len|magic|data|crc][DV_B: ...][DV_C: ...] ...
+dvRanges:     A→(offset, length, cardinality)  B→(...)  C→(...)
 ```
 
-### 有什么坑
+`DeletionFileWriter` 是顺序追加写的本体（`DeletionFileWriter.java:36`）：
 
-**1. offset 计算错误**
 ```java
-// 错误: 忘记文件头的 1 字节版本号
-int offset = 0;  // 第一个 DV 的 offset 应该是 1,不是 0
-
-// 正确: out.size() 自动包含版本号
-int start = out.size();  // 第一次调用返回 1
+// DeletionFileWriter.java:43 / :55  —— 行号已核对
+public DeletionFileWriter(IndexPathFactory pathFactory, FileIO fileIO) throws IOException {
+    this.out = new DataOutputStream(fileIO.newOutputStream(path, true));
+    out.writeByte(VERSION_ID_V1);                    // 文件头 1 字节版本号
+    this.dvMetas = new LinkedHashMap<>();            // 保序：读侧顺序 I/O 依赖此顺序
+}
+public void write(String key, DeletionVector dv) throws IOException {
+    int start  = out.size();                         // 第一个 DV 的 offset 是 1（版本号占了第 0 字节）
+    int length = dv.serializeTo(out);
+    dvMetas.put(key, new DeletionVectorMeta(key, start, length, dv.getCardinality()));
+}
 ```
 
-**2. Rolling 写入的边界问题**
+两个易忽视的细节：① `dvMetas` 用 `LinkedHashMap` 保序，因为读侧 `readAllDeletionVectors` 按 `dvRanges` 顺序逐个反序列化，保序才能保证顺序 I/O（`DeletionVectorsIndexFile.java:82`）；② **第一个 DV 的 offset 是 1 不是 0**，因为第 0 字节是版本号——手写解析时极易踩坑。
+
+**为什么记 `cardinality`**：它是该 DV 已删行数，标 `@Nullable BigIntType(true)`（`DeletionVectorMeta.java:35-40`，后向兼容：旧数据可能没有）。查询计划用 `rowCount - Σcardinality` 估有效行数做代价估算；运维侧用它判断 compaction 是否滞后（见 §1.3 陷阱 3）。
+
+**读取的三个入口**（`DeletionVectorsIndexFile.java`）：`readAllDeletionVectors(IndexFileMeta)`（`:73`，恢复/扫描时一次读全部，先 `checkVersion` 校验首字节）、`readDeletionVector(Map)`（`:105`，要求同属一个索引文件、批量 seek）、`readDeletionVector(DeletionFile)`（`:129`，读单个）。
+
+### 3.2 单文件写入 vs Rolling 写入
+
+**① 要解决什么问题**：PK 表（分桶）每个 bucket 只一个 DV 索引文件，修改时整体重写即可；但无桶（unaware）Append 表一个分区可能有上万个数据文件，所有 DV 挤一个索引文件会让它无限膨胀。
+
+**② 设计原理与取舍**：`DeletionVectorsIndexFile` 暴露两种写法（`DeletionVectorsIndexFile.java:142/150`），按表形态二选一：
+
+- `writeSingleFile(Map)`：所有 DV 写进一个文件，给 PK 表 / 分桶 Append 表用（`BucketedDvMaintainer` 调它）。
+- `writeWithRolling(Map)`：边写边按 `targetSizePerIndexFile`（默认 2MB）滚动切文件，给无桶 Append 表用。
+
+Rolling 的实现是"写完一个 DV 再判断是否超限"（`DeletionVectorIndexFileWriter`）：
+
 ```java
-// 陷阱: 最后一个文件可能超过 targetSize
+// DeletionVectorIndexFileWriter.tryWriter —— 行号已核对（DeletionVectorIndexFileWriter.java）
 while (iterator.hasNext()) {
+    Map.Entry<String, DeletionVector> entry = iterator.next();
     writer.write(entry.getKey(), entry.getValue());
-    if (writer.getPos() > targetSizeInBytes) {
-        break;  // 已经超了才 break,最后一个 DV 可能很大
-    }
-}
-```
-**影响**: 实际文件大小可能是 `targetSize + maxDvSize`
-
-**3. 版本号校验被跳过**
-```java
-// 错误: 直接读取 DV 数据,不校验版本号
-DataInputStream dis = new DataInputStream(fileIO.newInputStream(path));
-DeletionVector dv = DeletionVector.read(dis, null);  // 如果版本号错误会静默失败
-```
-
-**4. 生产环境注意事项**
-- `targetSizePerIndexFile` 默认值可能不适合你的场景
-- 过小 -> 文件数过多
-- 过大 -> 读取单个 DV 时 I/O 浪费
-- 建议: 根据平均 DV 大小调整,保持每个文件 100-1000 个 DV
-
-### 核心概念解释
-
-**DV 索引文件 (DeletionVectorsIndexFile)**
-```
-物理文件: bucket-0/index/dv-{uuid}.index
-格式: [1字节版本号][DV1数据][DV2数据][DV3数据]...
-```
-
-**DeletionVectorMeta (元数据)**
-- 记录每个数据文件的 DV 在索引文件中的位置
-- 存储在 `IndexFileMeta.dvRanges()` 中
-- Schema: `(dataFileName, offset, length, cardinality)`
-
-**Rolling 写入**
-- 类似日志文件的 Rolling 策略
-- 当前文件超过阈值时,开始新文件
-- 适用于无桶 Append 表
-
-**与其他系统对比**
-- **Iceberg**: 每个 data file 一个 DV blob,存储在 Puffin 文件中
-- **Paimon Bucketed**: 每个 bucket 一个 DV 索引文件
-- **Paimon Unaware**: Rolling 多个 DV 索引文件
-
-### 设计理念
-
-**为什么采用"索引文件 + 元数据"架构**
-1. **减少小文件**: 多个 DV 合并到一个索引文件
-2. **按需读取**: 通过 offset/length 精确定位,无需读取整个文件
-3. **顺序写入**: 写入时追加,无需随机 I/O
-
-**为什么 Bucketed 和 Unaware 策略不同**
-```
-Bucketed 表:
-  - 每个 bucket 独立,数据文件数量可控
-  - 单文件写入,整体重写
-  
-Unaware 表:
-  - 无 bucket 概念,一个分区可能有数万个文件
-  - Rolling 写入,避免单文件过大
-```
-
-**权衡取舍**
-- **单文件写入**: 简单,但修改一个 DV 需要重写整个文件
-- **Rolling 写入**: 复杂,但文件大小可控
-- **Paimon 选择**: 根据表类型自动选择策略
-
-**为什么需要 cardinality 字段**
-```sql
--- 查询优化器需要估算有效行数
-SELECT * FROM t WHERE partition = '2024-01-01';
-
--- 优化器计算:
-effective_rows = total_rows - SUM(dv.cardinality)
-```
-这个信息用于代价估算和执行计划选择。
-
-### 2.1 DeletionVectorsIndexFile 索引文件
-
-源码路径: `paimon-core/src/main/java/org/apache/paimon/deletionvectors/DeletionVectorsIndexFile.java` (L44-L173)
-
-这是 DV 索引文件的核心抽象，继承自 `IndexFile`，负责读写 DV 索引文件。
-
-关键常量:
-```java
-public static final String DELETION_VECTORS_INDEX = "DELETION_VECTORS";  // 索引类型标识
-public static final byte VERSION_ID_V1 = 1;                              // 文件版本号
-```
-
-构造参数:
-```java
-public DeletionVectorsIndexFile(
-    FileIO fileIO,
-    IndexPathFactory pathFactory,
-    MemorySize targetSizePerIndexFile,   // Rolling 写入时的目标文件大小
-    boolean bitmap64                      // 是否使用 V2 (64位) 格式
-)
-```
-
-**读取方法**:
-
-1. `readAllDeletionVectors(IndexFileMeta)` (L73-L96): 顺序读取一个索引文件中的所有 DV
-   - 从 `IndexFileMeta.dvRanges()` 获取每个数据文件的 DV 偏移量信息
-   - 打开索引文件，先校验版本号 (1字节)
-   - 按照 dvRanges 中的顺序依次反序列化 DV
-   
-2. `readDeletionVector(Map<String, DeletionFile>)` (L105-L127): 按需读取指定数据文件的 DV
-   - 所有 DeletionFile 必须属于同一个索引文件
-   - 通过 `seek` 跳转到指定偏移量读取
-
-3. `readDeletionVector(DeletionFile)` (L129-L140): 读取单个 DV
-
-**写入方法**:
-
-1. `writeSingleFile(Map<String, DeletionVector>)` (L142-L148): 将所有 DV 写入单个文件
-2. `writeWithRolling(Map<String, DeletionVector>)` (L150-L155): 按目标大小分文件写入
-
-**版本校验**: `checkVersion` (L163-L172) 读取文件的第一个字节，验证必须是 `VERSION_ID_V1 = 1`。
-
-**为什么 DV 索引文件需要版本号**: 区别于 DV 数据本身的 V1/V2 (通过 Magic Number 区分)，索引文件级别的版本号用于未来扩展索引文件的整体结构（如增加压缩、增加全局元数据等）。
-
-### 2.2 DeletionFileWriter 写入器
-
-源码路径: `paimon-core/src/main/java/org/apache/paimon/deletionvectors/DeletionFileWriter.java` (L36-L76)
-
-`DeletionFileWriter` 负责将多个 DV 写入单个物理文件:
-
-```java
-public class DeletionFileWriter implements Closeable {
-    private final Path path;
-    private final boolean isExternalPath;
-    private final DataOutputStream out;
-    private final LinkedHashMap<String, DeletionVectorMeta> dvMetas;
-    
-    public DeletionFileWriter(IndexPathFactory pathFactory, FileIO fileIO) throws IOException {
-        this.path = pathFactory.newPath();
-        this.out = new DataOutputStream(fileIO.newOutputStream(path, true));
-        out.writeByte(VERSION_ID_V1);     // 写入文件版本号 (1 字节)
-        this.dvMetas = new LinkedHashMap<>();
-    }
-    
-    public void write(String key, DeletionVector deletionVector) throws IOException {
-        int start = out.size();           // 记录当前写入位置
-        int length = deletionVector.serializeTo(out);   // 序列化 DV
-        dvMetas.put(key, new DeletionVectorMeta(key, start, length, 
-                        deletionVector.getCardinality()));
-    }
-    
-    public IndexFileMeta result() {
-        return new IndexFileMeta(
-            DELETION_VECTORS_INDEX,
-            path.getName(),
-            getPos(),               // 文件总大小
-            dvMetas.size(),         // DV 数量
-            dvMetas,                // 数据文件到 DV 位置的映射
-            isExternalPath ? path.toString() : null);
-    }
+    if (writer.getPos() > targetSizeInBytes) break;   // 已经超了才 break
 }
 ```
 
-**关键设计决策**:
+**④ 风险/边界**：因为"先写后判断"，单个 Rolling 文件实际大小最多超出 `targetSize` 一个 DV 的体量。`targetSizePerIndexFile` 配小 → 文件数过多；配大 → 读单个 DV 时 seek 范围内白读 I/O。读侧每次 `readAllDeletionVectors` 都先 `checkVersion`（读首字节校验 = 1），版本不符直接抛异常，避免静默读到脏数据。
 
-1. **LinkedHashMap 保序**: `dvMetas` 使用 `LinkedHashMap` 确保按写入顺序记录元数据。这很重要，因为 `readAllDeletionVectors` 方法 (DeletionVectorsIndexFile L82-L86) 按照 dvRanges 中的顺序**顺序**读取，保序可以保证顺序 I/O。
-
-2. **offset 记录**: `out.size()` 返回的是从文件开头到当前位置的偏移量。注意第一个 DV 的 offset 不是 0，而是 1（因为文件头有 1 字节版本号）。
-
-3. **isExternalPath 标志**: 如果路径是外部路径（不在标准索引目录下），则在 `IndexFileMeta` 中额外记录完整路径。
-
-### 2.3 DeletionVectorMeta 元数据
-
-源码路径: `paimon-core/src/main/java/org/apache/paimon/index/DeletionVectorMeta.java` (L33-L103)
-
-每个数据文件对应一条 DV 元数据:
-
-```java
-public class DeletionVectorMeta {
-    public static final RowType SCHEMA = RowType.of(
-        new DataField(0, "f0", newStringType(false)),        // 数据文件名
-        new DataField(1, "f1", new IntType(false)),          // 偏移量 (offset)
-        new DataField(2, "f2", new IntType(false)),          // 长度 (length)
-        new DataField(3, "_CARDINALITY", new BigIntType(true)));  // 删除行数 (可选)
-    
-    private final String dataFileName;     // 关联的数据文件名
-    private final int offset;              // DV 数据在索引文件中的偏移量
-    private final int length;              // DV 数据的字节长度
-    @Nullable private final Long cardinality;  // 已删除的行数
-}
-```
-
-**为什么需要 cardinality 字段**: `cardinality` 记录了该 DV 中已删除的行数。这个信息在查询计划阶段非常有用: 查询引擎可以通过 `totalRowCount - cardinality` 估算有效行数，用于代价估算和优化决策。`cardinality` 被标记为 `@Nullable` 和 `BigIntType(true)`，**这是后向兼容设计，旧版本数据可能没有此字段，读取时需要容错处理**。
-
-### 2.4 DeletionVectorIndexFileWriter 与 Rolling 写入
-
-源码路径: `paimon-core/src/main/java/org/apache/paimon/deletionvectors/DeletionVectorIndexFileWriter.java` (L34-L95)
-
-这是 DV 索引文件写入的高层封装，支持两种写入模式:
-
-**1. 单文件写入 (`writeSingleFile`)**:
-
-```java
-public IndexFileMeta writeSingleFile(Map<String, DeletionVector> input) throws IOException {
-    DeletionFileWriter writer = new DeletionFileWriter(indexPathFactory, fileIO);
-    try {
-        for (Map.Entry<String, DeletionVector> entry : input.entrySet()) {
-            writer.write(entry.getKey(), entry.getValue());
-        }
-    } finally {
-        writer.close();
-    }
-    return writer.result();
-}
-```
-
-适用场景: Bucketed 表（每个 bucket 一个 DV 文件），由 `BucketedDvMaintainer.writeDeletionVectorsIndex()` 调用。
-
-**2. Rolling 写入 (`writeWithRolling`)**:
-
-```java
-public List<IndexFileMeta> writeWithRolling(Map<String, DeletionVector> input) throws IOException {
-    List<IndexFileMeta> result = new ArrayList<>();
-    Iterator<Map.Entry<String, DeletionVector>> iterator = input.entrySet().iterator();
-    while (iterator.hasNext()) {
-        result.add(tryWriter(iterator));
-    }
-    return result;
-}
-
-private IndexFileMeta tryWriter(Iterator<...> iterator) throws IOException {
-    DeletionFileWriter writer = new DeletionFileWriter(indexPathFactory, fileIO);
-    while (iterator.hasNext()) {
-        Map.Entry<String, DeletionVector> entry = iterator.next();
-        writer.write(entry.getKey(), entry.getValue());
-        if (writer.getPos() > targetSizeInBytes) {
-            break;    // 当前文件超过目标大小，开始新文件
-        }
-    }
-    writer.close();
-    return writer.result();
-}
-```
-
-**为什么需要 Rolling 写入**: Unaware Bucket (无桶) 的 Append 表没有 bucket 分区概念，一个分区内可能有大量数据文件。如果所有 DV 都写入同一个索引文件，该文件可能非常大。Rolling 写入按 `targetSizePerIndexFile`（可配置）拆分为多个索引文件，平衡单文件大小和文件数量。
-
-**注意**: Rolling 写入策略是"写完一个 DV 后检查大小"，因此实际文件大小可能略超 `targetSizeInBytes`（最多超出一个 DV 的大小）。
-
-### 2.5 DV 索引文件物理布局
-
-```
-DV Index File (一个 .index 文件):
-+------------------------------------------+
-| Version (1 byte, 固定值 1)                |
-+------------------------------------------+
-| DV Data 1 (DataFile-A 的 DeletionVector) |
-|   [bitmap_length][magic][bitmap_data][crc]|
-+------------------------------------------+
-| DV Data 2 (DataFile-B 的 DeletionVector) |
-|   [bitmap_length][magic][bitmap_data][crc]|
-+------------------------------------------+
-| DV Data 3 (DataFile-C 的 DeletionVector) |
-+------------------------------------------+
-| ...                                      |
-+------------------------------------------+
-```
-
-每个 DV 的位置通过 `IndexFileMeta.dvRanges()` 中的 `DeletionVectorMeta(dataFileName, offset, length)` 来定位。`offset` 指向该 DV 在文件中的字节偏移量，`length` 是该 DV 序列化后的总字节长度（包含 bitmap_length + magic + bitmap_data + crc）。
+**⑤ 收益与代价**：索引文件 + dvRanges 这套组织把"N 个数据文件的 DV"压成"O(N/每文件DV数) 个索引文件 + 一张 offset 表"，既不爆小文件、又支持精确 seek。代价是修改任一 DV 都要重写它所在的整个索引文件（对象存储不能原地改）——这对 PK 表无所谓（反正整 bucket 一个文件、本来就整体重写），但对无桶 Append 表就引出了 §7 的"未改动 DV 也要搬家"复杂度。
 
 ---
 
-## 3. BucketedDvMaintainer 维护机制
+## 4. BucketedDvMaintainer：DV 的内存维护与增量提交
 
-### 解决什么问题
+**① 要解决什么问题**
 
-**核心业务问题**: 写入过程中会产生大量的删除标记 (每次更新都标记旧行删除),如何高效地管理这些 DV 的增量更新、合并和持久化?
+一次 checkpoint 周期内会产生大量删除标记（compaction 时每命中一个旧版本就标一行）。如果每个标记都落一次盘，会小文件爆炸；如果不知道"这一轮有没有真改动"，又会每次提交都重写一遍 DV 文件。`BucketedDvMaintainer` 在内存里维护单个 `(partition, bucket)` 的 `文件名 → DV` 全量映射，把"高频增量标记"和"低频批量落盘"解耦。
 
-**没有 Maintainer 的后果**:
-- 每次删除都写一个新的 DV 文件 -> 小文件泛滥
-- 无法追踪哪些 DV 被修改过 -> 每次都重写所有 DV
-- Checkpoint 恢复时无法恢复 DV 状态 -> 数据不一致
+**② 设计原理与取舍**
 
-**实际场景**:
-```java
-// 写入 1000 条更新记录
-for (int i = 0; i < 1000; i++) {
-    // 每条更新都需要标记旧记录删除
-    maintainer.notifyNewDeletion(oldFileName, oldPosition);
-}
-
-// prepareCommit 时:
-// - 只写入一个 DV 索引文件 (包含所有 1000 次删除)
-// - 而不是 1000 个独立的 DV 文件
-```
-
-### 有什么坑
-
-**1. modified 标记未正确设置**
-```java
-// 错误: 直接修改 deletionVectors,不设置 modified
-deletionVectors.put(fileName, dv);
-// 后果: prepareCommit 时不会写入新的 DV 文件,删除丢失
-
-// 正确: 使用 notifyNewDeletion
-maintainer.notifyNewDeletion(fileName, dv);  // 自动设置 modified = true
-```
-
-**2. 重复删除导致不必要的写入**
-```java
-// 错误: 重复删除同一行
-maintainer.notifyNewDeletion("file-1", 100);
-maintainer.notifyNewDeletion("file-1", 100);  // 重复
-// 后果: modified = true,但实际没有新增删除
-
-// 正确: checkedDelete 自动去重
-// BitmapDeletionVector.checkedDelete 只在新增时返回 true
-```
-
-**3. Checkpoint 恢复时 restoredFiles 为 null**
-```java
-// 错误: 未处理 null 情况
-BucketedDvMaintainer maintainer = factory.create(partition, bucket, restoredFiles);
-// 如果 restoredFiles = null,会抛出 NPE
-
-// 正确: Factory 内部处理
-if (restoredFiles == null) {
-    restoredFiles = Collections.emptyList();
-}
-```
-
-**4. 生产环境注意事项**
-- 监控 DV 修改频率: `dv_modified_count / commit_count`
-- 如果比例过高 (> 80%),说明更新频繁,考虑增加 Compaction 频率
-- 监控 DV 文件大小增长趋势
-
-### 核心概念解释
-
-**Maintainer (维护器)**
-- 管理单个 (partition, bucket) 的所有 DV
-- 追踪 DV 的增量修改
-- 负责 DV 的序列化和反序列化
-
-**modified 标记**
-```java
-private boolean modified = false;
-
-// 只有真正产生新删除时才设置为 true
-if (dv.checkedDelete(position)) {
-    modified = true;
-}
-
-// prepareCommit 时检查
-if (modified) {
-    writeDeletionVectorsIndex();  // 写入新文件
-}
-```
-
-**Factory 模式**
-```
-Factory.create(partition, bucket, restoredFiles)
-  -> 从 restoredFiles 读取已有的 DV
-  -> 构建 Map<String, DeletionVector>
-  -> 创建 BucketedDvMaintainer
-```
-
-**与其他系统对比**
-- **Iceberg**: 每次提交都重写 Puffin 文件 (Copy-on-Write)
-- **Paimon**: 增量合并 + 整体重写 (Merge + Rewrite)
-- **Delta Lake**: 类似 Paimon,但与 Checkpoint 机制不同
-
-### 设计理念
-
-**为什么采用内存 Map 管理 DV**
-```
-写入阶段:
-  - 频繁的删除通知 (每条更新都通知一次)
-  - 内存 Map 支持 O(1) 查找和更新
-  - 避免频繁的磁盘 I/O
-
-提交阶段:
-  - 一次性将所有 DV 写入文件
-  - 批量写入,减少小文件
-```
-
-**为什么需要 modified 标记**
-```
-场景: 10 次提交,只有 2 次有删除操作
-
-没有 modified:
-  - 每次提交都写入 DV 文件
-  - 10 个 DV 文件,其中 8 个内容相同
-
-有 modified:
-  - 只在有删除时写入
-  - 2 个 DV 文件
-  
-节省 80% 的文件写入
-```
-
-**为什么使用 computeIfAbsent**
-```java
-DeletionVector dv = deletionVectors.computeIfAbsent(
-    fileName, k -> createNewDeletionVector());
-```
-- 延迟创建: 只在第一次删除时创建 DV
-- 线程安全: computeIfAbsent 是原子操作
-- 简洁: 避免显式的 null 检查
-
-**权衡取舍**
-- **优势**: 批量写入,减少小文件,支持增量更新
-- **劣势**: 内存开销 (需要缓存所有 DV)
-- **适用场景**: Bucketed 表,每个 bucket 的 DV 数量可控
-
-**架构演进**
-```
-Phase 1: 每次删除写一个文件
-  -> 小文件泛滥
-
-Phase 2: 批量写入 (Maintainer)
-  -> 减少文件数
-
-Phase 3: modified 标记优化
-  -> 避免不必要的写入
-
-Phase 4: Factory 模式 + Checkpoint 恢复
-  -> 支持容错
-```
-
-### 3.1 核心职责与数据结构
-
-源码路径: `paimon-core/src/main/java/org/apache/paimon/deletionvectors/BucketedDvMaintainer.java` (L35-L179)
-
-`BucketedDvMaintainer` 管理单个 `(partition, bucket)` 内所有数据文件的 DV 状态:
+核心状态只有四个字段（`BucketedDvMaintainer.java:35-40`）：`dvIndexFile`（落盘器）、`deletionVectors`（内存 map）、`bitmap64`（V1/V2 开关）、`modified`（脏标记）。三个写入口对应三种语义：
 
 ```java
-public class BucketedDvMaintainer {
-    private final DeletionVectorsIndexFile dvIndexFile;
-    private final Map<String, DeletionVector> deletionVectors;  // 文件名 -> DV
-    protected final boolean bitmap64;                            // 使用 V1 还是 V2
-    private boolean modified;                                    // 是否有变更
-}
-```
-
-**为什么要在内存中维护完整的 DV 映射**: Bucketed 表的一个 bucket 通常只有一个 DV 索引文件。写入时可能对多个数据文件产生删除标记（例如对不同文件中的旧记录标记删除），因此需要维护一个完整的 `Map<String, DeletionVector>` 来追踪所有文件的 DV 状态。在 `prepareCommit` 时，将整个 map 写入新的 DV 索引文件。
-
-### 3.2 notifyNewDeletion 增量删除通知
-
-```java
-// 通知单行删除 (L61-L67)
+// BucketedDvMaintainer.java:61 / :87 / :102  —— 行号已核对
+// (a) 单行标删：lookup compaction 时逐行调用，computeIfAbsent 懒建 DV，checkedDelete 去重
 public void notifyNewDeletion(String fileName, long position) {
-    DeletionVector deletionVector =
-            deletionVectors.computeIfAbsent(fileName, k -> createNewDeletionVector());
-    if (deletionVector.checkedDelete(position)) {
-        modified = true;     // 只有真正新增的删除才标记 modified
-    }
+    DeletionVector dv = deletionVectors.computeIfAbsent(fileName, k -> createNewDeletionVector());
+    if (dv.checkedDelete(position)) { modified = true; }   // 只有真新增才置脏
 }
-
-// 通知整个 DV 替换 (L75-L78)
-public void notifyNewDeletion(String fileName, DeletionVector deletionVector) {
-    deletionVectors.put(fileName, deletionVector);
-    modified = true;
-}
-```
-
-**为什么有两个重载方法**: 
-- 单行版本 (`fileName, position`): 用于 Lookup 写入场景，每次找到一个旧记录就通知一次。使用 `computeIfAbsent` 确保 DV 延迟创建。
-- 整体替换版本 (`fileName, DeletionVector`): 用于批量场景（如 Compaction 合并 DV）。
-
-**`createNewDeletionVector()` (L50-L52)**: 根据 `bitmap64` 配置创建 V1 或 V2 的 DV:
-```java
-private DeletionVector createNewDeletionVector() {
-    return bitmap64 ? new Bitmap64DeletionVector() : new BitmapDeletionVector();
-}
-```
-
-### 3.3 mergeNewDeletion 合并删除向量
-
-```java
-public void mergeNewDeletion(String fileName, DeletionVector deletionVector) {
+// (b) 整 DV 合并：Append 表批量 DELETE 用，与已有 DV 取并集
+public void mergeNewDeletion(String fileName, DeletionVector dv) {
     DeletionVector old = deletionVectors.get(fileName);
-    if (old != null) {
-        deletionVector.merge(old);    // 新 DV 吸收旧 DV (OR 语义)
-    }
-    deletionVectors.put(fileName, deletionVector);
-    modified = true;
+    if (old != null) { dv.merge(old); }                    // OR 语义，新 DV 吸收旧 DV
+    deletionVectors.put(fileName, dv); modified = true;
 }
-```
-
-**为什么是 `deletionVector.merge(old)` 而非 `old.merge(deletionVector)`**: 因为调用方传入的 `deletionVector` 是新产生的 DV，`old` 是已有的 DV。merge 操作是 OR 语义（取并集），方向无关紧要，但这里选择让新 DV 吸收旧 DV，然后替换。这种模式在 `BucketedAppendDeleteFileMaintainer` (L55-L57) 中被使用。
-
-### 3.4 removeDeletionVectorOf 移除操作
-
-```java
+// (c) 移除：compaction 时旧文件被合并掉，它的 DV 不再需要
 public void removeDeletionVectorOf(String fileName) {
-    if (deletionVectors.containsKey(fileName)) {
-        deletionVectors.remove(fileName);
-        modified = true;
-    }
+    if (deletionVectors.containsKey(fileName)) { deletionVectors.remove(fileName); modified = true; }
 }
 ```
 
-**使用场景**: Compaction 时，旧文件被合并为新文件。旧文件的 DV 不再需要（因为旧文件本身将被删除），需要从 DV 映射中移除。注意只有当确实存在该文件的 DV 时才标记 `modified`。
+`createNewDeletionVector()`（`:50`）按 `bitmap64` 配置 new 出 V1 或 V2，所以一张表的 V1/V2 选择是在维护器层统一定的。
 
-### 3.5 Factory 模式与状态恢复
-
-```java
-public static class Factory {
-    private final IndexFileHandler handler;
-    
-    // 从已恢复的 IndexFileMeta 列表创建 (L164-L172)
-    public BucketedDvMaintainer create(
-            BinaryRow partition, int bucket, @Nullable List<IndexFileMeta> restoredFiles) {
-        if (restoredFiles == null) {
-            restoredFiles = Collections.emptyList();
-        }
-        Map<String, DeletionVector> deletionVectors =
-                new HashMap<>(handler.readAllDeletionVectors(partition, bucket, restoredFiles));
-        return create(partition, bucket, deletionVectors);
-    }
-    
-    // 从已有的 DV 映射创建 (L174-L177)
-    public BucketedDvMaintainer create(
-            BinaryRow partition, int bucket, Map<String, DeletionVector> deletionVectors) {
-        return new BucketedDvMaintainer(handler.dvIndex(partition, bucket), deletionVectors);
-    }
-}
-```
-
-**恢复流程解析**:
-1. Checkpoint 恢复时，Flink/Spark 的 Writer 持有已提交的 `IndexFileMeta` 列表
-2. Factory 通过 `handler.readAllDeletionVectors()` 从这些索引文件中读取所有 DV 数据
-3. 将 DV 数据装入 `HashMap`，构建新的 `BucketedDvMaintainer`
-4. `handler.dvIndex(partition, bucket)` 创建对应 (partition, bucket) 的 `DeletionVectorsIndexFile`，用于后续写入
-
-**为什么需要从 restoredFiles 恢复而非从最新 Snapshot 读取**: Checkpoint 恢复时，最新 Snapshot 可能不包含当前 Writer 的数据（可能有其他并行 Writer 的提交）。只有从 Writer 自身保存的 `restoredFiles` 恢复才能保证一致性。
-
-### 3.6 写入输出与 modified 跟踪
+**提交时落盘只看 `modified`**（`BucketedDvMaintainer.java:115`）：
 
 ```java
 public Optional<IndexFileMeta> writeDeletionVectorsIndex() {
-    if (modified) {
-        modified = false;
-        return Optional.of(dvIndexFile.writeSingleFile(deletionVectors));
-    }
-    return Optional.empty();
+    if (modified) { modified = false; return Optional.of(dvIndexFile.writeSingleFile(deletionVectors)); }
+    return Optional.empty();   // 这一轮没改动，不产生任何 DV 文件
 }
 ```
 
-**为什么返回 `Optional`**: 如果没有任何修改 (`modified = false`)，不需要写入新的 DV 索引文件，返回空。这个设计避免了在没有删除操作时产生不必要的小文件。
+返回 `Optional` 而非强制写文件，是为了**在没有删除发生的提交里不产生空/重复的 DV 小文件**——这是 `modified` 标记的全部价值。写完置 `false`，下一轮只在又有新改动时才写。
 
-**modified 重置**: 写入后将 `modified` 重置为 `false`，使下一轮提交只在有新变更时才写入。
+**③ 状态恢复（容错的关键）**：`Factory.create(partition, bucket, restoredFiles)`（`BucketedDvMaintainer.java:164`）从 Writer 自己保存的 `restoredFiles`（已提交的 `IndexFileMeta` 列表）重建内存 map：
+
+```java
+public BucketedDvMaintainer create(BinaryRow partition, int bucket, @Nullable List<IndexFileMeta> restoredFiles) {
+    if (restoredFiles == null) { restoredFiles = Collections.emptyList(); }   // 容 null
+    Map<String, DeletionVector> dvs =
+        new HashMap<>(handler.readAllDeletionVectors(partition, bucket, restoredFiles));
+    return create(partition, bucket, dvs);
+}
+```
+
+**为什么从 `restoredFiles` 恢复而不是从最新 Snapshot 读**：failover 时最新 Snapshot 可能已包含其它并行 Writer 的提交，从全局快照恢复会把别人的 DV 也吃进来。只有从本 Writer 自身 checkpoint 的 `restoredFiles` 恢复，才能保证状态一致。
+
+**④ 风险/陷阱**：① 直接 `deletionVectors.put(...)` 绕过 `notifyNewDeletion` 会漏置 `modified`，导致删除丢失——务必走维护器方法；② `mergeNewDeletion` 是 `dv.merge(old)`（让新 DV 吸收旧 DV 再替换），方向选择无关正确性（OR 可交换），但要求两个 DV 同为 V1 或同为 V2，否则 `merge` 抛 `Only instance with the same class type can be merged`（`BitmapDeletionVector.java:60`）。
+
+**⑤ 收益与代价**：内存 map 让高频标记 O(1)、批量落盘减小文件、`modified` 免无谓写、Factory 撑 failover。代价是要把整 bucket 的 DV 常驻内存——对分桶表 DV 数量可控、没问题，但这也是 DV 只适合"桶内文件数受控"的隐含前提。
 
 ---
 
-## 4. DV 在读路径中的应用
+## 5. MOW 写路径：DV 在 lookup compaction 时生成（核心）
 
-### 解决什么问题
+### 5.1 DV 不是在 flush 时生成，而是在 compaction 时
 
-**核心业务问题**: 主键表的读取需要合并多个层级的数据 (merge-on-read),这导致读取性能远低于 Append 表。如何通过 DV 跳过已删除的旧版本数据,避免 merge 开销?
+**① 要解决什么问题 / 旧稿的根本误解**
 
-**没有 DV 读路径优化的后果**:
-```sql
--- 查询: SELECT * FROM user_table WHERE partition = '2024-01-01';
+很多资料（包括本文旧稿）把 DV 描述成"写入一条更新就 lookup 旧记录、立即标删"。这在 Paimon 里**不成立**：写入侧 `MergeTreeWriter.write(kv)` 只是把 KeyValue 排序进 WriteBuffer，buffer 满了 flush 成一个 **Level 0** 文件——此时**完全没有 DV，也没有任何 lookup**。Level 0 文件 key 范围互相重叠，是否要标删别人、标删谁都还不知道。
 
--- 没有 DV (传统 LSM-tree):
---   - 读取 Level-0 到 Level-N 的所有文件
---   - 对相同 key 的记录做 merge
---   - 耗时: 10s (需要合并 1000 个文件)
+DV 真正生成的地方是 **lookup compaction**：当 compaction 把 Level 0 文件向高层推时，对参与的每个 key 去更高 level 做一次 lookup，**若发现该 key 在更高 level 已存在旧版本**，就把"旧版本所在文件的那一行"标记为删除。
 
--- 有 DV (rawConvertible = true):
---   - 直接读取每个文件,应用 DV 过滤
---   - 跳过被标记删除的行
---   - 耗时: 2s (无需 merge,性能接近 Append 表)
-```
+**② 设计原理与取舍**
 
-**实际场景**:
-- 实时数仓查询: 用户行为分析
-- 维度表查询: 商品信息、用户画像
-- CDC 同步后的查询: 数据库镜像
-
-### 有什么坑
-
-**1. rawConvertible 未启用**
-```java
-// 错误: DV 存在但 rawConvertible = false
-DataSplit split = new DataSplit(...);
-split.rawConvertible = false;  // 仍然走 merge-on-read
-// 后果: DV 不生效,读取性能差
-
-// 正确: 启用 rawConvertible
-split.rawConvertible = true;  // 跳过 merge,直接应用 DV
-```
-
-**2. DV Factory 未正确传递**
-```java
-// 错误: 创建 Reader 时未传递 DV Factory
-FileRecordReader reader = format.createReader(...);
-// 后果: 读取到已删除的行
-
-// 正确: 包装 ApplyDeletionVectorReader
-Optional<DeletionVector> dv = dvFactory.create(fileName);
-if (dv.isPresent()) {
-    reader = new ApplyDeletionVectorReader(reader, dv.get());
-}
-```
-
-**3. 迭代器未正确实现 returnedPosition**
-```java
-// 错误: returnedPosition 返回错误的值
-public long returnedPosition() {
-    return totalRowsRead;  // 错误: 应该返回当前行在文件中的位置
-}
-// 后果: DV 过滤错误,数据不一致
-
-// 正确: 返回文件内偏移量
-public long returnedPosition() {
-    return currentFilePosition;  // 从 0 开始的行号
-}
-```
-
-**4. 生产环境注意事项**
-- 监控 DV 过滤率: `dv_filtered_rows / total_rows`
-- 如果过滤率过高 (> 50%),触发 Compaction
-- 监控读取延迟: 有 DV 时应接近 Append 表
-
-### 核心概念解释
-
-**rawConvertible (原始可转换)**
-- 标志位,表示数据文件可以直接读取 (无需 merge)
-- 启用条件: DV 存在 + 文件是最新版本
-- 效果: 跳过 LSM-tree 的 merge 过程
-
-**装饰器模式**
-```
-底层 Reader (ORC/Parquet)
-  -> ApplyDeletionVectorReader (应用 DV 过滤)
-    -> 上层消费者
-```
-
-**行级过滤**
-```java
-while (true) {
-    InternalRow row = reader.next();
-    if (row == null) return null;
-    if (!dv.isDeleted(position)) {
-        return row;  // 未删除的行
-    }
-    // 跳过已删除的行
-}
-```
-
-**与其他系统对比**
-- **Iceberg**: Position Delete 需要与 Data File join
-- **Paimon**: DV 直接嵌入读取路径,无需 join
-- **Delta Lake**: 类似 Paimon,但实现细节不同
-
-### 设计理念
-
-**为什么采用装饰器模式**
-1. **解耦**: DV 过滤逻辑与文件格式无关
-2. **透明**: 上层无需感知 DV 的存在
-3. **可组合**: 可以与其他 Reader 组合 (如压缩、加密)
-
-**为什么在迭代器层面过滤**
-```
-Reader 层面:
-  - 以 batch 为粒度 (1000 行)
-  - 需要修改 batch 内部结构
-  - 复杂度高
-
-迭代器层面:
-  - 逐行过滤
-  - 简单高效
-  - 无需修改 batch
-```
-
-**为什么需要 returnedPosition**
-```
-DV 记录的是文件内的行号 (0-based)
-迭代器需要告诉 DV 当前读到第几行
-DV 根据行号判断是否删除
-```
-
-**权衡取舍**
-- **优势**: 读取性能接近 Append 表,无需 merge
-- **劣势**: 需要读取 DV 文件,略增加 I/O
-- **适用场景**: 读多写少的 OLAP 场景
-
-**架构演进**
-```
-Phase 1: 纯 merge-on-read
-  -> 读取慢
-
-Phase 2: DV + rawConvertible
-  -> 跳过 merge,直接过滤
-
-Phase 3: 提前终止优化
-  -> position > last 时停止读取
-```
-
-**性能对比**
-```
-场景: 1000 万行,10% 被删除
-
-传统 merge-on-read:
-  - 读取所有文件
-  - 合并相同 key
-  - 耗时: 10s
-
-DV + rawConvertible:
-  - 读取文件,应用 DV
-  - 跳过 10% 的行
-  - 耗时: 2s
-
-加速比: 5x
-```
-
-### 4.1 ApplyDeletionVectorReader 行级过滤
-
-源码路径: `paimon-core/src/main/java/org/apache/paimon/deletionvectors/ApplyDeletionVectorReader.java` (L31-L67)
-
-这是一个装饰器模式的 `FileRecordReader`，包装底层 Reader 并应用 DV 过滤:
+入口在 `LookupChangelogMergeFunctionWrapper.getResult()`（`LookupChangelogMergeFunctionWrapper.java:104`）。它先在参与 merge 的 section 里找最高层版本，没找到才去 lookup 更高层：
 
 ```java
-public class ApplyDeletionVectorReader implements FileRecordReader<InternalRow> {
-    private final FileRecordReader<InternalRow> reader;
-    private final DeletionVector deletionVector;
-    
-    @Nullable
-    public FileRecordIterator<InternalRow> readBatch() throws IOException {
-        FileRecordIterator<InternalRow> batch = reader.readBatch();
-        if (batch == null) return null;
-        return new ApplyDeletionFileRecordIterator(batch, deletionVector);
-    }
-}
-```
-
-**设计模式**: 经典的**装饰器模式**。`ApplyDeletionVectorReader` 不改变 Reader 的读取逻辑，只在每个 batch 上包装一层过滤迭代器。这使得 DV 过滤可以透明地与任何 `FileRecordReader` 组合。
-
-### 4.2 ApplyDeletionFileRecordIterator 迭代过滤
-
-源码路径: `paimon-core/src/main/java/org/apache/paimon/deletionvectors/ApplyDeletionFileRecordIterator.java` (L30-L80)
-
-```java
-public class ApplyDeletionFileRecordIterator 
-        implements FileRecordIterator<InternalRow>, DeletionFileRecordIterator {
-    
-    private final FileRecordIterator<InternalRow> iterator;
-    private final DeletionVector deletionVector;
-    
-    public InternalRow next() throws IOException {
-        while (true) {
-            InternalRow next = iterator.next();
-            if (next == null) return null;
-            if (!deletionVector.isDeleted(returnedPosition())) {
-                return next;   // 未被删除的行才返回
-            }
-            // 被删除的行直接跳过，继续读取下一行
-        }
-    }
-    
-    public long returnedPosition() {
-        return iterator.returnedPosition();    // 委托给底层迭代器获取行位置
-    }
-}
-```
-
-**关键设计**: 
-1. `returnedPosition()` 返回的是**文件内的行号**（从 0 开始），与 DV 中记录的 position 对应
-2. 使用 `while(true)` 循环跳过连续的已删除行，直到找到有效行或到达文件末尾
-3. 实现了 `DeletionFileRecordIterator` 接口，使得上层可以获取到 DV 引用
-
-**为什么在迭代器层面而非 Reader 层面过滤**: Reader 以 batch 为粒度工作（一个 batch 可能包含多行），而 DV 过滤需要逐行检查。在迭代器层面可以精确地按行过滤，且不需要修改 batch 的内部结构。
-
-### 4.3 读路径全链路分析
-
-```
-TableRead (入口)
-  |
-  v
-DataSplit.rawConvertible = true (DV 启用后的优化标志)
-  |
-  v  
-RawFileSplitRead.createReader(split)
-  |
-  +-- 获取 split 中的 DeletionFile 列表
-  |
-  +-- 对每个数据文件:
-  |     FileRecordReader reader = 底层文件格式 Reader (ORC/Parquet)
-  |     Optional<DeletionVector> dv = dvFactory.create(fileName)
-  |     if (dv.isPresent()) {
-  |         reader = new ApplyDeletionVectorReader(reader, dv.get())
-  |     }
-  |     -> 返回带 DV 过滤的 Reader
-  |
-  v
-ApplyDeletionVectorReader.readBatch()
-  -> ApplyDeletionFileRecordIterator.next()
-     -> 对每行检查 dv.isDeleted(position)
-     -> 跳过已删除行
-```
-
-**DV 启用后的关键优化**: 当 `rawConvertible = true` 时，读取路径跳过了 LSM-tree 的 merge 过程（无需将多个 level 的数据合并），直接逐文件读取并应用 DV 过滤。这使得读取性能接近 Append-Only 表。
-
----
-
-## 5. DV 在写路径中的应用
-
-### 解决什么问题
-
-**核心业务问题**: 主键表的更新操作需要标记旧版本数据为删除,但如何在写入新数据的同时高效地生成和维护 DV?
-
-**没有写路径 DV 集成的后果**:
-- 更新操作需要先读取旧数据,再写入新数据 -> 两次 I/O
-- 无法追踪旧记录的位置 -> 无法生成 DV
-- Compaction 无法消除 DV -> DV 持续累积
-
-**实际场景**:
-```sql
--- CDC 同步: 每秒 1000 次更新
-UPDATE user_table SET status = 'active' WHERE user_id = 12345;
-
--- 写路径:
--- 1. Lookup: 查找 user_id=12345 的旧记录位置
--- 2. DV: 标记旧记录删除 (file-old.parquet, position=5678)
--- 3. Write: 写入新记录到 Level-0
--- 4. Commit: 提交新的 DV 索引文件
-```
-
-### 有什么坑
-
-**1. Lookup 未启用导致 DV 不生成**
-```java
-// 错误: needLookup = false
-MergeTreeWriter writer = new MergeTreeWriter(..., false);
-// 后果: 不会查找旧记录,DV 不生成,数据重复
-
-// 正确: 启用 Lookup
-MergeTreeWriter writer = new MergeTreeWriter(..., true);
-```
-
-**2. Compaction 时未移除旧文件的 DV**
-```java
-// 错误: Compaction 后未调用 removeDeletionVectorOf
-compactFiles(beforeFiles, afterFiles);
-// 后果: 旧文件的 DV 仍然存在,浪费空间
-
-// 正确: 移除旧文件的 DV
-for (DataFileMeta file : beforeFiles) {
-    dvMaintainer.removeDeletionVectorOf(file.fileName());
-}
-```
-
-**3. DV 与数据文件提交不一致**
-```java
-// 错误: 先提交数据文件,再提交 DV
-commitDataFiles();
-commitDvIndex();  // 如果失败,DV 丢失
-// 后果: 数据不一致
-
-// 正确: 原子提交
-IndexIncrement indexIncrement = new IndexIncrement();
-indexIncrement.add(dvIndexMeta);
-commit(dataFiles, indexIncrement);  // 原子操作
-```
-
-**4. 生产环境注意事项**
-- 监控 Lookup 延迟: `lookup_latency_p99` 应 < 1ms
-- 监控 DV 生成率: `dv_generated_count / update_count` 应 ≈ 1
-- 监控 Compaction 频率: 避免 DV 累积过多
-
-### 核心概念解释
-
-**Lookup 模式**
-```
-写入流程:
-  1. 计算 key 的哈希
-  2. 在 LookupLevels 中查找旧记录
-  3. 如果找到: 返回 (fileName, position)
-  4. 通知 DvMaintainer 标记删除
-  5. 写入新记录到 Level-0
-```
-
-**LookupResult**
-```java
-class LookupResult {
-    String fileName;      // 旧记录所在文件
-    long position;        // 旧记录在文件中的位置
-    InternalRow value;    // 旧记录的值 (可选)
-}
-```
-
-**Compaction 消除 DV**
-```
-Compaction 前:
-  file-1.parquet (1000 行, DV: {100, 200, 300})
-  file-2.parquet (1000 行, DV: {50, 150})
-
-Compaction 后:
-  file-3.parquet (1400 行, 无 DV)
-  
-被 DV 标记的行不会写入新文件
-```
-
-**与其他系统对比**
-- **Iceberg**: 需要显式执行 rewrite 操作消除 DV
-- **Paimon**: Compaction 自动消除 DV
-- **Delta Lake**: 类似 Paimon,但 Compaction 策略不同
-
-### 设计理念
-
-**为什么 Lookup 是 DV 的前提**
-```
-问题: 如何知道旧记录在哪个文件的哪个位置?
-
-方案1: 扫描所有文件 -> 太慢
-方案2: 维护 key -> (file, pos) 映射 -> Lookup
-
-Lookup 提供了 O(1) 的旧记录定位能力
-```
-
-**为什么 Compaction 能消除 DV**
-```
-Compaction 读取流程:
-  1. 读取旧文件
-  2. 应用 DV 过滤 (跳过已删除的行)
-  3. 写入新文件
-
-新文件只包含有效行,不需要 DV
-```
-
-**为什么需要原子提交**
-```
-场景: 提交数据文件成功,提交 DV 失败
-
-后果:
-  - 新数据可见
-  - 旧数据未标记删除
-  - 数据重复
-
-解决: IndexIncrement 与 DataIncrement 一起提交
-```
-
-**权衡取舍**
-- **优势**: 自动生成 DV,Compaction 自动消除
-- **劣势**: 写入延迟增加 (Lookup 开销)
-- **适用场景**: 更新频繁的主键表
-
-**架构演进**
-```
-Phase 1: 纯 LSM-tree (无 DV)
-  -> 写入快,读取慢
-
-Phase 2: Lookup + DV 生成
-  -> 写入略慢,读取快
-
-Phase 3: Compaction 消除 DV
-  -> 长期稳定,无 DV 累积
-```
-
-**性能对比**
-```
-场景: 1000 万次更新
-
-无 DV (纯 LSM-tree):
-  - 写入延迟: 1ms
-  - 读取延迟: 100ms (需要 merge)
-
-有 DV (Lookup + DV):
-  - 写入延迟: 1.2ms (增加 Lookup 开销)
-  - 读取延迟: 20ms (跳过 merge)
-  
-读取加速比: 5x
-写入延迟增加: 20%
-```
-
-**Compaction 策略**
-```java
-// 触发条件: DV 过滤率 > 50%
-if (dv.getCardinality() > file.rowCount() * 0.5) {
-    triggerCompaction(file);
-}
-
-// Compaction 后:
-// - 旧文件删除
-// - 旧文件的 DV 删除
-// - 新文件无 DV
-```
-
-### 5.1 Lookup 模式下标记旧行删除
-
-在主键表 (PK Table) 的写入路径中，DV 通过 Lookup 机制生成:
-
-```
-TableWriteImpl.write(row)
-  |
-  v
-KeyValueFileStoreWrite.write(partition, bucket, kv)
-  |
-  v (如果启用了 DV, 即 needLookup = true)
-MergeTreeWriter.write(kv)
-  |
-  +-- LookupLevels.lookup(key)
-  |     |
-  |     +-- 在 Level-0 (内存 buffer) 中查找
-  |     +-- 在 Level-1..N (磁盘文件) 中查找
-  |     +-- 如果找到旧记录:
-  |           返回 LookupResult(fileName, position, ...)
-  |
-  +-- 如果 LookupResult 有效:
-  |     dvMaintainer.notifyNewDeletion(
-  |         lookupResult.fileName(), lookupResult.position())
-  |     // 标记旧文件中的旧行为已删除
-  |
-  +-- 写入新记录到 Level-0 (内存 buffer)
-```
-
-**为什么 Lookup 是 DV 的核心前提**: DV 的本质是"标记旧行为已删除"。要知道旧行在哪个文件的哪个位置，必须先查找旧记录。Lookup 机制（基于 RocksDB 或内存）维护了 `key -> (fileName, position)` 的映射，使得写入时可以精确定位旧记录。
-
-### 5.2 Compaction 时 DV 合并
-
-Compaction 过程中的 DV 处理:
-
-```
-Compaction 触发
-  |
-  v
-选择参与 compaction 的文件列表 (beforeFiles)
-  |
-  v
-合并读取 beforeFiles 的数据 + 应用 DV 过滤
-  |
-  +-- 对于每个 beforeFile:
-  |     removeDeletionVectorOf(beforeFileName)  // 移除旧文件的 DV
-  |
-  v
-写入合并后的新文件 (afterFiles)
-  |
-  +-- 新文件不需要 DV (数据已是最新的)
-  |
-  v
-提交: 
-  - 旧的 DV 索引文件标记为删除 (IndexManifestEntry DELETE)
-  - 新的 DV 索引文件（如果有修改）标记为新增 (IndexManifestEntry ADD)
-```
-
-**关键点**: Compaction 的一个重要作用是"消除" DV。参与 compaction 的旧文件中被 DV 标记为删除的行不会被写入新文件，因此新文件不需要 DV。这实质上是将 merge-on-read 的开销转移到了后台的 compaction 中。
-
-### 5.3 DV 生命周期总结
-
-```
-┌─────────────────────────────────────────────────────┐
-│ 1. 初始化: Factory.create() 从 IndexManifest 恢复    │
-│    -> 读取已有的 DV 索引文件到内存 Map               │
-├─────────────────────────────────────────────────────┤
-│ 2. 写入期间: Lookup 发现旧记录                        │
-│    -> notifyNewDeletion(oldFile, oldPosition)        │
-│    -> 在内存 Map 中更新 DV                           │
-├─────────────────────────────────────────────────────┤
-│ 3. Compaction 期间: 旧文件被合并                      │
-│    -> removeDeletionVectorOf(oldFileName)            │
-│    -> 从内存 Map 中移除对应 DV                       │
-├─────────────────────────────────────────────────────┤
-│ 4. prepareCommit(): 生成新的 DV 索引文件             │
-│    -> writeDeletionVectorsIndex()                    │
-│    -> 生成 IndexFileMeta 加入 IndexIncrement         │
-├─────────────────────────────────────────────────────┤
-│ 5. commit(): 提交到 Snapshot                         │
-│    -> 旧 DV 索引文件 -> DELETE entry                 │
-│    -> 新 DV 索引文件 -> ADD entry                    │
-└─────────────────────────────────────────────────────┘
-```
-
----
-
-## 6. Append 表的 DV
-
-### 6.1 BaseAppendDeleteFileMaintainer 接口
-
-源码路径: `paimon-core/src/main/java/org/apache/paimon/deletionvectors/append/BaseAppendDeleteFileMaintainer.java` (L52-L103)
-
-```java
-public interface BaseAppendDeleteFileMaintainer {
-    BinaryRow getPartition();
-    int getBucket();
-    void notifyNewDeletionVector(String dataFile, DeletionVector deletionVector);
-    List<IndexManifestEntry> persist();
-}
-```
-
-**为什么 Append 表也需要 DV**: Append 表虽然不支持 UPDATE，但支持 DELETE 操作（如 `DELETE FROM append_table WHERE id = 1`）。DV 允许在不重写整个数据文件的情况下标记被删除的行。
-
-接口提供两个工厂方法:
-
-1. `forBucketedAppend(...)` (L62-L75): 为有桶的 Append 表创建维护器
-2. `forUnawareAppend(...)` (L77-L102): 为无桶的 Append 表创建维护器
-
-### 6.2 AppendDeleteFileMaintainer (Unaware Bucket)
-
-源码路径: `paimon-core/src/main/java/org/apache/paimon/deletionvectors/append/AppendDeleteFileMaintainer.java` (L41-L169)
-
-这是无桶 Append 表的 DV 维护器，复杂度最高:
-
-**核心数据结构**:
-```java
-private final Map<String, DeletionFile> dataFileToDeletionFile;  // 数据文件 -> DV文件位置
-private final Map<String, IndexManifestEntry> indexNameToEntry;  // 索引文件 -> Manifest 条目
-private final Map<String, Map<String, DeletionFile>> indexFileToDeletionFiles; // 索引文件 -> (数据文件 -> DV位置)
-private final Map<String, String> dataFileToIndexFile;           // 数据文件 -> 索引文件名
-private final Set<String> touchedIndexFiles;                     // 被修改的索引文件
-private final Map<String, DeletionVector> deletionVectors;       // 新增的 DV
-```
-
-**关键方法 `notifyNewDeletionVector`** (L119-L125):
-
-```java
-public void notifyNewDeletionVector(String dataFile, DeletionVector deletionVector) {
-    DeletionFile previous = notifyRemovedDeletionVector(dataFile);
-    if (previous != null) {
-        deletionVector.merge(dvIndexFile.readDeletionVector(previous));
-    }
-    deletionVectors.put(dataFile, deletionVector);
-}
-```
-
-**为什么需要 merge 已有的 DV**: 同一个数据文件可能在多次操作中被删除不同的行。新的 DV 必须包含之前所有的删除信息，否则之前被删除的行会"复活"。
-
-**`persist()` 方法** (L128-L134) 的两步写入:
-
-1. **writeUnchangedDeletionVector** (L146-L168): 处理被"触碰"的索引文件
-   - 如果一个索引文件中只有部分 DV 被修改，需要将未修改的 DV 重写到新文件
-   - 旧的索引文件标记为 DELETE
-   - 这是因为无桶表的索引文件通过 Rolling 写入，一个索引文件包含多个数据文件的 DV
-
-2. **writeWithRolling(deletionVectors)**: 将新增的 DV 写入新的索引文件
-
-**为什么这比 BucketedDvMaintainer 复杂**: Bucketed 表每个 bucket 只有一个 DV 索引文件，修改时整体重写即可。无桶表的 DV 分散在多个 Rolling 索引文件中，部分更新需要处理"读取旧索引文件中未修改的 DV -> 写入新索引文件 -> 删除旧索引文件"的复杂逻辑。
-
-### 6.3 BucketedAppendDeleteFileMaintainer (Bucketed)
-
-源码路径: `paimon-core/src/main/java/org/apache/paimon/deletionvectors/append/BucketedAppendDeleteFileMaintainer.java` (L31-L68)
-
-这是有桶 Append 表的 DV 维护器，内部直接委托给 `BucketedDvMaintainer`:
-
-```java
-public class BucketedAppendDeleteFileMaintainer implements BaseAppendDeleteFileMaintainer {
-    private final BinaryRow partition;
-    private final int bucket;
-    private final BucketedDvMaintainer maintainer;   // 核心委托对象
-    
-    public void notifyNewDeletionVector(String dataFile, DeletionVector deletionVector) {
-        maintainer.mergeNewDeletion(dataFile, deletionVector);   // 使用 merge 语义
-    }
-    
-    public List<IndexManifestEntry> persist() {
-        List<IndexManifestEntry> result = new ArrayList<>();
-        maintainer.writeDeletionVectorsIndex()
-                .map(fileMeta -> new IndexManifestEntry(FileKind.ADD, partition, bucket, fileMeta))
-                .ifPresent(result::add);
-        return result;
-    }
-}
-```
-
-**为什么使用 `mergeNewDeletion` 而非 `notifyNewDeletion`**: Append 表的 DELETE 操作可能一次性传入一个完整的 DV（表示这次操作要删除的所有行），需要与已有的 DV 合并，而不是逐行通知。
-
-### 6.4 Append 表与 PK 表 DV 差异对比
-
-| 维度 | PK 表 DV | Append 表 DV |
-|------|----------|-------------|
-| DV 产生方式 | Lookup 发现旧记录时自动生成 | 用户执行 DELETE 语句时生成 |
-| 维护器 | `BucketedDvMaintainer` | `AppendDeleteFileMaintainer` 或 `BucketedAppendDeleteFileMaintainer` |
-| Compaction 消除 | 是，Compaction 后旧文件 DV 被移除 | 否，除非被 Compact 的文件包含 DV |
-| 写入模式 | 单文件 (`writeSingleFile`) | Rolling (`writeWithRolling`) 或单文件 |
-| 一个索引文件含 DV 数 | 整个 bucket 的所有 DV | 取决于 Rolling 策略 |
-
----
-
-## 7. 文件索引 SPI 体系
-
-### 解决什么问题
-
-**核心业务问题**: 数据湖查询需要扫描大量文件,如何在读取文件前就过滤掉不包含目标数据的文件?如何支持不同类型的索引(Bloom Filter、Bitmap、BSI)而不修改核心代码?
-
-**没有文件索引的后果**:
-```sql
--- 查询: 在 1TB 数据中找 user_id = 12345
-SELECT * FROM user_table WHERE user_id = 12345;
-
--- 没有索引: 扫描所有 10000 个文件,读取 1TB 数据
--- 有 Bloom Filter: 过滤掉 9999 个文件,只读取 1 个文件 (100MB)
--- 节省 99.99% 的 I/O
-```
-
-**实际场景**:
-- 点查询: `WHERE id = 'xxx'` -> Bloom Filter
-- 范围查询: `WHERE age BETWEEN 20 AND 30` -> BSI
-- 多值查询: `WHERE city IN ('Beijing', 'Shanghai')` -> Bitmap
-- TopN 查询: `ORDER BY score DESC LIMIT 10` -> Range Bitmap
-
-### 有什么坑
-
-**1. SPI 配置错误**
-```sql
--- 错误: 拼写错误的索引类型
-CREATE TABLE t (...) WITH (
-  'file-index.bloom-filter.columns' = 'id',
-  'file-index.bloom-filtter.id.items' = '1000000'  -- 拼写错误
-);
--- 结果: 使用默认值,索引效果差
-```
-
-**2. 索引类型选择不当**
-```sql
--- 错误: 对高基数列使用 Bitmap
-CREATE TABLE t (...) WITH (
-  'file-index.bitmap.columns' = 'user_id'  -- user_id 有 1 亿个不同值
-);
--- 后果: 索引文件巨大,内存溢出
-```
-
-**正确选择**:
-- 低基数 (< 10000): Bitmap
-- 高基数点查: Bloom Filter
-- 数值范围查: BSI 或 Range Bitmap
-
-**3. 索引文件未关闭**
-```java
-// 错误: 忘记关闭 FileIndexPredicate
-FileIndexPredicate predicate = new FileIndexPredicate(...);
-FileIndexResult result = predicate.evaluate(filter);
-// 忘记 predicate.close() -> 文件句柄泄漏
-```
-
-**4. 生产环境注意事项**
-- 索引文件与数据文件分离存储,需要同时清理
-- 索引构建会增加写入延迟 20-50%
-- 监控指标: `index_build_time`, `index_file_size`, `index_hit_rate`
-
-### 核心概念解释
-
-**SPI (Service Provider Interface)**
-- Java 标准的插件机制
-- 通过 `META-INF/services/` 注册实现类
-- 运行时动态加载
-
-**FileIndexer 三件套**
-```
-FileIndexerFactory (工厂)
-  -> 创建 FileIndexer (索引器)
-    -> 创建 FileIndexWriter (写入器)
-    -> 创建 FileIndexReader (读取器)
-```
-
-**索引文件格式**
-```
-[Header]
-  - Magic Number: 识别文件类型
-  - Version: 格式版本
-  - Column Metadata: 每列的索引类型和位置
-[Body]
-  - 索引数据 (变长)
-```
-
-**与其他系统对比**
-- **Parquet**: 内置 Min/Max 统计,不支持 Bloom Filter
-- **ORC**: 内置 Bloom Filter,不支持 Bitmap
-- **Paimon**: 可扩展的 SPI,支持任意索引类型
-
-### 设计理念
-
-**为什么采用 SPI 架构**
-1. **可扩展性**: 用户可以实现自定义索引(如地理空间索引)
-2. **解耦**: 索引实现与核心引擎分离
-3. **按需加载**: 只加载用户配置的索引类型
-
-**为什么索引文件独立存储**
-```
-data-file-1.parquet  (100MB)
-  -> index-file-1.index (1MB)
-    -> bloom-filter (500KB)
-    -> bitmap (500KB)
-```
-- 数据文件不变,索引可以重建
-- 索引文件可以缓存在内存中
-- 支持异步构建索引
-
-**权衡取舍**
-| 维度 | 内置索引 (Parquet) | 外部索引 (Paimon) |
-|------|-------------------|------------------|
-| 写入性能 | 快 (一次写入) | 慢 (两次写入) |
-| 灵活性 | 低 (固定类型) | 高 (可扩展) |
-| 存储开销 | 低 (嵌入数据文件) | 高 (独立文件) |
-| 重建成本 | 高 (需要重写数据) | 低 (只重建索引) |
-
-**架构演进**
-```
-Phase 1: 无索引 (全表扫描)
-  -> 查询慢
-
-Phase 2: Min/Max 统计 (文件级过滤)
-  -> 范围查询优化
-
-Phase 3: Bloom Filter (点查询优化)
-  -> 等值查询加速
-
-Phase 4: Bitmap/BSI (行级过滤)
-  -> 精确到行,跳过无关数据
-```
-
-### 7.1 FileIndexer/FileIndexerFactory 接口设计
-
-**FileIndexerFactory** (SPI 入口):
-
-源码路径: `paimon-common/src/main/java/org/apache/paimon/fileindex/FileIndexerFactory.java` (L24-L30)
-
-```java
-public interface FileIndexerFactory {
-    String identifier();                           // SPI 标识符，如 "bloom-filter", "bitmap"
-    FileIndexer create(DataType type, Options options);  // 创建索引器
-}
-```
-
-**FileIndexer** (索引器):
-
-源码路径: `paimon-common/src/main/java/org/apache/paimon/fileindex/FileIndexer.java` (L29-L41)
-
-```java
-public interface FileIndexer {
-    FileIndexWriter createWriter();                                      // 创建写入器
-    FileIndexReader createReader(SeekableInputStream inputStream, int start, int length);  // 创建读取器
-    
-    static FileIndexer create(String type, DataType dataType, Options options) {
-        FileIndexerFactory factory = FileIndexerFactoryUtils.load(type);
-        return factory.create(dataType, options);
-    }
-}
-```
-
-**为什么采用 SPI 架构**: 文件索引是可扩展的。通过 Java SPI (`ServiceLoader`)，用户可以实现自己的索引类型并通过 classpath 注册，无需修改 Paimon 核心代码。目前内置了 4 种索引类型:
-
-| SPI identifier | 工厂类 | 索引实现类 |
-|---------------|--------|-----------|
-| `bloom-filter` | `BloomFilterFileIndexFactory` | `BloomFilterFileIndex` |
-| `bitmap` | `BitmapFileIndexFactory` | `BitmapFileIndex` |
-| `bsi` | `BitSliceIndexBitmapFileIndexFactory` | `BitSliceIndexBitmapFileIndex` |
-| `range-bitmap` | `RangeBitmapFileIndexFactory` | `RangeBitmapFileIndex` |
-
-### 7.2 SPI 加载机制
-
-源码路径: `paimon-common/src/main/java/org/apache/paimon/fileindex/FileIndexerFactoryUtils.java` (L29-L56)
-
-```java
-public class FileIndexerFactoryUtils {
-    private static final Map<String, FileIndexerFactory> factories = new HashMap<>();
-    
-    static {
-        ServiceLoader<FileIndexerFactory> serviceLoader =
-                ServiceLoader.load(FileIndexerFactory.class);
-        for (FileIndexerFactory indexerFactory : serviceLoader) {
-            if (factories.put(indexerFactory.identifier(), indexerFactory) != null) {
-                LOG.warn("Found multiple FileIndexer for type: " + indexerFactory.identifier());
+// LookupChangelogMergeFunctionWrapper.java:104  —— 行号已核对
+public ChangelogResult getResult() {
+    KeyValue highLevel = mergeFunction.pickHighLevel();
+    boolean containLevel0 = mergeFunction.containLevel0();
+    if (highLevel == null) {                       // 本次 section 内没有更高层版本
+        T lookupResult = lookup.apply(mergeFunction.key());   // 去 outputLevel+1 及以上做点查
+        if (lookupResult != null) {
+            if (lookupStrategy.deletionVector) {              // DV 模式：拿到旧版本的文件名+行号
+                // PositionedKeyValue / FilePosition 都携带 (fileName, rowPosition)
+                deletionVectorsMaintainer.notifyNewDeletion(fileName, rowPosition); // ← DV 在这里生成
+            } else {
+                highLevel = (KeyValue) lookupResult;          // 非 DV 模式（如 lookup changelog）
             }
         }
     }
-    
-    static FileIndexerFactory load(String type) {
-        FileIndexerFactory factory = factories.get(type);
-        if (factory == null) {
-            throw new RuntimeException("Can't find file index for type: " + type);
-        }
-        return factory;
+    // ... 计算最终值、产出 changelog
+}
+```
+
+注意 lookup 目标是 `lookupLevels.lookup(key, outputLevel + 1)`（`LookupMergeTreeCompactRewriter.java:212`）——只查**输出层以上**的层。这意味着 DV 标记的永远是"被本次 compaction 输出的新版本所顶替的、位于更高 level 的旧行"。
+
+而触发这条路径的前提，是 `LookupMergeTreeCompactRewriter.upgradeStrategy`（`:133`）决定对 Level 0 文件**强制 rewrite**：
+
+```java
+// LookupMergeTreeCompactRewriter.java:133  —— 行号已核对
+protected UpgradeStrategy upgradeStrategy(int outputLevel, DataFileMeta file) {
+    if (file.level() != 0) { return NO_CHANGELOG_NO_REWRITE; }      // 非 L0 文件不重写
+    // DV 模式下，只要文件有删除行就必须 rewrite（因为要 drop delete）
+    if (dvMaintainer != null && file.deleteRowCount().map(c -> c > 0).orElse(true)) {
+        return CHANGELOG_WITH_REWRITE;
     }
-}
-```
-
-**实现细节**: 使用静态初始化块加载所有 SPI 实现，存入 `HashMap`。重复注册同一 `identifier` 会打印警告但不报错（后注册的覆盖先注册的）。
-
-### 7.3 FileIndexFormat 存储格式 (Header + Body)
-
-源码路径: `paimon-common/src/main/java/org/apache/paimon/fileindex/FileIndexFormat.java` (L99-L367)
-
-文件索引以附加文件 (`.index`) 的形式存储，格式如下:
-
-```
- ______________________________________    _____________________
-|     magic (8 bytes long)              |
-|   = 1493475289347502                  |
-|---------------------------------------|
-|   version (4 bytes int) = 1          |
-|---------------------------------------|
-|   head length (4 bytes int)          |
-|---------------------------------------|
-|   column number (4 bytes int)        |
-|---------------------------------------|
-|   column 1 name ｜ index count       |         HEAD
-|---------------------------------------|
-|   index type 1 ｜ start pos ｜length |
-|---------------------------------------|
-|   index type 2 ｜ start pos ｜length |
-|---------------------------------------|
-|   column 2 name ｜ index count       |
-|---------------------------------------|
-|   index type 1 ｜ start pos ｜length |
-|---------------------------------------|
-|   redundant length (4 bytes) = 0     |
-|---------------------------------------|    ---------------------
-|            BODY (索引数据)             |         BODY
-|______________________________________|    _____________________
-```
-
-**Header 结构解析**:
-- `magic` (8 bytes): 固定值 `1493475289347502L`，用于识别文件格式
-- `version` (4 bytes): 当前版本 `1`
-- `head length` (4 bytes): header 的总字节数（包含 magic、version、head length 本身）
-- `column number` (4 bytes): 有索引的列数
-- 每列: `column_name (UTF) + index_count (4 bytes)`
-- 每个索引: `index_type (UTF) + start_pos (4 bytes, 含 head offset) + length (4 bytes)`
-- `redundant length` (4 bytes): 预留扩展字段，当前为 0
-
-**为什么 start_pos 需要加上 headLength**: Body 数据紧跟在 Header 之后。`start_pos` 在 Body 构建时是相对于 Body 起始的偏移，写入 Header 时需要加上 `headLength` 转换为文件绝对偏移。这使得 Reader 可以直接 `seek(start_pos)` 读取索引数据。
-
-**EMPTY_INDEX_FLAG (-1)**: 如果某个索引的数据为 null（写入器返回 null 字节数组），其 `start_pos` 被设为 `-1`，Reader 遇到此标记返回 `EmptyFileIndexReader.INSTANCE`。
-
-### 7.4 FileIndexWriter 写入接口
-
-源码路径: `paimon-common/src/main/java/org/apache/paimon/fileindex/FileIndexWriter.java` (L22-L39)
-
-```java
-public abstract class FileIndexWriter {
-    private boolean empty = true;
-    
-    public void writeRecord(Object key) {
-        empty = false;
-        write(key);
-    }
-    
-    public abstract void write(Object key);        // 子类实现：写入一个值
-    public abstract byte[] serializedBytes();       // 子类实现：序列化为字节数组
-    
-    public boolean empty() { return empty; }
-}
-```
-
-**为什么需要 `empty` 标记**: 如果一列的所有值都是 null，索引可能不需要序列化。`writeRecord` 方法在调用 `write` 前设置 `empty = false`，上层可以通过 `empty()` 判断是否需要序列化。
-
-### 7.5 FileIndexReader 读取接口
-
-源码路径: `paimon-common/src/main/java/org/apache/paimon/fileindex/FileIndexReader.java` (L34-L148)
-
-`FileIndexReader` 是抽象类，实现了 `FunctionVisitor<FileIndexResult>` 接口。所有 visit 方法的默认返回值都是 `REMAIN`（即"不过滤"），子类只需覆盖支持的操作:
-
-```java
-public abstract class FileIndexReader implements FunctionVisitor<FileIndexResult> {
-    // 默认实现: 所有操作都返回 REMAIN (保留)
-    public FileIndexResult visitEqual(FieldRef fieldRef, Object literal) { return REMAIN; }
-    public FileIndexResult visitLessThan(FieldRef fieldRef, Object literal) { return REMAIN; }
-    public FileIndexResult visitIn(FieldRef fieldRef, List<Object> literals) {
-        // 默认: 对每个 literal 调用 visitEqual，结果做 OR
-        FileIndexResult result = null;
-        for (Object key : literals) {
-            result = result == null ? visitEqual(fieldRef, key) : result.or(visitEqual(fieldRef, key));
-        }
-        return result;
-    }
-    // ... 其他操作同理
-}
-```
-
-**为什么默认返回 REMAIN 而非 SKIP**: 安全性考虑。如果某种索引不支持某个操作（如 Bloom Filter 不支持范围查询），返回 REMAIN 意味着"不确定，保留该文件"。这是一种**保守策略**，避免错误过滤导致数据丢失。
-
----
-
-## 8. Bloom Filter 索引
-
-### 解决什么问题
-
-**核心业务问题**: 点查询 (`WHERE id = 'xxx'`) 需要扫描所有文件才能确定数据是否存在。如何用最小的空间开销快速判断"某个值一定不在文件中"?
-
-**没有 Bloom Filter 的后果**:
-```sql
--- 查询: 在 10000 个文件中找 order_id = 'ORDER-12345'
-SELECT * FROM orders WHERE order_id = 'ORDER-12345';
-
--- 没有 Bloom Filter: 打开 10000 个文件,读取元数据
--- 有 Bloom Filter: 
---   - 9999 个文件的 Bloom Filter 返回 "一定不存在" -> 跳过
---   - 1 个文件返回 "可能存在" -> 读取
--- 节省 99.99% 的文件打开开销
-```
-
-**实际场景**:
-- 订单查询: `WHERE order_id = 'xxx'`
-- 用户查询: `WHERE user_id = 12345`
-- 日志查询: `WHERE trace_id = 'xxx'`
-
-### 有什么坑
-
-**1. items 参数设置不当**
-```sql
--- 错误: items 远小于实际不同值数量
-CREATE TABLE t (...) WITH (
-  'file-index.bloom-filter.columns' = 'user_id',
-  'file-index.bloom-filter.user_id.items' = '10000'  -- 实际有 100 万个不同用户
-);
--- 后果: 误判率飙升到 50%+,索引失效
-```
-
-**正确设置**:
-```sql
--- 估算每个文件的不同值数量
-SELECT COUNT(DISTINCT user_id) / COUNT(DISTINCT file_name) 
-FROM table_metadata;
-
--- 设置 items 为估算值的 1.2 倍
-'file-index.bloom-filter.user_id.items' = '120000'
-```
-
-**2. fpp 设置过小**
-```sql
--- 错误: 追求极低误判率
-'file-index.bloom-filter.user_id.fpp' = '0.0001'  -- 0.01%
--- 后果: Bloom Filter 占用 10MB,索引文件过大
-```
-
-**权衡**: fpp = 0.01 (1%) 通常是最佳平衡点
-
-**3. 对不支持的类型使用 Bloom Filter**
-```sql
--- 错误: DECIMAL 类型不支持
-CREATE TABLE t (amount DECIMAL(10,2)) WITH (
-  'file-index.bloom-filter.columns' = 'amount'
-);
--- 结果: 运行时抛出 UnsupportedOperationException
-```
-
-**支持的类型**: 整数、字符串、二进制、日期时间
-
-**4. 生产环境注意事项**
-- Bloom Filter 只能加速等值查询,范围查询无效
-- `IN` 查询会转换为多个 `EQUAL` 的 OR
-- 监控误判率: `bloom_filter_false_positive_rate`
-
-### 核心概念解释
-
-**Bloom Filter (布隆过滤器)**
-- 概率型数据结构,用于判断元素是否在集合中
-- 可能误判 (False Positive): 说"存在"但实际不存在
-- 不会漏判 (No False Negative): 说"不存在"就一定不存在
-
-**工作原理**
-```
-1. 初始化: 创建 m 位的 BitSet,全部置 0
-2. 插入: 对值计算 k 个哈希,将对应位置 1
-3. 查询: 对值计算 k 个哈希,检查对应位是否全为 1
-```
-
-**参数关系**
-```
-m = -n * ln(p) / (ln(2))^2  (位数组大小)
-k = m/n * ln(2)              (哈希函数个数)
-
-n = items (预期元素数)
-p = fpp (误判率)
-```
-
-**示例**:
-```
-items = 1,000,000
-fpp = 0.01
--> m = 9,585,059 bits ≈ 1.14 MB
--> k = 7 个哈希函数
-```
-
-**与其他索引对比**
-| 索引类型 | 空间复杂度 | 查询复杂度 | 支持操作 |
-|---------|-----------|-----------|---------|
-| Bloom Filter | O(n) | O(k) | EQUAL, IN |
-| Bitmap | O(n * cardinality) | O(1) | EQUAL, IN, NOT |
-| BSI | O(n * bits) | O(bits) | EQUAL, 范围 |
-
-### 设计理念
-
-**为什么选择 xxHash**
-- 速度: xxHash 是最快的非加密哈希之一 (10+ GB/s)
-- 质量: 哈希分布均匀,碰撞率低
-- 对比: MurmurHash (慢 20%), CRC32 (质量差)
-
-**为什么整数用 Thomas Wang 哈希**
-```java
-// Thomas Wang 的整数哈希 (位混洗)
-long hash(long key) {
-    key = (~key) + (key << 21);
-    key = key ^ (key >>> 24);
-    key = (key + (key << 3)) + (key << 8);
-    key = key ^ (key >>> 14);
-    key = (key + (key << 2)) + (key << 4);
-    key = key ^ (key >>> 28);
-    key = key + (key << 31);
-    return key;
-}
-```
-- 无需序列化为字节数组
-- 6 次位运算,比 xxHash 快 3 倍
-- 专为整数优化,分布性极好
-
-**为什么不支持范围查询**
-- Bloom Filter 通过哈希打散值的顺序
-- 无法判断"是否存在大于 X 的值"
-- 范围查询需要 BSI 或 Range Bitmap
-
-**权衡取舍**
-- **优势**: 空间效率极高,查询速度快
-- **劣势**: 有误判,不支持删除
-- **适用场景**: 高基数列的点查询
-
-**参数调优建议**
-```sql
--- 低基数列 (< 1000): 用 Bitmap 代替
-'file-index.bitmap.columns' = 'status'
-
--- 中基数列 (1000-100万): Bloom Filter
-'file-index.bloom-filter.columns' = 'user_id'
-'file-index.bloom-filter.user_id.items' = '50000'
-'file-index.bloom-filter.user_id.fpp' = '0.01'
-
--- 高基数列 (> 100万): 增大 items,接受更大的索引文件
-'file-index.bloom-filter.user_id.items' = '2000000'
-```
-
-### 8.1 BloomFilterFileIndex 实现
-
-源码路径: `paimon-common/src/main/java/org/apache/paimon/fileindex/bloomfilter/BloomFilterFileIndex.java` (L48-L136)
-
-```java
-public class BloomFilterFileIndex implements FileIndexer {
-    private static final int DEFAULT_ITEMS = 1_000_000;    // 默认预期元素数
-    private static final double DEFAULT_FPP = 0.1;         // 默认误判率 10%
-    
-    private final DataType dataType;
-    private final int items;
-    private final double fpp;
-}
-```
-
-**Writer** (L83-L112):
-```java
-private static class Writer extends FileIndexWriter {
-    private final BloomFilter64 filter;
-    private final FastHash hashFunction;
-    
-    public Writer(DataType type, int items, double fpp) {
-        this.filter = new BloomFilter64(items, fpp);        // 根据预期数量和误判率初始化
-        this.hashFunction = FastHash.getHashFunction(type);  // 按类型获取哈希函数
-    }
-    
-    public void write(Object key) {
-        if (key != null) {
-            filter.addHash(hashFunction.hash(key));    // null 值不加入 BloomFilter
-        }
-    }
-    
-    public byte[] serializedBytes() {
-        // [4字节 numHashFunctions][BitSet 字节数组]
-        int numHashFunctions = filter.getNumHashFunctions();
-        byte[] serialized = new byte[filter.getBitSet().bitSize() / 8 + 4];
-        // Big-Endian 写入 numHashFunctions
-        serialized[0] = (byte) ((numHashFunctions >>> 24) & 0xFF);
-        // ... 
-        filter.getBitSet().toByteArray(serialized, 4, serialized.length - 4);
-        return serialized;
-    }
-}
-```
-
-**Reader** (L114-L135):
-```java
-private static class Reader extends FileIndexReader {
-    private final BloomFilter64 filter;
-    private final FastHash hashFunction;
-    
-    public FileIndexResult visitEqual(FieldRef fieldRef, Object key) {
-        return key == null || filter.testHash(hashFunction.hash(key)) ? REMAIN : SKIP;
-    }
-    // 注意: 只覆盖了 visitEqual，其他操作使用父类默认的 REMAIN
-}
-```
-
-### 8.2 BloomFilter64 底层结构
-
-BloomFilter64 是一个 64 位哈希的 Bloom Filter 实现:
-- 使用 `BitSet` 存储位数组
-- 根据 `items` 和 `fpp` 自动计算最优的位数组大小和哈希函数个数
-- 使用 `numHashFunctions` 个哈希函数，每个哈希值通过对 bitSize 取模来确定位位置
-
-### 8.3 FastHash 哈希策略
-
-源码路径: `paimon-common/src/main/java/org/apache/paimon/fileindex/bloomfilter/FastHash.java` (L52-L217)
-
-```java
-public interface FastHash {
-    long hash(Object o);
-    
-    static FastHash getHashFunction(DataType type) {
-        return type.accept(FastHashVisitor.INSTANCE);
-    }
-}
-```
-
-`FastHashVisitor` 为不同数据类型提供不同的哈希策略:
-
-| 数据类型 | 哈希方式 |
-|---------|---------|
-| `CHAR/VARCHAR` | `LongHashFunction.xx().hashBytes(bytes)` (xxHash) |
-| `BINARY/VARBINARY` | `LongHashFunction.xx().hashBytes(bytes)` (xxHash) |
-| `TINYINT/SMALLINT/INT/BIGINT` | Thomas Wang 的整数哈希函数 |
-| `FLOAT` | `getLongHash(Float.floatToIntBits(value))` |
-| `DOUBLE` | `getLongHash(Double.doubleToLongBits(value))` |
-| `DATE/TIME` | 作为 int 用 Thomas Wang 哈希 |
-| `TIMESTAMP` | precision <= 3 用毫秒，否则用微秒 |
-| `BOOLEAN/DECIMAL/ARRAY/MAP/ROW` | **不支持**，抛出 `UnsupportedOperationException` |
-
-**为什么字符串用 xxHash 而数值用 Thomas Wang 哈希**: xxHash 是一种高性能的通用哈希函数，适合字节数组。Thomas Wang 的整数哈希 (L202-L211) 是一种位混洗（bit-mixing）算法，对整数值有更好的分布性且无需序列化为字节数组，性能更高。
-
-### 8.4 序列化格式
-
-```
-+----------------------------+----------------------------+
-| numHashFunctions (4 bytes) | BitSet 数据 (变长)          |
-| Big-Endian int             |                            |
-+----------------------------+----------------------------+
-```
-
-### 8.5 仅支持 Equal 的设计决策
-
-Bloom Filter Reader **仅覆盖了 `visitEqual`**，其他操作（`visitLessThan`, `visitGreaterThan` 等）使用父类默认的 `REMAIN`。
-
-**为什么 Bloom Filter 不支持范围查询**: Bloom Filter 的数学原理决定了它只能回答"某个元素可能存在"或"一定不存在"的问题，无法回答"是否存在大于 X 的元素"。范围查询需要值的有序性信息，而 Bloom Filter 通过哈希打散了值的顺序。
-
-**但 `visitIn` 可以工作**: 因为 `IN` 等价于多个 `EQUAL` 的 OR。父类 `FileIndexReader` 的 `visitIn` 默认实现就是对每个值调用 `visitEqual` 后做 OR 运算 (L97-L106)。
-
-### 8.6 参数调优 (items/fpp)
-
-| 参数 | 默认值 | 含义 |
-|------|--------|------|
-| `items` | 1,000,000 | 预期的不同值数量 |
-| `fpp` | 0.1 (10%) | 误判率 (False Positive Probability) |
-
-配置方式:
-```sql
-CREATE TABLE t (...) WITH (
-  'file-index.bloom-filter.columns' = 'col1',
-  'file-index.bloom-filter.col1.items' = '500000',
-  'file-index.bloom-filter.col1.fpp' = '0.01'
-);
-```
-
-**调优建议**:
-- `items` 应接近每个文件中该列的不同值数量。过大浪费空间，过小增加误判率
-- `fpp` 越小精度越高，但 BitSet 占用空间越大。`0.01` (1%) 是常用的平衡点
-- Bloom Filter 的空间公式: `bits = -items * ln(fpp) / (ln(2))^2`
-
----
-
-## 9. Bitmap 倒排索引
-
-### 解决什么问题
-
-**核心业务问题**: 低基数列 (如性别、状态、城市) 的查询需要精确到行级过滤,而 Bloom Filter 只能做文件级判断。如何用最小的空间记录"哪些行包含某个值"?
-
-**没有 Bitmap 索引的后果**:
-```sql
--- 查询: 找出所有状态为 'active' 的用户
-SELECT * FROM users WHERE status = 'active';
-
--- 没有 Bitmap: 
---   - Bloom Filter 说 "可能存在" -> 读取整个文件 (100MB)
---   - 实际只有 10% 的行是 'active' -> 浪费 90MB I/O
-
--- 有 Bitmap:
---   - 索引返回 RoaringBitmap {0, 5, 7, 12, ...} (匹配的行号)
---   - 只读取这些行,跳过其他 90% 的数据
-```
-
-**实际场景**:
-- 状态过滤: `WHERE status IN ('active', 'pending')`
-- 地域过滤: `WHERE city = 'Beijing'`
-- 分类过滤: `WHERE category = 'electronics'`
-
-### 有什么坑
-
-**1. 高基数列使用 Bitmap**
-```sql
--- 错误: user_id 有 1000 万个不同值
-CREATE TABLE t (...) WITH (
-  'file-index.bitmap.columns' = 'user_id'
-);
--- 后果: 
---   - 索引文件 > 1GB (每个值一个 Bitmap)
---   - 内存溢出 (Writer 需要缓存所有 Bitmap)
-```
-
-**基数阈值**: 建议 cardinality < 10000
-
-**2. V1/V2 版本选择不当**
-```sql
--- 场景: 列有 5000 个不同值
-'file-index.bitmap.columns' = 'city'
--- 默认使用 V1,查找一个值需要遍历 5000 个字典条目
-
--- 优化: 启用 V2 二级索引
-'file-index.bitmap.city.index-block-size' = '16KB'
--- 查找复杂度从 O(n) 降到 O(log n)
-```
-
-**3. 单值优化未生效**
-```java
-// 错误: 手动创建 Bitmap
-RoaringBitmap32 bitmap = new RoaringBitmap32();
-bitmap.add(position);
-bitmaps.put(value, bitmap);  // 浪费空间
-
-// 正确: 让 BitmapFileIndex 自动优化
-// 单值会被编码为 offset = -1 - rowNumber
-```
-
-**4. 生产环境注意事项**
-- Bitmap 索引适合 OLAP,不适合高频更新
-- 监控索引大小: `bitmap_index_size / data_file_size` 应 < 10%
-- 如果比例过高,考虑换用 Bloom Filter
-
-### 核心概念解释
-
-**倒排索引 (Inverted Index)**
-```
-正排: 行号 -> 值
-  Row 0: "Beijing"
-  Row 1: "Shanghai"
-  Row 2: "Beijing"
-
-倒排: 值 -> 行号集合
-  "Beijing": {0, 2}
-  "Shanghai": {1}
-```
-
-**RoaringBitmap32**
-- 压缩的位图实现
-- 对稀疏和密集数据都有极致压缩
-- 支持快速的位运算 (AND, OR, NOT)
-
-**V1 vs V2 格式**
-| 维度 | V1 | V2 |
-|------|----|----|
-| 字典结构 | 扁平数组 | 分块 + 二级索引 |
-| 查找复杂度 | O(n) | O(log n) |
-| 适用基数 | < 1000 | 1000-10000 |
-| 空间开销 | 低 | 略高 (索引块) |
-
-**单值优化**
-```
-普通值: offset = 文件中的位置, 需要读取 Bitmap
-单值:   offset = -1 - rowNumber, 直接解码
-```
-
-**与其他索引对比**
-| 索引类型 | 文件级过滤 | 行级过滤 | 空间复杂度 |
-|---------|-----------|---------|-----------|
-| Bloom Filter | 是 | 否 | O(n) |
-| Bitmap | 是 | 是 | O(n * cardinality) |
-| BSI | 是 | 是 | O(n * bits) |
-
-### 设计理念
-
-**为什么采用倒排索引**
-1. **精确过滤**: 直接返回匹配的行号,无误判
-2. **支持复杂查询**: IN, NOT IN, IS NULL 都能高效处理
-3. **行级下推**: 配合 `ApplyBitmapIndexRecordReader` 跳过无关行
-
-**为什么需要 V2 格式**
-```
-V1 查找流程:
-  遍历 5000 个字典条目 -> 找到匹配值 -> 读取 Bitmap
-
-V2 查找流程:
-  二分查找 Index Block (log 50) -> 二分查找 Block 内部 (log 100) -> 读取 Bitmap
-  总复杂度: O(log 5000) ≈ 12 次比较
-```
-
-**为什么支持行级下推**
-```java
-// 文件有 100 万行,只有 1000 行匹配
-RoaringBitmap32 bitmap = {5, 100, 205, ...};  // 1000 个行号
-
-// 读取时:
-while (position < 1_000_000) {
-    if (position > bitmap.last()) break;  // 提前终止
-    if (bitmap.contains(position)) {
-        return row;  // 只返回匹配行
-    }
-}
-```
-节省 99.9% 的行解析开销。
-
-**权衡取舍**
-- **优势**: 精确到行,无误判,支持复杂查询
-- **劣势**: 空间开销大,不适合高基数列
-- **适用场景**: 低基数列 (< 10000) 的等值和 IN 查询
-
-**架构演进**
-```
-Phase 1: V1 扁平字典
-  -> 简单,但高基数时查找慢
-
-Phase 2: V2 二级索引
-  -> 查找快,但实现复杂
-
-Phase 3: 单值优化
-  -> 节省空间,提升性能
-```
-
-**参数调优建议**
-```sql
--- 低基数列 (< 100): 默认 V1
-'file-index.bitmap.columns' = 'status'
-
--- 中基数列 (100-1000): V1 + 单值优化
-'file-index.bitmap.columns' = 'city'
-
--- 高基数列 (1000-10000): V2 + 二级索引
-'file-index.bitmap.columns' = 'product_category'
-'file-index.bitmap.product_category.index-block-size' = '16KB'
-
--- 超高基数 (> 10000): 改用 Bloom Filter
-'file-index.bloom-filter.columns' = 'user_id'
-```
-
-### 9.1 BitmapFileIndex 核心思想
-
-源码路径: `paimon-common/src/main/java/org/apache/paimon/fileindex/bitmap/BitmapFileIndex.java` (L49-L389)
-
-为每个不同的字段值维护一个 RoaringBitmap32，记录包含该值的行号集合:
-
-```
-字段 "city" (值 -> 包含该值的行号):
-  "Beijing"  -> RoaringBitmap32 {0, 3, 7, 12}
-  "Shanghai" -> RoaringBitmap32 {1, 4, 8}
-  "Shenzhen" -> RoaringBitmap32 {2, 5, 9, 10, 11}
-  null       -> RoaringBitmap32 {6}
-```
-
-**Writer 核心逻辑** (L80-L191):
-```java
-private static class Writer extends FileIndexWriter {
-    private final int version;
-    private final Map<Object, RoaringBitmap32> id2bitmap = new HashMap<>();
-    private final RoaringBitmap32 nullBitmap = new RoaringBitmap32();
-    private int rowNumber;
-    
-    public void write(Object key) {
-        if (key == null) {
-            nullBitmap.add(rowNumber++);
-        } else {
-            id2bitmap.computeIfAbsent(valueMapper.apply(key), k -> new RoaringBitmap32())
-                    .add(rowNumber++);
-        }
-    }
-}
-```
-
-**为什么需要 `valueMapper`**: 某些数据类型（如 `Timestamp`）的内部表示不适合直接作为 HashMap 的 key。`getValueMapper()` (L316-L388) 将 Timestamp 转换为 Long 值（毫秒或微秒），BinaryString 做深拷贝（避免对象复用导致的 key 冲突）。
-
-### 9.2 V1 格式 (BitmapFileIndexMeta)
-
-源码路径: `paimon-common/src/main/java/org/apache/paimon/fileindex/bitmap/BitmapFileIndexMeta.java` (L74-L360)
-
-```
-Bitmap File Index V1:
-+-------------------------------------------------+
-| version (1 byte) = 1                           |
-+-------------------------------------------------+
-| row count (4 bytes int)                         |
-+-------------------------------------------------+
-| non-null value bitmap number (4 bytes int)      |
-+-------------------------------------------------+
-| has null value (1 byte)                         |
-+-------------------------------------------------+
-| null value offset (4 bytes, 仅 hasNull 时存在)   |    HEAD
-+-------------------------------------------------+
-| value 1 | offset 1                              |
-+-------------------------------------------------+
-| value 2 | offset 2                              |
-+-------------------------------------------------+
-| ...                                             |
-+-------------------------------------------------+-----------
-| serialized bitmap 1                             |
-+-------------------------------------------------+
-| serialized bitmap 2                             |    BODY
-+-------------------------------------------------+
-| ...                                             |
-+-------------------------------------------------+
-```
-
-**offset 的特殊编码**: 当一个值只出现在一行时 (cardinality == 1)，offset 被编码为 `-1 - rowNumber`。这样读取时不需要读取序列化的 Bitmap，直接从 offset 中解码出行号。
-
-### 9.3 V2 格式 (BitmapFileIndexMetaV2) 二级索引优化
-
-源码路径: `paimon-common/src/main/java/org/apache/paimon/fileindex/bitmap/BitmapFileIndexMetaV2.java` (L100-L409)
-
-**设计动机**: 当列的基数（cardinality）很高时，V1 格式需要在读取时遍历整个字典来查找目标值。V2 在字典上建立**二级索引块**（Index Blocks），支持二分查找，显著减少读取开销。
-
-```
-Bitmap File Index V2:
-+-------------------------------------------------+
-| version (1 byte) = 2                           |
-+-------------------------------------------------+
-| row count | non-null number | has null         |
-+-------------------------------------------------+
-| null offset | null bitmap length               |    HEAD
-+-------------------------------------------------+
-| bitmap index block number (4 bytes)             |
-+-------------------------------------------------+
-| block key 1 | block offset 1                   |  (二级索引入口)
-| block key 2 | block offset 2                   |
-| ...                                             |
-+-------------------------------------------------+
-| bitmap body offset (4 bytes)                    |
-+-------------------------------------------------+-----------
-| Index Block 1:                                  |
-|   entry number | value | offset | length | ...  |  INDEX BLOCKS
-| Index Block 2:                                  |
-|   entry number | value | offset | length | ...  |
-| ...                                             |
-+-------------------------------------------------+-----------
-| serialized bitmap 1                             |
-| serialized bitmap 2                             |  BITMAP BLOCKS
-| ...                                             |
-+-------------------------------------------------+
-```
-
-**查找流程**:
-1. 在 HEAD 中的二级索引入口做二分查找，定位到 `BitmapIndexBlock`
-2. 在 `BitmapIndexBlock` 内部做二分查找，定位到具体的 bitmap entry
-3. 按 offset + length 读取 bitmap 数据
-
-```java
-public Entry findEntry(Object bitmapId) {
-    BitmapIndexBlock block = findBlock(bitmapId);     // 二分查找定位 Block
-    if (block != null) {
-        return block.findEntry(bitmapId);             // Block 内部二分查找
-    }
-    return null;
-}
-```
-
-**Block 大小限制**: 通过 `index-block-size` 参数控制（默认 16KB），确保每个 Block 不会太大。
-
-**为什么 V2 比 V1 更快**: V1 查找一个值需要遍历所有字典条目 O(n)，V2 通过二级索引将复杂度降低到 O(log(n/block_size))。对于百万级基数的列，差异非常显著。
-
-### 9.4 支持的谓词类型
-
-| 谓词 | 支持 | 返回类型 |
-|------|------|---------|
-| `Equal` | 是 | `BitmapIndexResult` |
-| `NotEqual` | 是 | `BitmapIndexResult` (通过 flip 实现) |
-| `In` | 是 | `BitmapIndexResult` (多个 bitmap 的 OR) |
-| `NotIn` | 是 | `BitmapIndexResult` (In 结果 flip) |
-| `IsNull` | 是 | `BitmapIndexResult` (null bitmap) |
-| `IsNotNull` | 是 | `BitmapIndexResult` (null bitmap flip) |
-| `LessThan/GreaterThan` 等 | 否 | 默认 `REMAIN` |
-
-### 9.5 单值优化
-
-当某个值只出现在一行时:
-```java
-if (v.getCardinality() == 1) {
-    bitmapOffsets.put(k, -1 - v.iterator().next());  // 编码: offset = -1 - rowNumber
-}
-```
-
-读取时:
-```java
-int offset = entry.offset;
-if (offset < 0) {
-    return RoaringBitmap32.bitmapOf(-1 - offset);    // 解码: rowNumber = -1 - offset
-}
-```
-
-**为什么需要这个优化**: 对于高基数列（如 ID 列），大量值只出现一次。为每个值存储完整的 Bitmap 序列化数据非常浪费空间。单值优化将 Bitmap 压缩为一个 int 值（行号），节省了大量存储空间。
-
-### 9.6 ApplyBitmapIndexRecordReader 行级下推
-
-源码路径:
-- `paimon-common/.../fileindex/bitmap/ApplyBitmapIndexRecordReader.java` (L31-L58)
-- `paimon-common/.../fileindex/bitmap/ApplyBitmapIndexFileRecordIterator.java` (L33-L78)
-
-Bitmap 索引不仅可以做文件级过滤（SKIP/REMAIN），还可以做**行级过滤**:
-
-```java
-public class ApplyBitmapIndexFileRecordIterator implements FileRecordIterator<InternalRow> {
-    private final FileRecordIterator<InternalRow> iterator;
-    private final RoaringBitmap32 bitmap;   // 匹配行号集合
-    private final int last;                 // bitmap 中的最大行号
-    
-    public InternalRow next() throws IOException {
-        while (true) {
-            InternalRow next = iterator.next();
-            if (next == null) return null;
-            int position = (int) returnedPosition();
-            if (position > last) return null;          // 超过最大匹配行号，提前终止
-            if (bitmap.contains(position)) return next; // 在匹配集合中
-        }
-    }
-}
-```
-
-**关键优化 `position > last`**: 当读取位置超过 Bitmap 中的最大行号时，后续不可能有匹配行，直接返回 null 终止读取。这避免了读取文件末尾的大量无用数据。
-
-**为什么 Bitmap 索引可以做行级下推而 Bloom Filter 不行**: Bloom Filter 只能判断"值可能存在于文件中"，无法告诉你具体在哪些行。Bitmap 索引直接记录了匹配值对应的行号集合，因此可以精确到行级过滤。
-
----
-
-## 10. BSI (Bit-Sliced Index)
-
-### 解决什么问题
-
-**核心业务问题**: 数值列的范围查询 (`WHERE age BETWEEN 20 AND 30`) 无法用 Bloom Filter 或 Bitmap 高效处理。如何用 O(bits) 的复杂度完成范围查询,而不是 O(cardinality)?
-
-**没有 BSI 的后果**:
-```sql
--- 查询: 找出年龄在 25-35 岁的用户
-SELECT * FROM users WHERE age BETWEEN 25 AND 35;
-
--- 使用 Bitmap 倒排:
---   - 需要为每个年龄值 (25, 26, 27, ..., 35) 查找 Bitmap
---   - 11 次 Bitmap 查找 + 11 次 OR 运算
---   - 如果范围是 1-100,需要 100 次操作
-
--- 使用 BSI:
---   - 对 6 个位切片做固定次数的位运算
---   - 复杂度 O(log2(100)) = 7 次运算
---   - 范围越大,优势越明显
-```
-
-**实际场景**:
-- 年龄范围: `WHERE age BETWEEN 20 AND 30`
-- 价格范围: `WHERE price >= 100 AND price <= 500`
-- 时间范围: `WHERE timestamp > '2024-01-01'`
-- 评分过滤: `WHERE score >= 4.0`
-
-### 有什么坑
-
-**1. 对非数值类型使用 BSI**
-```sql
--- 错误: 字符串类型不支持
-CREATE TABLE t (name STRING) WITH (
-  'file-index.bsi.columns' = 'name'
-);
--- 结果: 运行时抛出 UnsupportedOperationException
-```
-
-**支持的类型**: TINYINT, SMALLINT, INT, BIGINT, DATE, TIME, TIMESTAMP, DECIMAL
-
-**2. 负数查询语义混淆**
-```sql
--- 查询: temperature < -5
--- 错误理解: 在负数 BSI 中查找 < 5
--- 正确理解: 在负数 BSI 中查找 |x| > 5
-
--- 内部转换:
-x < -5  -> |x| > 5  (负数域)
-x >= -5 -> |x| <= 5 OR 所有正数
-```
-
-**3. DECIMAL 精度丢失**
-```sql
--- DECIMAL(10, 2) 被转换为 unscaledLong
--- 12.34 -> 1234
--- 如果超过 Long.MAX_VALUE,会溢出
-CREATE TABLE t (amount DECIMAL(20, 2)) WITH (
-  'file-index.bsi.columns' = 'amount'  -- 危险!
-);
-```
-
-**4. 生产环境注意事项**
-- BSI 写入时需要缓存所有值,内存开销大
-- 适合数值列,不适合高精度 DECIMAL
-- 监控 Writer 内存: `bsi_writer_memory_usage`
-
-### 核心概念解释
-
-**Bit-Sliced Index (位切片索引)**
-```
-将整数的每个二进制位拆开,为每个位维护一个 Bitmap
-
-示例: 4 行数据 [5, 3, 7, 2]
-  5 = 101
-  3 = 011
-  7 = 111
-  2 = 010
-
-Bit-0 (最低位): {0, 1, 2}  (值的 bit-0 为 1 的行)
-Bit-1:          {1, 2, 3}  (值的 bit-1 为 1 的行)
-Bit-2 (最高位): {0, 2}     (值的 bit-2 为 1 的行)
-```
-
-**范围查询算法**
-```
-查询: x > 5 (二进制 101)
-
-从高位到低位遍历:
-  Bit-2: 5 的 bit-2 = 1
-    -> 保留 bit-2 = 1 的行 {0, 2}
-  Bit-1: 5 的 bit-1 = 0
-    -> 加入 bit-1 = 1 的行 {0, 1, 2, 3}
-  Bit-0: 5 的 bit-0 = 1
-    -> 保留 bit-0 = 1 的行 {0, 1, 2}
-
-结果: {2} (只有行 2 的值 7 > 5)
-```
-
-**正负数分组**
-```
-正数 BSI: 存储非负整数
-负数 BSI: 存储负数的绝对值
-
-查询时根据条件分别在两个 BSI 上操作
-```
-
-**与其他索引对比**
-| 索引类型 | 范围查询复杂度 | 空间复杂度 | 支持类型 |
-|---------|--------------|-----------|---------|
-| Bitmap | O(cardinality) | O(n * cardinality) | 任意 |
-| BSI | O(bits) | O(n * bits) | 数值 |
-| Range Bitmap | O(bits) | O(n * bits + dict) | 任意 |
-
-### 设计理念
-
-**为什么采用位切片**
-1. **范围查询优化**: O(bits) 复杂度,与值域大小无关
-2. **空间效率**: 对于 64 位整数,只需 64 个 Bitmap
-3. **通用性**: 支持所有比较操作 (=, <, >, <=, >=, BETWEEN)
-
-**为什么需要正负数分组**
-```
-问题: BSI 只能处理非负整数
-
-解决: 
-  - 正数直接存储
-  - 负数取绝对值存储到独立的 BSI
-  
-查询转换:
-  x < -3  -> 负数域中 |x| > 3
-  x >= -3 -> 负数域中 |x| <= 3 OR 所有正数
-```
-
-**为什么比 Bitmap 倒排快**
-```
-Bitmap 倒排:
-  age BETWEEN 20 AND 30
-  -> 查找 11 个值的 Bitmap
-  -> 11 次 Bitmap OR 运算
-  -> 复杂度 O(11)
-
-BSI:
-  age BETWEEN 20 AND 30
-  -> gte(20) AND lte(30)
-  -> 2 * O(log2(100)) = 14 次位运算
-  -> 复杂度 O(bits)
-  
-当范围很大时 (如 1-1000),BSI 优势明显
-```
-
-**权衡取舍**
-- **优势**: 范围查询快,空间效率高
-- **劣势**: 只支持数值类型,写入需要缓存所有值
-- **适用场景**: 数值列的范围查询
-
-**架构演进**
-```
-Phase 1: Bitmap 倒排 (支持等值查询)
-  -> 范围查询慢
-
-Phase 2: BSI (支持高效范围查询)
-  -> 只支持数值
-
-Phase 3: Range Bitmap (BSI + 字典编码)
-  -> 支持任意类型的范围查询
-```
-
-**参数调优建议**
-```sql
--- 整数列的范围查询: BSI
-'file-index.bsi.columns' = 'age,price,score'
-
--- 时间戳列: BSI (转换为 long)
-'file-index.bsi.columns' = 'created_at'
-
--- 高精度 DECIMAL: 避免使用 BSI
--- 改用 Range Bitmap
-'file-index.range-bitmap.columns' = 'amount'
-
--- 字符串范围查询: Range Bitmap
-'file-index.range-bitmap.columns' = 'name'
-```
-
-**性能对比**
-```
-场景: 1000 万行,age 列范围 0-100
-
-查询: age BETWEEN 20 AND 30
-
-Bitmap 倒排:
-  - 11 次 Bitmap 查找
-  - 11 次 OR 运算
-  - 耗时: ~50ms
-
-BSI:
-  - 2 次范围查询 (gte + lte)
-  - 1 次 AND 运算
-  - 耗时: ~10ms
-
-加速比: 5x
-```
-
-### 10.1 BitSliceIndexBitmapFileIndex 核心原理
-
-源码路径: `paimon-common/src/main/java/org/apache/paimon/fileindex/bsi/BitSliceIndexBitmapFileIndex.java` (L55-L412)
-
-BSI 将整数值的每个二进制位拆开，为每个位维护一个 RoaringBitmap32（称为 Slice）:
-
-```
-假设有 4 行数据，值分别为 5(101), 3(011), 7(111), 2(010):
-
-bit-0 (最低位): RoaringBitmap32 {0, 1, 2}    (值 5=1, 3=1, 7=1, 2=0)
-bit-1:          RoaringBitmap32 {1, 2, 3}    (值 5=0, 3=1, 7=1, 2=1)
-bit-2 (最高位): RoaringBitmap32 {0, 2}       (值 5=1, 3=0, 7=1, 2=0)
-```
-
-**为什么 BSI 比 Bitmap 倒排更适合范围查询**: Bitmap 倒排为每个值维护一个 Bitmap。范围查询 `age >= 5` 需要找到所有值 >= 5 的 Bitmap 并做 OR，开销与基数成正比。BSI 只需要对位切片做固定次数的位运算（次数 = 值的位数），时间复杂度 O(bits)。
-
-### 10.2 正负数分组策略
-
-BSI 将值分为正数组和负数组分别处理:
-
-```java
-// Writer 中的分组逻辑 (L115-L139)
-for (int i = 0; i < collector.values.size(); i++) {
-    Long value = collector.values.get(i);
-    if (value != null) {
-        if (value < 0) {
-            negative.append(i, Math.abs(value));   // 负数取绝对值存储
-        } else {
-            positive.append(i, value);
-        }
-    }
-}
-```
-
-**为什么要分组**: BSI 的底层 `BitSliceIndexRoaringBitmap` 只能处理非负整数。对负数取绝对值后存入独立的 BSI，查询时分别在正数和负数 BSI 上操作:
-
-```java
-// 查询 `x < value` 的逻辑 (L279-L289)
-public FileIndexResult visitLessThan(FieldRef fieldRef, Object literal) {
-    return new BitmapIndexResult(() -> {
-        Long value = valueMapper.apply(literal);
-        if (value < 0) {
-            return negative.gt(Math.abs(value));   // x < -3 等价于 |x| > 3 (负数域)
-        } else {
-            return RoaringBitmap32.or(positive.lt(value), negative.isNotNull());
-            // x < 5 等价于 (正数 < 5) OR (所有负数)
-        }
-    });
-}
-```
-
-**负数查询语义转换**:
-- `x < -3` -> 在负数域中 `|x| > 3`
-- `x >= -3` -> 在负数域中 `|x| <= 3` OR 所有正数
-- `x = -3` -> 在负数域中 `|x| = 3`
-
-### 10.3 范围查询 O(bits) 复杂度
-
-以 `gt(code)` (大于查询) 为例:
-
-```java
-// BitSliceIndexRoaringBitmap.gt 核心算法:
-public RoaringBitmap32 gt(long code) {
-    RoaringBitmap32 state = null;
-    int start = Long.numberOfTrailingZeros(~code); // 优化: 跳过末尾连续1位
-    
-    for (int i = start; i < slices.length; i++) {
-        if (state == null) {
-            state = getSlice(i).clone();
-            continue;
-        }
-        long bit = (code >> i) & 1;
-        if (bit == 1) {
-            state.and(getSlice(i));    // 该位为1: 保留该位也为1的行
-        } else {
-            state.or(getSlice(i));     // 该位为0: 加入该位为1的行
-        }
-    }
-    state.and(foundSet);  // 与有效行集合取交集
-    return state;
-}
-```
-
-**时间复杂度**: O(bits)，对于 long 类型最多 64 次 Bitmap 运算，与数据量和基数无关。
-
-### 10.4 值映射 (Value Mapper)
-
-```java
-public static Function<Object, Long> getValueMapper(DataType dataType) {
-    return dataType.accept(new DataTypeDefaultVisitor<>() {
-        // TinyInt/SmallInt/Int -> long
-        // BigInt -> 直接使用
-        // Date/Time -> int -> long
-        // Timestamp -> 毫秒或微秒 (取决于精度)
-        // Decimal -> unscaledLong
-    });
-}
-```
-
-### 10.5 支持的数据类型与谓词
-
-| 数据类型 | 映射方式 |
-|---------|---------|
-| `TINYINT/SMALLINT/INT/BIGINT` | 直接转 long |
-| `DATE/TIME` | 天数/毫秒数 转 long |
-| `TIMESTAMP` | 精度 <= 3 用毫秒, 否则微秒 |
-| `DECIMAL` | `unscaledLong` |
-| 字符串/浮点/复杂类型 | **不支持** |
-
-| 谓词 | 支持 | 说明 |
-|------|------|------|
-| `Equal/NotEqual` | 是 | 精确匹配 |
-| `In/NotIn` | 是 | 多值匹配 |
-| `LessThan/LessOrEqual` | 是 | 范围查询 |
-| `GreaterThan/GreaterOrEqual` | 是 | 范围查询 |
-| `Between` | 是 | `gte AND lte` |
-| `IsNull/IsNotNull` | 是 | 通过 EBM (Existence Bitmap) |
-
----
-
-## 11. Range Bitmap 索引
-
-### 11.1 RangeBitmapFileIndex 架构
-
-源码路径: `paimon-common/src/main/java/org/apache/paimon/fileindex/rangebitmap/RangeBitmapFileIndex.java` (L43-L185)
-
-Range Bitmap 是最复杂的索引类型，组合了三个核心组件:
-
-```
-RangeBitmap (核心)
-  |
-  +-- ChunkedDictionary (字典编码: 值 <-> 整数码)
-  |     |
-  |     +-- Chunk[] (分块存储)
-  |           |
-  |           +-- FixedLengthChunk / VariableLengthChunk
-  |
-  +-- BitSliceIndexBitmap (BSI: 整数码的位切片索引)
-        |
-        +-- RoaringBitmap32[] slices (位切片)
-        +-- RoaringBitmap32 ebm (Existence Bitmap)
-```
-
-**整体查询流程**:
-1. 将查询值通过 Dictionary 转换为整数码 (code)
-2. 在 BSI 上执行位切片运算，得到匹配的行号集合
-3. 返回 `BitmapIndexResult`
-
-**为什么要在 BSI 上加一层 Dictionary**: BSI 要求输入为非负整数。Range Bitmap 通过字典编码将任意类型（包括字符串、浮点数）映射为连续的非负整数，从而使 BSI 可以处理所有类型。字典按值排序，因此码值的大小关系与原始值一致，保证了范围查询的正确性。
-
-### 11.2 ChunkedDictionary 分块字典
-
-源码路径: `paimon-common/src/main/java/org/apache/paimon/fileindex/rangebitmap/dictionary/chunked/ChunkedDictionary.java` (L33-L277)
-
-字典采用分块存储策略:
-
-```
-ChunkedDictionary:
-  +-- Chunk[0]: key="apple",  code=0,  内含 keys: apple, banana, cherry
-  +-- Chunk[1]: key="date",   code=3,  内含 keys: date, elderberry, fig
-  +-- Chunk[2]: key="grape",  code=6,  内含 keys: grape, honey, ice
-```
-
-**二分查找流程 (`find` 方法, L75-L95)**:
-1. 先在 Chunk 数组上做二分查找，定位到目标 Chunk
-2. 在 Chunk 内部查找具体的码值
-3. 如果值不存在，返回 `-(insertion_point) - 1` (类似 `Arrays.binarySearch`)
-
-```java
-public int find(Object key) {
-    int low = 0, high = size - 1;
-    while (low <= high) {
-        int mid = (low + high) >>> 1;
-        Chunk found = get(mid);
-        int result = comparator.compare(found.key(), key);
-        if (result > 0) high = mid - 1;
-        else if (result < 0) low = mid + 1;
-        else return found.code();           // 精确匹配 Chunk 的 key
-    }
-    if (low == 0) return -(low + 1);        // 比最小值还小
-    return get(low - 1).find(key);           // 在前一个 Chunk 内查找
-}
-```
-
-**为什么使用分块而非扁平字典**: 分块字典支持**增量读取**。查找时只需要反序列化命中的 Chunk，不需要读取整个字典。对于大字典（百万级基数），这显著减少了 I/O 和内存开销。分块大小通过 `chunk-size` 参数控制。
-
-### 11.3 BitSliceIndexBitmap 内部 BSI
-
-源码路径: `paimon-common/src/main/java/org/apache/paimon/fileindex/rangebitmap/BitSliceIndexBitmap.java` (L35-L431)
-
-这是 Range Bitmap 专用的 BSI 实现（与 `paimon-common/.../bsi` 中的 BSI 不同），支持:
-- `eq(code)`: 等值查询
-- `gt(code)` / `gte(code)`: 大于/大于等于
-- `topK(k, foundSet, strict)`: 找 Top-K 最大值
-- `bottomK(k, foundSet, strict)`: 找 Top-K 最小值
-
-**延迟加载优化**: BSI 的 slices 数组在构造时不立即加载，而是在首次查询时才从文件中读取 (L287-L322)。`ebm` (Existence Bitmap) 也是延迟加载的 (L272-L285)。
-
-### 11.4 TopN 查询加速
-
-Range Bitmap 是唯一支持 TopN 查询的索引类型。`visitTopN` (L167-L183) 的实现:
-
-```java
-public FileIndexResult visitTopN(TopN topN, FileIndexResult result) {
-    RoaringBitmap32 foundSet = result instanceof BitmapIndexResult 
-            ? ((BitmapIndexResult) result).get() : null;
-    int limit = topN.limit();
-    SortValue sort = orders.get(0);
-    boolean strict = orders.size() == 1;
-    
-    if (ASCENDING.equals(sort.direction())) {
-        return new BitmapIndexResult(
-                () -> bitmap.bottomK(limit, nullOrdering, foundSet, strict));
-    } else {
-        return new BitmapIndexResult(
-                () -> bitmap.topK(limit, nullOrdering, foundSet, strict));
-    }
-}
-```
-
-**TopK 算法 (BitSliceIndexBitmap.topK, L165-L210)**:
-
-参考论文: *Bit-Sliced Index Arithmetic* (O'Neil & Quass, SIGMOD 1997) Algorithm 4.1
-
-```
-算法: 找 K 个最大值
-G = {} (guaranteed set, 一定在 top-K 中)
-E = isNotNull(foundSet) (eligible set, 候选集)
-
-从最高位到最低位遍历:
-  X = G OR (E AND slice[i])
-  if |X| > K:
-    E = E AND slice[i]      // 保留该位为 1 的行
-  else if |X| < K:
-    G = X                    // 确认 X 中的行
-    E = E AND NOT slice[i]   // 继续看更低位
-  else:
-    E = E AND slice[i]
-    break
-结果 = G OR E
-```
-
-**时间复杂度**: O(slices * bitmap_op)，其中 bitmap_op 是 Bitmap 位运算的复杂度。这比排序整个数据集 O(n*log(n)) 要高效得多。
-
-**NullOrdering 处理**: `fillNulls` 方法 (L303-L329) 处理 `NULLS FIRST` 和 `NULLS LAST` 语义:
-- `NULLS_LAST`: 先从非 null 值中找 top-K，不够再用 null 行补充
-- `NULLS_FIRST`: 先取所有 null 行，不够再从非 null 值中补充
-
-### 11.5 与 BSI 索引的差异
-
-| 维度 | BSI (bsi) | Range Bitmap (range-bitmap) |
-|------|-----------|---------------------------|
-| 数据类型 | 仅数值型 | 任意类型（通过字典编码） |
-| 负数处理 | 正/负分组，取绝对值 | 字典编码为非负整数 |
-| 存储结构 | BitSliceIndexRoaringBitmap | ChunkedDictionary + BitSliceIndexBitmap |
-| TopN 支持 | 不支持 | 支持 |
-| 内存开销 | Writer 需要缓存所有值 (StatsCollectList) | Writer 通过 TreeMap 排序 |
-| 适用场景 | 纯数值列的范围查询 | 任意类型的范围查询 + TopN |
-
----
-
-## 12. FileIndexResult 三态逻辑
-
-### 解决什么问题
-
-**核心业务问题**: 不同类型的索引返回不同精度的结果。Bloom Filter 只能说"可能存在",Bitmap 能精确到行号。如何统一这些不同精度的结果,并支持逻辑运算 (AND/OR)?
-
-**没有三态逻辑的后果**:
-```java
-// 错误: 用布尔值表示索引结果
-boolean bloomResult = bloomFilter.test(value);  // true = 可能存在
-boolean bitmapResult = bitmap.contains(value);  // true = 精确存在
-
-// 问题: 无法区分"可能存在"和"精确存在"
-// 无法表达"精确到哪些行"
-```
-
-**实际场景**:
-```sql
--- 查询: status = 'active' AND age > 25
--- Bloom Filter (status): REMAIN (可能存在)
--- BSI (age): BitmapIndexResult {1, 5, 7, 12} (精确行号)
--- 结果: BitmapIndexResult {1, 5, 7, 12} (保留精确结果)
-```
-
-### 有什么坑
-
-**1. REMAIN 的语义混淆**
-```java
-// 错误理解: REMAIN 表示"一定包含数据"
-if (result == REMAIN) {
-    // 认为文件一定有匹配数据
-}
-
-// 正确理解: REMAIN 表示"不确定,需要读取文件"
-if (result.remain()) {
-    // 可能有数据,也可能没有 (Bloom Filter 误判)
-}
-```
-
-**2. AND/OR 运算顺序错误**
-```java
-// 错误: 先计算 Bitmap,再 AND SKIP
-BitmapIndexResult bitmap = expensiveOperation();  // 耗时操作
-FileIndexResult result = bitmap.and(SKIP);  // SKIP,但 bitmap 已经计算了
-
-// 正确: 利用短路特性
-FileIndexResult result = SKIP.and(bitmap);  // 直接返回 SKIP,不计算 bitmap
-```
-
-**3. 延迟计算未生效**
-```java
-// 错误: 立即调用 get() 触发计算
-BitmapIndexResult result = new BitmapIndexResult(() -> expensiveBitmapOp());
-RoaringBitmap32 bitmap = result.get();  // 立即计算
-
-// 正确: 延迟到真正需要时
-BitmapIndexResult result = new BitmapIndexResult(() -> expensiveBitmapOp());
-if (result.remain()) {  // 只有 remain() 被调用时才计算
     // ...
 }
 ```
 
-**4. 生产环境注意事项**
-- 多个索引组合时,优先使用精度高的索引
-- 监控 REMAIN 比例: 过高说明索引失效
-- 监控 BitmapIndexResult 的计算次数
+**一句话**：DV 模式下 Level 0 文件必须经过一次 compaction rewrite 才会"落定"，rewrite 过程顺带 lookup 高层、生成 DV。这就是为什么 MOW 表 Level 0 在 compaction 前对读不可见。
 
-### 核心概念解释
+### 5.2 DV 与 LSM 各 level 的关系
 
-**三态逻辑**
-```
-REMAIN: "不确定,可能包含匹配数据"
-  - Bloom Filter 返回 true
-  - 索引不支持该操作
-  - 没有索引
+把上面拼起来，DV 与 level 的对应关系是理解 MOW 的核心：
 
-SKIP: "一定不包含匹配数据"
-  - Bloom Filter 返回 false
-  - Bitmap 返回空集合
-  - BSI 范围查询无匹配
+- **Level 0 文件**：刚 flush 出来、key 重叠、还没 DV。它们是"新写入的最新版本"，对读不可见，等待 compaction。
+- **更高 level 文件（L1..Ln）**：存量数据，可能被 Level 0 里同 key 的新版本顶替。DV 标记的就是**这些高层文件里被顶替的行**。
+- **compaction 时**：被 rewrite 的 Level 0 数据写进新文件（成为新的高层文件），同时为"被它们顶替的旧高层行"生成/更新 DV。
 
-BitmapIndexResult: "精确匹配这些行"
-  - Bitmap 返回行号集合
-  - BSI 返回行号集合
-```
+所以 DV 始终是"高层旧文件 + 它的失效行位图"。读取时，每个数据文件配它自己的 DV，逐文件顺序读、按行跳过——不再需要跨 level 归并。这正是 MOW 让 PK 表读取接近 Append 表的根因（详见 §6）。
 
-**布尔代数语义**
-```
-REMAIN 类似于 "全集" (Universal Set)
-SKIP 类似于 "空集" (Empty Set)
-BitmapIndexResult 类似于 "子集" (Subset)
+> Lookup 本身（`key → (fileName, rowPosition)` 的点查能力）由 `LookupLevels` + 状态后端（RocksDB / 内存）提供，是把列式文件转成本地 KV 索引的点查加速器。它的内部结构、远程 lookup 文件、RocksDB 调优等不在本文展开，详见 [01 §6 LookupLevels](01-核心存储引擎分析.md)。
 
-AND 运算 = 交集
-OR 运算 = 并集
-```
+### 5.3 compaction 如何"消除"旧 DV
 
-**延迟计算 (Lazy Evaluation)**
-```java
-BitmapIndexResult result = new BitmapIndexResult(() -> {
-    // 这段代码只有在 get() 被调用时才执行
-    return expensiveBitmapOperation();
-});
-```
-
-**与其他系统对比**
-- **Parquet**: 只有 SKIP/REMAIN 两态 (基于统计信息)
-- **ORC**: 支持 Bloom Filter (两态) 和 Row Group Index (类似三态)
-- **Paimon**: 完整的三态逻辑,支持行级过滤
-
-### 设计理念
-
-**为什么需要三态而非两态**
-```
-两态 (布尔):
-  true = 包含数据
-  false = 不包含数据
-  
-问题: 无法表达"精确到哪些行"
-
-三态:
-  REMAIN = 可能包含 (文件级)
-  SKIP = 一定不包含 (文件级)
-  BitmapIndexResult = 精确行号 (行级)
-```
-
-**为什么 REMAIN AND x = x**
-```
-语义: REMAIN 表示"不确定"
-  REMAIN AND SKIP = SKIP (确定结果优先)
-  REMAIN AND Bitmap{1,3,5} = Bitmap{1,3,5} (精确结果优先)
-  
-如果 REMAIN AND x = REMAIN:
-  - 精确的行级结果被丢弃
-  - 退化为文件级过滤
-```
-
-**为什么需要延迟计算**
-```
-场景: (Bloom Filter) AND (Bitmap)
-
-如果 Bloom Filter 返回 SKIP:
-  - 整个表达式 = SKIP
-  - Bitmap 不需要计算
-  
-延迟计算避免了不必要的开销
-```
-
-**权衡取舍**
-- **优势**: 统一不同精度的索引,支持组合查询
-- **劣势**: 实现复杂,需要理解三态语义
-- **适用场景**: 多索引协同工作
-
-**架构演进**
-```
-Phase 1: 两态逻辑 (SKIP/REMAIN)
-  -> 只支持文件级过滤
-
-Phase 2: 三态逻辑 (SKIP/REMAIN/Bitmap)
-  -> 支持行级过滤
-
-Phase 3: 延迟计算
-  -> 优化性能,避免不必要的计算
-```
-
-**运算真值表**
-```
-AND 运算:
-         | REMAIN | SKIP | Bitmap{1,3}
----------|--------|------|------------
-REMAIN   | REMAIN | SKIP | Bitmap{1,3}
-SKIP     | SKIP   | SKIP | SKIP
-Bitmap{2,3}| Bitmap{2,3} | SKIP | Bitmap{3}
-
-OR 运算:
-         | REMAIN | SKIP | Bitmap{1,3}
----------|--------|------|------------
-REMAIN   | REMAIN | REMAIN | REMAIN
-SKIP     | REMAIN | SKIP | Bitmap{1,3}
-Bitmap{2,3}| REMAIN | Bitmap{2,3} | Bitmap{1,2,3}
-```
-
-**实战示例**
-```sql
--- 查询: status = 'active' AND age > 25 AND city = 'Beijing'
-
--- 索引评估:
-Bloom Filter (status): REMAIN (可能存在)
-BSI (age): Bitmap{1, 5, 7, 12, 20}
-Bitmap (city): Bitmap{1, 7, 15}
-
--- 运算过程:
-Step 1: REMAIN AND Bitmap{1,5,7,12,20} = Bitmap{1,5,7,12,20}
-Step 2: Bitmap{1,5,7,12,20} AND Bitmap{1,7,15} = Bitmap{1,7}
-
--- 最终结果: 只读取行 1 和行 7
-```
-
-### 12.1 REMAIN/SKIP/BitmapIndexResult 三种状态
-
-源码路径: `paimon-common/src/main/java/org/apache/paimon/fileindex/FileIndexResult.java` (L22-L77)
+compaction 不只是生成 DV，也是**回收 DV** 的唯一途径。`notifyRewriteCompactBefore`（`LookupMergeTreeCompactRewriter.java:103`）在 rewrite 开始前，把所有参与 compaction 的旧文件的 DV 从维护器里移除：
 
 ```java
-public interface FileIndexResult {
-    // 状态1: REMAIN - "不确定，可能包含匹配数据"
-    FileIndexResult REMAIN = new FileIndexResult() {
-        boolean remain() { return true; }
-        FileIndexResult and(other) { return other; }      // REMAIN AND x = x
-        FileIndexResult or(other) { return this; }        // REMAIN OR x = REMAIN
-    };
-    
-    // 状态2: SKIP - "一定不包含匹配数据"
-    FileIndexResult SKIP = new FileIndexResult() {
-        boolean remain() { return false; }
-        FileIndexResult and(other) { return this; }       // SKIP AND x = SKIP
-        FileIndexResult or(other) { return other; }       // SKIP OR x = x
-    };
-    
-    // 状态3: BitmapIndexResult - "精确匹配这些行"
-    // 见 BitmapIndexResult 类
-}
-```
-
-**为什么是"三态"而非布尔**: Bloom Filter 无法告诉你具体哪些行匹配，只能说"可能匹配" (REMAIN) 或"一定不匹配" (SKIP)。Bitmap 索引则可以返回精确的行号集合 (BitmapIndexResult)。三态设计允许不同精度的索引在同一个框架中协同工作。
-
-### 12.2 AND/OR 运算语义
-
-**AND 运算 (交集语义)**:
-
-| AND | REMAIN | SKIP | Bitmap{1,3,5} |
-|-----|--------|------|---------------|
-| REMAIN | REMAIN | SKIP | Bitmap{1,3,5} |
-| SKIP | SKIP | SKIP | SKIP |
-| Bitmap{2,3,4} | Bitmap{2,3,4} | SKIP | Bitmap{3} |
-
-**OR 运算 (并集语义)**:
-
-| OR | REMAIN | SKIP | Bitmap{1,3,5} |
-|----|--------|------|---------------|
-| REMAIN | REMAIN | REMAIN | REMAIN |
-| SKIP | REMAIN | SKIP | Bitmap{1,3,5} |
-| Bitmap{2,3,4} | REMAIN | Bitmap{2,3,4} | Bitmap{1,2,3,4,5} |
-
-**REMAIN 在 AND 中的特殊行为**: `REMAIN AND x = x` 而非 `REMAIN AND x = REMAIN`。这是因为 REMAIN 表示"不确定"，与一个确定结果做 AND 时，应该保留确定结果。例如: Bloom Filter 返回 REMAIN (可能包含 "Beijing")，Bitmap 返回 Bitmap{1,3,5} (行 1,3,5 是 "Beijing")，AND 后应该使用 Bitmap{1,3,5} 做行级过滤。
-
-### 12.3 BitmapIndexResult 的延迟计算
-
-源码路径: `paimon-common/src/main/java/org/apache/paimon/fileindex/bitmap/BitmapIndexResult.java` (L29-L77)
-
-```java
-public class BitmapIndexResult extends LazyField<RoaringBitmap32> implements FileIndexResult {
-    public BitmapIndexResult(Supplier<RoaringBitmap32> supplier) {
-        super(supplier);    // 延迟计算: 只有在 get() 被调用时才执行 supplier
-    }
-    
-    public boolean remain() {
-        return !get().isEmpty();    // 触发计算
-    }
-    
-    public FileIndexResult and(FileIndexResult other) {
-        if (other instanceof BitmapIndexResult) {
-            return new BitmapIndexResult(
-                    () -> RoaringBitmap32.and(get(), ((BitmapIndexResult) other).get()));
-        }
-        return FileIndexResult.super.and(other);
+// LookupMergeTreeCompactRewriter.java:103  —— 行号已核对
+protected void notifyRewriteCompactBefore(List<DataFileMeta> files) {
+    if (dvMaintainer != null) {
+        files.forEach(file -> dvMaintainer.removeDeletionVectorOf(file.fileName()));
     }
 }
 ```
 
-**为什么使用延迟计算**: Bitmap 运算（特别是大 Bitmap 的 AND/OR）可能很耗时。如果最终结果因为某个 SKIP 而不需要 Bitmap 结果，延迟计算可以避免不必要的运算。例如: `BitmapResult AND SKIP = SKIP`，此时 BitmapResult 的 Supplier 永远不会被执行。
+逻辑闭环：被 compact 的旧文件中，被 DV 标删的行不会写进新文件（drop delete），所以**新文件里全是有效行、不需要 DV**；旧文件连同它的 DV 一起退场。提交时，旧 DV 索引文件标 `IndexManifestEntry DELETE`、新 DV 索引文件（若有）标 `ADD`，与数据文件增量一起进同一个 Snapshot。这把"读时 merge"的代价彻底物化成了"compaction 时一次性付清"。
 
-**额外方法**:
-- `andNot(RoaringBitmap32 deletion)`: 从 Bitmap 中移除 DV 标记的行
-- `limit(int limit)`: 限制结果行数（用于 TopN）
+### 5.4 DV 生命周期串讲
+
+以一条 `(pk=42)` 的更新在 MOW 表里的旅程为例：
+
+```
+1. write(新版本v2)        → 排序进 WriteBuffer，flush 成 Level 0 文件 F_new（无 DV，对读不可见）
+2. compaction 触发        → upgradeStrategy 对 L0 文件 F_new 判定 CHANGELOG_WITH_REWRITE
+3. rewrite 中 lookup      → 对 pk=42 查 outputLevel+1 以上，发现旧版本 v1 在高层文件 F_old 第 N 行
+4. notifyNewDeletion      → dvMaintainer 标记 F_old 第 N 行失效（checkedDelete 去重、置 modified）
+5. notifyRewriteCompactBefore → 若 F_old 自己也参与了本次 compaction，则其 DV 被 removeDeletionVectorOf 回收
+6. prepareCommit          → writeDeletionVectorsIndex() 把 F_old 的 DV 写成新索引文件（modified 才写）
+7. commit                 → 数据文件增量 + IndexIncrement(新 DV ADD / 旧 DV DELETE) 原子进同一 Snapshot
+8. 读取 pk=42             → 顺序读 F_old，DV 跳过第 N 行；读 F_new 拿到 v2；无需归并（§6）
+```
+
+**④ 风险/陷阱**：① MOW 表的 compaction 不能纯异步，否则新数据可见延迟（§1.3 陷阱 1）；② lookup 在写期是真实开销（要从高层文件/索引点查），更新越频繁、命中越多，写吞吐越受 lookup 性能影响——这是 MOW 相对纯 MOR 多付的写代价；③ `deletion-vectors.enabled` 默认 `false`（`CoreOptions.java:1860`），不开就是 MOR。
+
+**⑤ 收益与代价**：把 merge 从"每次读"降为"compaction 一次"，读取接近 Append。代价是写期多一次 lookup + compaction 必须同步 + DV 索引文件的额外写。适合"读多写少、点查/OLAP、batch 读"，不适合"超高频更新且几乎不读"的纯摄入场景（那种情况 MOR + 异步 compaction 更划算）。
 
 ---
 
-## 13. FileIndexPredicate 评估流程
+## 6. DV 读路径：按行过滤与装饰器
 
-### 13.1 谓词评估入口
+**① 要解决什么问题**
 
-源码路径: `paimon-common/src/main/java/org/apache/paimon/fileindex/FileIndexPredicate.java` (L54-L206)
+DV 已经在写期把"哪些行失效"记好了，读期要做的是：跳过 merge、逐文件顺序读、按行号扔掉失效行，且这个过滤必须**对文件格式透明**、能和文件索引返回的行选择叠加。
+
+**② 设计原理与取舍：装饰器 + 迭代器层过滤**
+
+入口在 `RawFileSplitRead`（`RawFileSplitRead.java:179`）：为 split 里的每个数据文件建一个懒加载 DV factory，读到某文件时拿它的 DV，**非空则用 `ApplyDeletionVectorReader` 把底层 reader 包一层**：
 
 ```java
-public class FileIndexPredicate implements Closeable {
-    private final FileIndexFormat.Reader reader;
-    
-    public FileIndexResult evaluate(@Nullable Predicate predicate) {
-        if (predicate == null) return REMAIN;
-        
-        // 1. 提取谓词涉及的列名
-        Set<String> requiredFieldNames = getRequiredNames(predicate);
-        
-        // 2. 加载这些列的索引 Reader
-        Map<String, Collection<FileIndexReader>> indexReaders = new HashMap<>();
-        requiredFieldNames.forEach(name -> indexReaders.put(name, reader.readColumnIndex(name)));
-        
-        // 3. 用 FileIndexPredicateTest 访问者评估谓词
-        FileIndexResult result = new FileIndexPredicateTest(indexReaders).test(predicate);
-        
-        if (!result.remain()) {
-            LOG.debug("One file has been filtered: " + path);
-        }
-        return result;
+// RawFileSplitRead.java:262 / :308  —— 行号已核对
+DeletionVector deletionVector = dvFactory == null ? null : dvFactory.get();
+// ...（先做文件索引：FileIndexEvaluator 可能返回 BitmapIndexResult 作为行 selection）
+FileRecordReader<InternalRow> fileRecordReader = new DataFileRecordReader(...);
+if (fileIndexResult instanceof BitmapIndexResult) {                 // 文件索引的行级 selection
+    fileRecordReader = new ApplyBitmapIndexRecordReader(fileRecordReader, (BitmapIndexResult) fileIndexResult);
+}
+if (deletionVector != null && !deletionVector.isEmpty()) {          // DV 行级过滤叠加在最外层
+    return new ApplyDeletionVectorReader(fileRecordReader, deletionVector);
+}
+return fileRecordReader;
+```
+
+注意两层行级过滤的**叠加顺序**：文件索引（Bitmap/BSI，详见 [13 号文档](13-索引机制深度分析.md)）先在 `DataFileRecordReader` 上挑出"谓词命中的行"，DV 再在更外层剔除"逻辑失效的行"。两者都基于"文件内行号"，互不冲突。
+
+`ApplyDeletionVectorReader` 是纯装饰器（`ApplyDeletionVectorReader.java:31`），不改底层读逻辑，只在每个 batch 外包一层过滤迭代器：
+
+```java
+// ApplyDeletionVectorReader.java:53 + ApplyDeletionFileRecordIterator —— 行号已核对
+public FileRecordIterator<InternalRow> readBatch() throws IOException {
+    FileRecordIterator<InternalRow> batch = reader.readBatch();
+    return batch == null ? null : new ApplyDeletionFileRecordIterator(batch, deletionVector);
+}
+// 迭代器 next()：用 while 跳过连续失效行，靠底层 returnedPosition() 拿"文件内行号"
+public InternalRow next() throws IOException {
+    while (true) {
+        InternalRow next = iterator.next();
+        if (next == null) return null;
+        if (!deletionVector.isDeleted(returnedPosition())) return next;  // 未删则返回
+        // 已删则跳过，继续读下一行
     }
 }
 ```
 
-### 13.2 FileIndexPredicateTest 访问者模式
+**为什么在迭代器层而不是 batch/Reader 层过滤**：Reader 以 batch 为粒度（一批多行），改 batch 内部结构复杂；迭代器逐行检查、`returnedPosition()` 直接给文件内行号（与 DV 记录的 position 同源），简单且 O(1) 每行。
+
+**③ 为什么读期能不 merge**：当 split 标记为 `rawConvertible` 时，走 `RawFileSplitRead` 而非 `MergeFileSplitRead`——即"逐文件直读 + DV 过滤"，跳过 `SortMergeReader` 归并。`MergeFileSplitRead` 路径下也会构造 DV factory（`MergeFileSplitRead.java:257`）用于 drop 已删行，但真正让 PK 表读取接近 Append 的，是 `rawConvertible` 让大部分文件走免归并的 raw 读。`rawConvertible` 的判定属于 scan 层（详见 [01 §7.1/§12.4](01-核心存储引擎分析.md)）。
+
+**④ 风险/陷阱**：① DV 行号是**文件内 0-based 偏移**，迭代器若 `returnedPosition()` 返回"已读总行数"而非"文件内位置"，过滤就会错乱——这也是为什么 DV 严格绑定 `(数据文件, 行号)`、而非全局行号；② DV 命中率过高（一个文件大半被标删）说明 compaction 滞后，读时白读 I/O 多，应触发 compaction；③ 读期还要为有 DV 的文件多读一次 DV 索引文件（小额 I/O）。
+
+**⑤ 收益与代价**：读取从"跨多层归并"降为"顺序读 + O(1) 位图判定"，逼近 Append 表吞吐；代价是每个有 DV 的文件多一次 DV 加载、且整块位图须驻内存。与 Iceberg position-delete 需要"data 文件 join delete 文件"相比，DV 嵌入读路径、零 join。
+
+---
+
+## 7. Append 表的 DV：行级 DELETE 与 Rolling 维护
+
+**① 要解决什么问题**
+
+Append 表不支持 UPDATE，但支持 `DELETE FROM append_table WHERE ...`。若按 COW 整文件重写来删几行，代价极高。DV 让 Append 表也能"标记某文件某行失效"而不重写数据文件——但 Append 表的删除是**用户 DELETE 语句一次性给出"这次要删的整个 DV"**，与 PK 表"compaction 时逐行通知"语义不同，因此维护器接口也不同。
+
+**② 设计原理与取舍**
+
+接口 `BaseAppendDeleteFileMaintainer`（`:52`）只两个动作：`notifyNewDeletionVector(dataFile, dv)`（标删）、`persist()`（落盘出 `IndexManifestEntry`）。两个工厂按桶形态分流（`:62/:77`）：
+
+- 分桶 Append → `BucketedAppendDeleteFileMaintainer`，内部直接委托 `BucketedDvMaintainer`（和 PK 表共用维护器，单文件写）。
+- 无桶（unaware）Append → `AppendDeleteFileMaintainer`，**复杂度最高**，Rolling 写。
+
+**分桶版本极简**（`BucketedAppendDeleteFileMaintainer.java:55`）——`notifyNewDeletionVector` 转 `mergeNewDeletion`（整 DV 合并而非逐行），`persist` 转 `writeDeletionVectorsIndex` 包成 `FileKind.ADD` 条目。为什么用 `mergeNewDeletion`：DELETE 一次给一个完整 DV，要与该文件已有 DV 取并集，否则上次删的行会"复活"。
+
+**无桶版本为何复杂**：无桶表的 DV 分散在多个 Rolling 索引文件里，一个索引文件含多个数据文件的 DV。要改其中一个数据文件的 DV，就得动它所在的整个索引文件。核心是 `notifyNewDeletionVector` + `persist` 两步（`AppendDeleteFileMaintainer.java:119/128`）：
 
 ```java
-private static class FileIndexPredicateTest implements PredicateVisitor<FileIndexResult> {
-    private final Map<String, Collection<FileIndexReader>> columnIndexReaders;
-    
-    // 叶子谓词评估
-    public FileIndexResult visit(LeafPredicate predicate) {
-        FieldRef fieldRef = predicate.fieldRefOptional().orElse(null);
-        if (fieldRef == null) return REMAIN;
-        
-        FileIndexResult compoundResult = REMAIN;
-        for (FileIndexReader reader : columnIndexReaders.get(fieldRef.name())) {
-            compoundResult = compoundResult.and(
-                    predicate.function().visit(reader, fieldRef, predicate.literals()));
-            if (!compoundResult.remain()) return compoundResult;  // 短路优化
-        }
-        return compoundResult;
-    }
-    
-    // 组合谓词评估
-    public FileIndexResult visit(CompoundPredicate predicate) {
-        if (predicate.function() instanceof Or) {
-            // OR: 对所有子谓词做 or 运算
-            FileIndexResult result = null;
-            for (Predicate child : predicate.children()) {
-                result = result == null ? child.visit(this) : result.or(child.visit(this));
-            }
-            return result == null ? REMAIN : result;
-        } else {
-            // AND: 对所有子谓词做 and 运算，支持短路
-            FileIndexResult result = null;
-            for (Predicate child : predicate.children()) {
-                result = result == null ? child.visit(this) : result.and(child.visit(this));
-                if (!result.remain()) return result;  // 短路: SKIP 后不再评估
-            }
-            return result == null ? REMAIN : result;
-        }
-    }
+// AppendDeleteFileMaintainer.java:119  —— 行号已核对
+public void notifyNewDeletionVector(String dataFile, DeletionVector dv) {
+    DeletionFile previous = notifyRemovedDeletionVector(dataFile); // 把该文件从旧索引文件"摘除"，并标记 touched
+    if (previous != null) { dv.merge(dvIndexFile.readDeletionVector(previous)); } // 合并旧 DV，防复活
+    deletionVectors.put(dataFile, dv);
 }
-```
-
-**关键设计**: 一列可能有**多个索引**（如同时有 Bloom Filter 和 Bitmap），对同一列的多个索引结果做 AND 运算。这意味着 Bloom Filter 的文件级判断可以与 Bitmap 的行级判断组合: 如果 Bloom Filter 判断 SKIP，则直接跳过；否则使用 Bitmap 的行级结果。
-
-### 13.3 TopN 评估
-
-```java
-public FileIndexResult evaluateTopN(@Nullable TopN topN, FileIndexResult result) {
-    if (topN == null || !result.remain()) return result;
-    
-    // 如果已有 BitmapIndexResult 且行数 <= K，无需 TopN 过滤
-    if (result instanceof BitmapIndexResult) {
-        long cardinality = ((BitmapIndexResult) result).get().getCardinality();
-        if (cardinality <= k) return result;
-    }
-    
-    // 在第一个排序列的索引上执行 TopN
-    String requiredName = orders.get(0).field().name();
-    Set<FileIndexReader> readers = reader.readColumnIndex(requiredName);
-    for (FileIndexReader reader : readers) {
-        FileIndexResult ret = reader.visitTopN(topN, result);
-        if (!REMAIN.equals(ret)) return ret;
-    }
+public List<IndexManifestEntry> persist() {
+    List<IndexManifestEntry> result = writeUnchangedDeletionVector();      // ① 搬家：未改动的 DV
+    dvIndexFile.writeWithRolling(deletionVectors).stream()                 // ② 新增/改动的 DV 滚动写
+            .map(this::toAddEntry).forEach(result::add);
     return result;
 }
 ```
 
-**为什么只看第一个排序列**: 当前实现仅支持单列排序的 TopN 优化。`orders.size() == 1` 时 `strict = true`（精确 K 行），多列时 `strict = false`（可能返回多于 K 行）。
+关键在 `writeUnchangedDeletionVector`（`:146`）：被 touched 的索引文件里，那些**没改动的 DV 也必须重写到新文件**、旧索引文件整体标 `toDeleteEntry()`。因为对象存储不能原地改，一个索引文件只要被动了一处，就得整体重生。它维护一组辅助 map（`dataFileToIndexFile` / `indexFileToDeletionFiles` / `touchedIndexFiles` 等，`:46-51`）来追踪"哪个数据文件的 DV 在哪个索引文件、哪些索引文件被碰过"。
+
+**③ Append 与 PK 表 DV 的差异对照**
+
+| 维度 | PK 表 DV | Append 表 DV |
+|------|----------|--------------|
+| 产生时机 | lookup compaction 时逐行 `notifyNewDeletion` 自动生成 | 用户 `DELETE` 语句一次性给整个 DV |
+| 维护器 | `BucketedDvMaintainer` | 分桶→`BucketedAppendDeleteFileMaintainer`（委托前者）；无桶→`AppendDeleteFileMaintainer` |
+| 写入模式 | 单文件 `writeSingleFile` | 分桶单文件；无桶 `writeWithRolling` |
+| compaction 消除 | 是，旧文件 DV 随 compaction 自动回收 | 否（除非被 compact 的文件恰好含 DV） |
+| 索引文件粒度 | 整个 bucket 一个 | 无桶按 size Rolling 多个，部分修改要"搬家" |
+
+**④ 风险/陷阱**：无桶 Append 表频繁小批 DELETE 会反复触发"未改动 DV 搬家 + 旧索引文件 DELETE"，放大索引文件写与 manifest 条目数；`notifyNewDeletionVector` 必须先 merge 旧 DV，漏 merge 会让历史删除复活。
+
+**⑤ 收益与代价**：Append 表获得"不重写数据文件即可行级删除"的能力；代价是无桶形态下索引文件维护远比 PK 表重。若 DELETE 频繁，分桶 Append 表比无桶更可控。
 
 ---
 
-## 14. 全局索引
+## 8. MOW vs COW vs MOR：行级标删的取舍边界
 
-### 14.1 GlobalIndexMeta 架构
+**① 要解决什么问题**：同样是"主键表能 update/delete"，业界有三条路。理解它们的代价边界，才知道 DV（MOW）什么时候是收益、什么时候是负担。
 
-源码路径: `paimon-core/src/main/java/org/apache/paimon/index/GlobalIndexMeta.java` (L33-L60)
+**② 三种范式的本质对比**
 
-```java
-public class GlobalIndexMeta {
-    public static final RowType SCHEMA = new RowType(true, Arrays.asList(
-        new DataField(0, "_ROW_RANGE_START", new BigIntType(false)),    // 行范围起始
-        new DataField(1, "_ROW_RANGE_END", new BigIntType(false)),      // 行范围结束
-        new DataField(2, "_INDEX_FIELD_ID", new IntType(false)),        // 索引字段 ID
-        new DataField(3, "_EXTRA_FIELD_IDS", DataTypes.ARRAY(IntType)), // 附加字段 ID
-        new DataField(4, "_INDEX_META", DataTypes.BYTES())));           // 索引元数据
-    
-    private final long rowRangeStart;
-    private final long rowRangeEnd;
-    private final int indexFieldId;
-    @Nullable private final int[] extraFieldIds;
-    @Nullable private final byte[] indexMeta;
-}
-```
+| | MOR（无 DV） | **MOW（DV）** | COW（整文件重写） |
+|---|---|---|---|
+| 更新一行做什么 | 追加新版本，旧版本留着 | 追加新版本 + compaction 时标删旧行 | 读出整个旧文件、改一行、写新整文件 |
+| 写放大 | 最低（纯追加） | 中（lookup + DV 写 + compaction） | 最高（GB 级文件改一行也重写） |
+| 读放大 | 最高（每次跨层归并） | 低（顺序读 + 位图跳行） | 最低（文件即最新） |
+| 旧数据何时真正消失 | compaction | compaction（标删 + drop delete） | 立即（被新文件替代） |
+| 空间放大 | 中（旧版本 + changelog） | 中（旧文件 + DV 共存到 compaction） | 低 |
+| Paimon 用否 | 用（默认，`deletion-vectors.enabled=false`） | 用（开 DV） | **不用于主键表** |
 
-### 14.2 BTree 全局索引
+**③ 为什么 Paimon 主键表不走 COW**：COW 改一行重写整文件，在对象存储上写放大灾难性（详见 [01 §1.1 LSM vs B+Tree](01-核心存储引擎分析.md) 对 Delta/Iceberg CoW 的对比）。Paimon 用 LSM 追加 + 后台 compaction，本质上把"何时重写"推迟并批量化。DV 是在这套 LSM 之上叠的一层：**让"重写聚合后的文件"和"标记被聚合掉的旧行"同时在 compaction 完成**，从而读取免归并。
 
-源码路径: `paimon-core/src/main/java/org/apache/paimon/globalindex/btree/BTreeGlobalIndexBuilder.java`
+**④ DV 什么时候反而是负担**：
+- 纯摄入、几乎不查的场景：DV 的读收益用不上，却白付 lookup + compaction 同步的写代价——这种场景 MOR + 异步 compaction 更划算。
+- 更新极频繁且 compaction 跟不上：DV 大量累积，读时白读被标删行、写时 lookup 命中率高，双向变慢（§1.3 陷阱 3）。
+- 桶内文件数失控：DV 维护器要把整 bucket 的 DV 常驻内存（§4），桶过大时内存压力上升。
 
-全局索引使用 B-Tree 结构存储在独立的索引文件中:
-- 通过 `GlobalIndexFileReadWrite` 进行文件读写
-- 索引文件以 `global-index-{uuid}.index` 命名
-- 每个索引条目记录 key 到 (partition, bucket) 的映射
-
-### 14.3 用途: 跨分区更新
-
-源码路径: `paimon-core/src/main/java/org/apache/paimon/crosspartition/GlobalIndexAssigner.java`
-
-当表启用了跨分区更新时，全局索引维护主键到 (partition, bucket) 的映射:
-
-1. **启动时**: 通过 `IndexBootstrap` 扫描全表，在 RocksDB 中建立完整索引
-2. **写入时**: 查找旧记录所在的 partition + bucket
-3. **跨分区更新**: 如果旧记录在不同分区，先在旧分区产生 DELETE（通过 DV），再在新分区产生 INSERT
-
-**与本地 Lookup 的区别**: 本地 Lookup 只在同一 (partition, bucket) 内查找旧记录，全局索引可以跨分区查找。
+**⑤ 结论**：DV/MOW 是"**读多写少、点查/OLAP/batch 读**"的最优解；"**超高频写、极少读**"仍应留在 MOR。这也是 `deletion-vectors.enabled` 默认 `false`、需显式开启的原因。
 
 ---
 
-## 15. Predicate 体系
+## 9. 文件索引交汇点（详见 13 号文档）
 
-### 解决什么问题
+> 文件索引（Bloom Filter / Bitmap / BSI / Range Bitmap / FileIndexFormat / FileIndexResult 三态 / FileIndexPredicate / Predicate 体系 / 全局索引 / Lookup 状态后端）的**完整原理与实现由 [13 号文档](13-索引机制深度分析.md) 主讲**，本文不重复展开。这里只说清它与 DV 在读路径上的交汇关系。
 
-**核心业务问题**: SQL 的 WHERE 条件需要在多个层次下推 (Manifest、DataFile、FileIndex、Row),如何用统一的抽象表示谓词,并在不同层次高效求值?
+**① 二者解决的问题不同，但都作用在"文件内行号"上**：
 
-**没有统一 Predicate 体系的后果**:
-- 每个层次都需要重新解析 SQL 条件 -> 重复工作
-- 无法复用谓词求值逻辑 -> 代码重复
-- 难以扩展新的谓词类型 -> 维护困难
+- **文件索引**：读前过滤。Bloom Filter 答"这个值可能在/一定不在本文件"（文件级 SKIP/REMAIN）；Bitmap/BSI/Range Bitmap 能进一步给出"哪些行命中谓词"的行号位图（行级 `BitmapIndexResult`）。
+- **DV**：读时剔除逻辑失效行。
 
-**实际场景**:
-```sql
--- 查询: SELECT * FROM t WHERE age > 25 AND city = 'Beijing';
-
--- 多层下推:
--- 1. Manifest 层: 根据分区统计过滤 Manifest
--- 2. DataFile 层: 根据 min/max 统计过滤文件
--- 3. FileIndex 层: 根据索引过滤文件/行
--- 4. Row 层: 逐行精确过滤
-```
-
-### 有什么坑
-
-**1. 谓词未正确下推**
-```java
-// 错误: 只在 Row 层过滤
-Predicate predicate = ...;
-for (InternalRow row : allRows) {
-    if (predicate.test(row)) {
-        results.add(row);
-    }
-}
-// 后果: 读取所有数据,性能差
-
-// 正确: 多层下推
-// Manifest 层过滤 -> DataFile 层过滤 -> FileIndex 层过滤 -> Row 层过滤
-```
-
-**2. 统计信息求值错误**
-```java
-// 错误: 未考虑 null 值
-boolean test(long rowCount, InternalRow minValues, InternalRow maxValues) {
-    // age > 25
-    int maxAge = maxValues.getInt(ageIndex);
-    return maxAge > 25;  // 错误: 如果所有值都是 null,max 也是 null
-}
-
-// 正确: 检查 null count
-if (nullCounts.getLong(ageIndex) == rowCount) {
-    return false;  // 所有值都是 null
-}
-```
-
-**3. 访问者模式使用不当**
-```java
-// 错误: 直接 instanceof 判断
-if (predicate instanceof LeafPredicate) {
-    LeafPredicate leaf = (LeafPredicate) predicate;
-    // 处理叶子谓词
-} else if (predicate instanceof CompoundPredicate) {
-    // 处理组合谓词
-}
-// 问题: 难以扩展,违反开闭原则
-
-// 正确: 使用访问者模式
-predicate.visit(new MyPredicateVisitor());
-```
-
-**4. 生产环境注意事项**
-- 监控谓词下推效果: `filtered_files / total_files`
-- 监控统计信息准确性: 定期更新 min/max
-- 监控索引命中率: `index_hit_rate`
-
-### 核心概念解释
-
-**Predicate (谓词)**
-```
-表示 SQL 的 WHERE 条件
-支持多层求值:
-  - 行级: test(InternalRow)
-  - 统计级: test(rowCount, min, max, nullCount)
-  - 索引级: visit(FileIndexReader)
-```
-
-**LeafPredicate (叶子谓词)**
-```
-单个比较条件:
-  - age > 25
-  - city = 'Beijing'
-  - status IN ('active', 'pending')
-```
-
-**CompoundPredicate (组合谓词)**
-```
-多个条件的组合:
-  - age > 25 AND city = 'Beijing'
-  - status = 'active' OR status = 'pending'
-```
-
-**访问者模式 (Visitor Pattern)**
-```
-双重分派:
-  1. predicate.visit(visitor)
-  2. visitor.visit(predicate)
-  
-好处: 新增 Visitor 无需修改 Predicate
-```
-
-**与其他系统对比**
-- **Spark**: Expression 树,类似但更复杂
-- **Flink**: Expression 树 + CodeGen
-- **Paimon**: Predicate 树 + 多层求值
-
-### 设计理念
-
-**为什么采用访问者模式**
-1. **扩展性**: 新增求值逻辑无需修改 Predicate
-2. **解耦**: Predicate 与求值逻辑分离
-3. **类型安全**: 编译期检查,避免 instanceof
-
-**为什么需要多层求值**
-```
-层次越高,过滤成本越低:
-
-Manifest 层:
-  - 成本: 读取元数据 (KB 级)
-  - 过滤粒度: 分区
-  
-DataFile 层:
-  - 成本: 读取文件 Footer (MB 级)
-  - 过滤粒度: 文件
-  
-FileIndex 层:
-  - 成本: 读取索引文件 (MB 级)
-  - 过滤粒度: 文件/行
-  
-Row 层:
-  - 成本: 读取数据文件 (GB 级)
-  - 过滤粒度: 行
-```
-
-**为什么统计信息求值很重要**
-```sql
--- 查询: age > 100
--- 文件统计: min=18, max=65
-
--- 统计级求值:
-if (max <= 100) {
-    return false;  // 整个文件都不满足,跳过
-}
-
--- 节省: 避免读取整个文件
-```
-
-**权衡取舍**
-- **优势**: 统一抽象,多层复用,易扩展
-- **劣势**: 实现复杂,需要理解访问者模式
-- **适用场景**: 需要多层下推的查询引擎
-
-**架构演进**
-```
-Phase 1: 简单的 Filter 接口
-  -> 只支持行级过滤
-
-Phase 2: Predicate 树
-  -> 支持复杂条件
-
-Phase 3: 多层求值
-  -> 支持统计信息过滤
-
-Phase 4: 访问者模式
-  -> 支持索引求值
-```
-
-**双重分派示例**
-```java
-// 第一次分派: 根据 Predicate 类型
-predicate.visit(visitor);
-
-// LeafPredicate 实现:
-public <T> T visit(PredicateVisitor<T> visitor) {
-    return visitor.visit(this);  // 第二次分派
-}
-
-// Visitor 实现:
-public FileIndexResult visit(LeafPredicate predicate) {
-    // 第三次分派: 根据 Function 类型
-    return predicate.function().visit(this, fieldRef, literals);
-}
-
-// Equal 函数实现:
-public <T> T visit(FunctionVisitor<T> visitor, FieldRef fieldRef, List<Object> literals) {
-    return visitor.visitEqual(fieldRef, literals.get(0));
-}
-```
-
-**性能对比**
-```
-场景: 1000 个文件,查询 age > 100
-
-无统计信息:
-  - 读取 1000 个文件
-  - 逐行过滤
-  - 耗时: 100s
-
-有统计信息:
-  - Manifest 层过滤: 剩余 500 个分区
-  - DataFile 层过滤: 剩余 50 个文件
-  - FileIndex 层过滤: 剩余 5 个文件
-  - Row 层过滤: 精确结果
-  - 耗时: 5s
-
-加速比: 20x
-```
-
-**实战示例**
-```java
-// 构建谓词: age > 25 AND city = 'Beijing'
-Predicate agePredicate = new LeafPredicate(
-    FieldRef.of("age"), 
-    new GreaterThan(), 
-    Collections.singletonList(25));
-
-Predicate cityPredicate = new LeafPredicate(
-    FieldRef.of("city"),
-    new Equal(),
-    Collections.singletonList("Beijing"));
-
-Predicate compound = new CompoundPredicate(
-    new And(),
-    Arrays.asList(agePredicate, cityPredicate));
-
-// 多层求值:
-// 1. 统计级
-boolean fileMatches = compound.test(rowCount, minValues, maxValues, nullCounts);
-
-// 2. 索引级
-FileIndexResult indexResult = compound.visit(new FileIndexPredicateTest(indexReaders));
-
-// 3. 行级
-boolean rowMatches = compound.test(row);
-```
-
-### 15.1 LeafPredicate 叶子谓词
-
-源码路径: `paimon-common/src/main/java/org/apache/paimon/predicate/LeafPredicate.java` (L46-L283)
-
-```java
-public class LeafPredicate implements Predicate {
-    private final Transform transform;       // 字段引用或表达式
-    private final LeafFunction function;     // 比较函数 (Equal, LessThan, In 等)
-    private transient List<Object> literals; // 比较字面量
-    
-    // 多层求值:
-    // 1. 行级求值 (L136-L139)
-    public boolean test(InternalRow row) {
-        Object value = transform.transform(row);
-        return function.test(transform.outputType(), value, literals);
-    }
-    
-    // 2. 统计级求值 (L142-L164) - 用于文件级过滤
-    public boolean test(long rowCount, InternalRow minValues, InternalRow maxValues, 
-                        InternalArray nullCounts) {
-        // 基于 min/max/nullCount 统计信息判断
-    }
-}
-```
-
-**LeafFunction 实现**: Equal, NotEqual, LessThan, GreaterThan, LessOrEqual, GreaterOrEqual, IsNull, IsNotNull, In, NotIn, StartsWith, EndsWith, Contains, Like, Between, AlwaysFalse 等。
-
-### 15.2 CompoundPredicate 组合谓词
-
-源码路径: `paimon-common/src/main/java/org/apache/paimon/predicate/CompoundPredicate.java` (L35-L103)
-
-```java
-public class CompoundPredicate implements Predicate {
-    private final CompoundFunction function;   // And 或 Or
-    private final List<Predicate> children;    // 子谓词列表
-}
-```
-
-### 15.3 FunctionVisitor 双重分派
-
-源码路径: `paimon-common/src/main/java/org/apache/paimon/predicate/FunctionVisitor.java` (L27-L100)
-
-```java
-public interface FunctionVisitor<T> extends PredicateVisitor<T> {
-    default T visit(LeafPredicate predicate) {
-        // 双重分派: predicate.function().visit(this, fieldRef, literals)
-        return predicate.function().visit(this, fieldRef.get(), predicate.literals());
-    }
-    
-    // 子类只需实现具体的 visit 方法:
-    T visitEqual(FieldRef fieldRef, Object literal);
-    T visitLessThan(FieldRef fieldRef, Object literal);
-    T visitIn(FieldRef fieldRef, List<Object> literals);
-    // ... 等
-}
-```
-
-**为什么使用双重分派**: Predicate 的求值取决于两个维度: (1) 函数类型 (Equal, LessThan 等)，(2) 求值上下文 (行级测试、统计测试、索引测试)。双重分派允许在不修改 LeafFunction 的情况下，通过不同的 Visitor 实现不同的求值逻辑。`FileIndexReader` 就是 `FunctionVisitor<FileIndexResult>` 的实现。
-
-### 15.4 Predicate 多层下推
-
-Predicate 在 Paimon 中被层层下推:
+**② 在读路径如何叠加**（见 §6 与 `RawFileSplitRead.java:262-309`）：先跑文件索引（`FileIndexEvaluator`）——若整体 SKIP 直接返回空 reader；若返回行级 `BitmapIndexResult`，用 `ApplyBitmapIndexRecordReader` 在数据 reader 上挑出"谓词命中行"；DV 再在最外层用 `ApplyDeletionVectorReader` 剔除"失效行"。两者都基于文件内 0-based 行号，互不冲突、可叠加。
 
 ```
-                     Predicate
-                        |
-        +---------------+---------------+
-        |               |               |
-   Manifest 层      DataFile 层      FileIndex 层       Row 层
-   (分区统计)     (min/max 统计)   (Bloom/Bitmap/BSI)  (逐行过滤)
-   过滤 Manifest  过滤数据文件     过滤文件/行           精确过滤
+DataFileRecordReader（读数据文件）
+  → ApplyBitmapIndexRecordReader（文件索引行选择：留下谓词命中行）   ← 详见 13 号
+  → ApplyDeletionVectorReader（DV：剔除失效行）                      ← 本文 §6
 ```
 
-每一层的过滤是**递进的**: 上层过滤后的结果传给下层继续过滤。越靠前的层过滤成本越低但精度也越低。
+**③ 一个值得知道的细节**：`FileIndexEvaluator.evaluate` 接收 `deletionVector` 参数（`RawFileSplitRead.java:273`），表示文件索引的行选择结果与 DV 可以在评估阶段就协同（如 BitmapIndexResult 提供 `andNot(deletion)` 从命中集合里再去掉已删行）。但索引内部的三态运算、延迟计算、TopN 等机制属于 13 号文档范畴。
+
+**与本文的边界**：凡涉及"索引怎么建、怎么编码、怎么求值、Predicate 怎么下推、Lookup 状态后端（RocksDB/InMemory）怎么调优"——一律见 [13 号文档](13-索引机制深度分析.md)；本文只保证你理解"DV 在读路径上和文件索引各管一段、如何叠加"。
 
 ---
 
-## 16. Lookup 机制
-
-### 解决什么问题
-
-**核心业务问题**: 主键表的更新操作需要找到旧记录的位置 (fileName, position) 才能标记删除。如何在海量数据中快速查找 `key -> (fileName, position)` 的映射?
-
-**没有 Lookup 的后果**:
-```sql
--- 更新操作: UPDATE user_table SET status = 'active' WHERE user_id = 12345;
-
--- 没有 Lookup:
---   - 扫描所有文件,查找 user_id = 12345 的旧记录
---   - 10000 个文件 * 100MB = 1TB 扫描
---   - 耗时: 分钟级
-
--- 有 Lookup (RocksDB):
---   - 查询 RocksDB: key=12345 -> (file-123.parquet, position=5678)
---   - 标记 DV: dv.delete(5678)
---   - 耗时: 毫秒级
-```
-
-**实际场景**:
-- CDC 同步: Kafka -> Paimon,每秒数千次更新
-- 实时数仓: 用户行为实时更新
-- 维度表更新: 商品信息、用户画像
-
-### 有什么坑
-
-**1. RocksDB 路径配置错误**
-```java
-// 错误: 使用临时目录
-StateFactory factory = new RocksDBStateFactory("/tmp/rocksdb");
-// 后果: 重启后数据丢失,需要重新扫描全表
-
-// 正确: 使用持久化目录
-StateFactory factory = new RocksDBStateFactory("/data/paimon/lookup");
-```
-
-**2. LRU Cache 设置不当**
-```java
-// 错误: Cache 过小
-ValueState<Key, Value> state = factory.valueState(
-    "lookup", keySerializer, valueSerializer, 1000);  // 只缓存 1000 条
-// 后果: 热点 key 频繁访问 RocksDB,性能下降
-
-// 正确: 根据热点数据量设置
-ValueState<Key, Value> state = factory.valueState(
-    "lookup", keySerializer, valueSerializer, 1_000_000);  // 缓存 100 万条
-```
-
-**3. 内存状态用于大表**
-```java
-// 错误: 10 亿行数据用内存状态
-StateFactory factory = new InMemoryStateFactory();
-// 后果: OOM
-
-// 正确: 大表用 RocksDB
-StateFactory factory = new RocksDBStateFactory(path);
-```
-
-**4. 生产环境注意事项**
-- RocksDB 需要定期 Compact,避免空间膨胀
-- 监控 RocksDB 大小: `rocksdb_size / data_size` 应 < 5%
-- 监控 Cache 命中率: `lookup_cache_hit_rate` 应 > 90%
-- 启动时的 Bootstrap 扫描可能耗时数小时
-
-### 核心概念解释
-
-**Lookup (查找)**
-- 维护 `key -> (fileName, position)` 的映射
-- 写入时查找旧记录位置
-- 更新 DV 标记旧记录删除
-
-**StateFactory (状态工厂)**
-```
-接口: 创建 ValueState, SetState, ListState
-实现:
-  - RocksDBStateFactory: 持久化到磁盘
-  - InMemoryStateFactory: 全内存
-```
-
-**RocksDB**
-- 嵌入式 KV 存储引擎
-- LSM-tree 结构,写入快
-- 支持 TTL, Merge Operator
-- 适合海量数据
-
-**LRU Cache**
-- 缓存最近访问的 KV 对
-- 减少 RocksDB 查询
-- 提升热点 key 性能
-
-**与其他系统对比**
-- **Flink State**: 类似,但与 Checkpoint 深度集成
-- **Iceberg**: 无 Lookup,依赖 Merge-on-Read
-- **Hudi**: 使用 HBase 或 RocksDB 做 Lookup
-
-### 设计理念
-
-**为什么选择 RocksDB**
-1. **容量**: 支持 TB 级数据,远超内存限制
-2. **性能**: 写入 100K ops/s,读取 200K ops/s (SSD)
-3. **成熟度**: Facebook 生产验证,稳定可靠
-4. **嵌入式**: 无需独立部署,简化运维
-
-**为什么需要 LRU Cache**
-```
-场景: 热点用户频繁更新
-
-没有 Cache:
-  - 每次更新都查询 RocksDB
-  - 10000 次更新 = 10000 次 RocksDB 查询
-  - 耗时: 10000 * 0.1ms = 1s
-
-有 Cache (命中率 95%):
-  - 9500 次命中 Cache (0.01ms)
-  - 500 次查询 RocksDB (0.1ms)
-  - 耗时: 9500 * 0.01ms + 500 * 0.1ms = 145ms
-  
-加速比: 7x
-```
-
-**为什么支持 InMemory 状态**
-```
-小表场景 (< 1000 万行):
-  - 全内存,无磁盘 I/O
-  - 查询延迟 < 1us
-  - 适合维度表
-```
-
-**权衡取舍**
-| 维度 | RocksDB | InMemory |
-|------|---------|----------|
-| 容量 | TB 级 | GB 级 |
-| 查询延迟 | 0.1ms | 0.001ms |
-| 写入吞吐 | 100K ops/s | 1M ops/s |
-| 持久化 | 是 | 否 |
-| 适用场景 | 大表 | 小表 |
-
-**架构演进**
-```
-Phase 1: 无 Lookup (全表扫描)
-  -> 更新慢
-
-Phase 2: 内存 Lookup (HashMap)
-  -> 容量受限
-
-Phase 3: RocksDB Lookup
-  -> 支持大表
-
-Phase 4: RocksDB + LRU Cache
-  -> 兼顾容量和性能
-```
-
-**参数调优建议**
-```sql
--- 小表 (< 1000 万行): 内存状态
-'lookup.state-factory' = 'memory'
-
--- 大表 (> 1000 万行): RocksDB
-'lookup.state-factory' = 'rocksdb'
-'lookup.rocksdb.path' = '/data/paimon/lookup'
-
--- Cache 大小: 热点数据量的 2 倍
-'lookup.cache-rows' = '2000000'  -- 200 万行
-
--- RocksDB 调优
-'lookup.rocksdb.block-cache-size' = '256MB'
-'lookup.rocksdb.write-buffer-size' = '64MB'
-```
-
-**性能对比**
-```
-场景: 1 亿行数据,1000 万次更新
-
-无 Lookup:
-  - 每次更新扫描全表
-  - 耗时: 数天
-
-内存 Lookup:
-  - 内存不足,OOM
-  
-RocksDB Lookup (无 Cache):
-  - 1000 万次 RocksDB 查询
-  - 耗时: 1000 万 * 0.1ms = 16 分钟
-
-RocksDB + LRU Cache (命中率 95%):
-  - 50 万次 RocksDB 查询
-  - 耗时: 50 万 * 0.1ms + 950 万 * 0.01ms = 2 分钟
-  
-加速比: 8x
-```
-
-**Bootstrap 优化**
-```java
-// 启动时扫描全表构建 Lookup
-if (stateFactory.preferBulkLoad()) {
-    // RocksDB: 使用 SST 文件批量导入
-    // 比逐条 put 快 10 倍
-    bulkLoadFromSnapshot();
-} else {
-    // InMemory: 逐条 put
-    loadFromSnapshot();
-}
-```
-
-### 16.1 StateFactory 接口
-
-源码路径: `paimon-core/src/main/java/org/apache/paimon/lookup/StateFactory.java` (L27-L51)
-
-```java
-public interface StateFactory extends Closeable {
-    <K, V> ValueState<K, V> valueState(String name, Serializer<K> keySerializer, 
-            Serializer<V> valueSerializer, long lruCacheSize) throws IOException;
-    
-    <K, V> SetState<K, V> setState(String name, Serializer<K> keySerializer, 
-            Serializer<V> valueSerializer, long lruCacheSize) throws IOException;
-    
-    <K, V> ListState<K, V> listState(String name, Serializer<K> keySerializer, 
-            Serializer<V> valueSerializer, long lruCacheSize) throws IOException;
-    
-    boolean preferBulkLoad();    // 是否偏好批量加载
-}
-```
-
-### 16.2 RocksDB 状态后端
-
-源码路径: `paimon-core/src/main/java/org/apache/paimon/lookup/rocksdb/RocksDBStateFactory.java` (L45)
-
-- 数据持久化到本地磁盘，适合大数据量
-- 支持 TTL (通过 `TtlDB`)
-- 支持 merge operator (字符串追加)
-- `preferBulkLoad() = true`: RocksDB 的 SST 文件导入比逐条 put 更高效
-
-**为什么默认使用 RocksDB**: Lookup 需要存储 `key -> (fileName, position)` 的映射。对于大表，这个映射可能有数十亿条目，放不进内存。RocksDB 作为嵌入式 KV 存储，通过 LSM-tree 结构可以高效地在磁盘上存储和查询海量数据。
-
-### 16.3 InMemory 状态后端
-
-源码路径: `paimon-core/src/main/java/org/apache/paimon/lookup/memory/InMemoryStateFactory.java` (L30)
-
-- 全内存存储，适合小数据量
-- `preferBulkLoad() = false`: 内存操作不需要批量优化
-- 提供 `InMemoryValueState`, `InMemorySetState`, `InMemoryListState`
-
-### 16.4 LRU Cache 策略
-
-所有 State 接口都接受 `lruCacheSize` 参数:
-- RocksDB 状态: LRU Cache 缓存最近访问的 KV 对，减少磁盘读取
-- InMemory 状态: LRU Cache 限制内存使用上限
-
-**为什么需要 LRU Cache**: Lookup 操作在写入每条记录时都会触发。热点 key (频繁更新的记录) 通过 LRU Cache 可以避免重复的 RocksDB 查询。Cache size 通过 `lookup.cache-rows` 等参数配置。
-
----
-
-## 17. 与 Iceberg DV 对比
+## 10. 与 Iceberg DV 对比
 
 | 维度 | Paimon DV | Iceberg DV |
 |------|-----------|------------|
@@ -4048,19 +561,36 @@ public interface StateFactory extends Closeable {
 | **关联方式** | 通过 IndexManifest 中的 IndexFileMeta | 通过 Manifest 中的 content_offset/content_length |
 | **粒度** | 每个 bucket 一个 DV 文件 (PK 表) 或 Rolling 多个文件 (Append 表) | 每个 data file 一个 DV blob |
 | **更新方式** | 增量合并 (merge + writeSingleFile 整体重写) | Copy-on-Write (重写整个 Puffin 文件) |
-| **产生方式** | 写入时自动通过 Lookup 生成 | 需要显式执行 DELETE 或 rewrite |
+| **产生方式** | PK 表在 **lookup compaction** 时自动生成；Append 表由 DELETE 语句生成 | 需要显式执行 DELETE 或 rewrite |
 | **用途** | 消除 merge-on-read 开销，使 PK 表读取接近 Append 表 | 替代 position delete 文件 |
-| **与 Compaction 关系** | Compaction 消除 DV (旧文件 DV 被移除) | 没有直接关系，需要单独的 rewrite 操作 |
+| **与 Compaction 关系** | Compaction 既生成 DV、也消除 DV (旧文件 DV 被移除) | 没有直接关系，需要单独的 rewrite 操作 |
 | **格式兼容性** | V2 格式参考 Iceberg DV 格式 (Little-Endian, 64-bit Roaring) | Iceberg 标准格式 |
 | **Checkpoint 恢复** | 从 Writer 保存的 restoredFiles 恢复 | 从 Iceberg Snapshot 恢复 |
-| **实时性** | 实时写入时产生 DV | 通常由 Spark/Trino 等批处理引擎产生 |
+| **实时性** | 实时写入 + 同步 compaction 时产生 DV | 通常由 Spark/Trino 等批处理引擎产生 |
 
 **Paimon DV 的独特优势**:
 
-1. **与 LSM-tree 深度集成**: Paimon 的 DV 通过 Lookup 机制在写入时**自动**生成，无需额外操作。用户写入一条更新记录时，系统自动查找旧记录并标记删除。
+1. **与 LSM-tree 深度集成**: Paimon 的 DV 在 **lookup compaction** 时自动生成——compaction 把 Level 0 推向高层、对每个 key lookup 更高 level 的旧版本并标删，无需用户额外操作。
 
-2. **Compaction 自动清理**: LSM-tree 的 Compaction 过程天然会消除 DV，不需要像 Iceberg 那样手动执行 `rewrite` 操作。
+2. **Compaction 既产又消**: LSM compaction 一边为"被新版本顶替的旧行"生成 DV，一边把"参与本次 compaction 的旧文件的 DV"回收（`notifyRewriteCompactBefore`），不需要像 Iceberg 那样手动 `rewrite`。
 
-3. **读取优化**: DV 启用后，PK 表的读取跳过 LSM merge，性能接近 Append 表。这是因为每个数据文件中有效的行（未被 DV 标记删除的行）就是最新版本，无需与其他文件合并。
+3. **读取优化**: DV 启用后 PK 表读取跳过 LSM merge，逐文件顺序读 + 位图跳行，性能接近 Append 表。
 
-4. **Append 表也支持**: Paimon 允许在 Append 表上使用 DV 实现行级删除（`DELETE FROM` 语句），而 Iceberg 的 DV 仅用于替代 position delete。
+4. **Append 表也支持**: Paimon 允许在 Append 表上用 DV 实现行级 `DELETE`，而 Iceberg 的 DV 仅用于替代 position delete。
+
+---
+
+## 11. 设计决策总结
+
+| 决策点 | 选择 | 取舍/代价 | 收益 |
+|--------|------|-----------|------|
+| 删除标记的形态 | per-data-file 的 **Roaring 位图**（DV），而非独立 delete 文件 | 整块位图须驻内存判定；不能部分加载 | `isDeleted` O(1)、零 join、稀疏/密集都极致压缩、支持 OR 合并 |
+| merge 时机 | **MOW**：compaction 时归并并生成 DV，读时免归并 | 写期多一次 lookup + compaction 必须同步 | 读取从"每查必归并"降到接近 Append 表 |
+| 不走 COW | 主键表用 LSM 追加 + 后台 compaction + DV | 旧文件与 DV 共存到下次 compaction（空间放大） | 避免"改一行重写整文件"的写放大灾难 |
+| DV 生成位置 | lookup compaction（`LookupChangelogMergeFunctionWrapper`），**非 flush** | Level 0 在 compaction 前对读不可见 | 只标记"被聚合掉的旧高层行"，逻辑闭环、可被 compaction 回收 |
+| V1/V2 双格式 | Magic Number 自动分派，可同表混存 | 两套序列化（BE/LE）维护成本 | V1 省（2^31 行内）、V2 兼容 Iceberg 且支持超大文件 + RLE |
+| 索引文件组织 | 一个物理 `.index` 顺序存多 DV + `dvRanges` offset 表 | 改任一 DV 须重写整个索引文件 | 不爆小文件、精确 seek、顺序写 |
+| 写入模式分流 | 分桶/PK 单文件重写；无桶 Append 按 size Rolling | 无桶部分修改要"未改动 DV 搬家" | 适配两种桶形态的文件数规模 |
+| 内存维护 + `modified` | `BucketedDvMaintainer` 内存 map + 脏标记，提交时整体写 | 整 bucket DV 常驻内存 | 高频标记 O(1)、无改动不写文件、支持 failover 恢复 |
+| 与文件索引叠加 | DV 在最外层、文件索引行选择在内层，同基于文件内行号 | 两层装饰器 | 谓词命中行 + 失效行剔除互不冲突、可组合 |
+| 默认关闭 | `deletion-vectors.enabled` 默认 `false` | 用户需显式开启 | 超高频写/极少读场景仍可留在低写放大的 MOR |

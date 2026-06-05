@@ -1,0 +1,394 @@
+---
+title: "管理快照"
+sidebar_position: 5
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# 管理快照 {#manage-snapshots}
+
+本节将介绍与快照相关的管理与行为。
+
+## 快照过期 {#expire-snapshots}
+
+Paimon 写入端每次提交都会生成一个或两个[快照（snapshot）](../concepts/basic-concepts#snapshot)。每个快照可能会新增一些数据文件，或将某些旧数据文件标记为已删除。然而，被标记的数据文件并不会真正删除，因为 Paimon 还支持时间旅行（time travel）到更早的快照。只有当快照过期时，它们才会被删除。
+
+目前，过期由 Paimon 写入端在提交新变更时自动执行。通过让旧快照过期，可以删除不再使用的旧数据文件和元数据文件，从而释放磁盘空间。
+
+快照过期由以下表属性控制。
+
+<table className="table table-bordered">
+    <thead>
+    <tr>
+      <th className="text-left" style={{width: "20%"}}>配置项</th>
+      <th className="text-left" style={{width: "5%"}}>是否必填</th>
+      <th className="text-left" style={{width: "5%"}}>默认值</th>
+      <th className="text-left" style={{width: "10%"}}>类型</th>
+      <th className="text-left" style={{width: "60%"}}>说明</th>
+    </tr>
+    </thead>
+    <tbody>
+    <tr>
+      <td><h5>snapshot.time-retained</h5></td>
+      <td>否</td>
+      <td style={{wordWrap: "break-word"}}>1 h</td>
+      <td>Duration</td>
+      <td>已完成快照保留的最长时间。</td>
+    </tr>
+    <tr>
+      <td><h5>snapshot.num-retained.min</h5></td>
+      <td>否</td>
+      <td style={{wordWrap: "break-word"}}>10</td>
+      <td>Integer</td>
+      <td>已完成快照保留的最小数量。应大于或等于 1。</td>
+    </tr>
+    <tr>
+      <td><h5>snapshot.num-retained.max</h5></td>
+      <td>否</td>
+      <td style={{wordWrap: "break-word"}}>Integer.MAX_VALUE</td>
+      <td>Integer</td>
+      <td>已完成快照保留的最大数量。应大于或等于最小数量。</td>
+    </tr>
+    <tr>
+      <td><h5>snapshot.expire.execution-mode</h5></td>
+      <td>否</td>
+      <td style={{wordWrap: "break-word"}}>sync</td>
+      <td>Enum</td>
+      <td>指定过期的执行模式。</td>
+    </tr>
+    <tr>
+      <td><h5>snapshot.expire.limit</h5></td>
+      <td>否</td>
+      <td style={{wordWrap: "break-word"}}>10</td>
+      <td>Integer</td>
+      <td>一次允许过期的快照最大数量。</td>
+    </tr>
+    </tbody>
+</table>
+
+当快照数量小于 `snapshot.num-retained.min` 时，不会有任何快照过期（即使满足 `snapshot.time-retained` 条件）；此后将使用 `snapshot.num-retained.max` 和 `snapshot.time-retained` 来控制快照过期，直到剩余快照满足条件为止。
+
+下面的示例展示了更多细节（`snapshot.num-retained.min` 为 2，`snapshot.time-retained` 为 1h，`snapshot.num-retained.max` 为 5）：
+
+> 快照项使用元组（snapshotId, 对应时间）来描述
+
+<table>
+<thead>
+    <tr>
+      <th className="text-left" style={{width: "30%"}}>新快照</th>
+      <th className="text-left" style={{width: "40%"}}>过期检查后的全部快照</th>
+      <th className="text-left" style={{width: "30%"}}>说明</th>
+    </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>
+         (snapshots-1, 2023-07-06 10:00)
+        </td>
+        <td>
+         (snapshots-1, 2023-07-06 10:00)
+        </td>
+        <td>
+          没有快照过期
+        </td>
+      </tr>
+      <tr>
+        <td>
+         (snapshots-2, 2023-07-06 10:20)
+        </td>
+        <td>
+         (snapshots-1, 2023-07-06 10:00) <br/>
+         (snapshots-2, 2023-07-06 10:20)
+        </td>
+        <td>
+          没有快照过期
+        </td>
+      </tr>
+      <tr>
+        <td>
+          (snapshots-3, 2023-07-06 10:40)
+        </td>
+        <td>
+           (snapshots-1, 2023-07-06 10:00) <br/>
+           (snapshots-2, 2023-07-06 10:20) <br/>
+           (snapshots-3, 2023-07-06 10:40)
+        </td>
+        <td>
+           没有快照过期
+        </td>
+      </tr>
+      <tr>
+        <td>
+          (snapshots-4, 2023-07-06 11:00)
+        </td>
+        <td>
+          (snapshots-1, 2023-07-06 10:00) <br/>
+          (snapshots-2, 2023-07-06 10:20) <br/>
+          (snapshots-3, 2023-07-06 10:40) <br/>
+          (snapshots-4, 2023-07-06 11:00) <br/>
+        </td>
+        <td>
+           没有快照过期
+        </td>
+      </tr>
+      <tr>
+        <td>
+          (snapshots-5, 2023-07-06 11:20)
+        </td>
+        <td>
+          (snapshots-2, 2023-07-06 10:20) <br/>
+          (snapshots-3, 2023-07-06 10:40) <br/>
+          (snapshots-4, 2023-07-06 11:00) <br/>
+          (snapshots-5, 2023-07-06 11:20)
+        </td>
+        <td>
+           snapshot-1 因不满足 `snapshot.time-retained` 条件而过期
+        </td>
+      </tr>
+      <tr>
+        <td>
+          (snapshots-6, 2023-07-06 11:30)
+        </td>
+        <td>
+        (snapshots-3, 2023-07-06 10:40) <br/>
+        (snapshots-4, 2023-07-06 11:00) <br/>
+        (snapshots-5, 2023-07-06 11:20) <br/>
+        (snapshots-6, 2023-07-06 11:30)
+        </td>
+        <td>
+        snapshot-2 因不满足 `snapshot.time-retained` 条件而过期
+        </td>
+      </tr>
+      <tr>
+        <td>
+          (snapshots-7, 2023-07-06 11:35)
+        </td>
+        <td>
+        (snapshots-3, 2023-07-06 10:40) <br/>
+        (snapshots-4, 2023-07-06 11:00) <br/>
+        (snapshots-5, 2023-07-06 11:20) <br/>
+        (snapshots-6, 2023-07-06 11:30) <br/>
+        (snapshots-7, 2023-07-06 11:35)
+        </td>
+        <td>
+        没有快照过期
+        </td>
+      </tr>
+      <tr>
+        <td>
+          (snapshots-8, 2023-07-06 11:36)
+        </td>
+        <td>
+        (snapshots-4, 2023-07-06 11:00) <br/>
+        (snapshots-5, 2023-07-06 11:20) <br/>
+        (snapshots-6, 2023-07-06 11:30) <br/>
+        (snapshots-7, 2023-07-06 11:35) <br/>
+        (snapshots-8, 2023-07-06 11:36)
+        </td>
+        <td>
+         snapshot-3 因不满足 `snapshot.num-retained.max` 条件而过期
+        </td>
+      </tr>
+    </tbody>
+</table>
+
+请注意，保留时间过短或保留数量过小可能导致：
+
+- 批式查询无法找到文件。例如，表相对较大，批式查询需要 10 分钟才能读取完成，但 10 分钟前的快照已过期，此时批式查询将读取到一个已删除的快照。
+- 表文件上的流式读取作业无法重新启动。
+  当作业重启时，它记录的快照可能已经过期。（你可以使用
+  [Consumer Id](../flink/consumer-id) 在快照过期保留时间较短的情况下保护流式读取）。
+
+默认情况下，Paimon 会同步删除过期的快照。当需要删除的文件过多时，可能无法快速删除，并对上游算子产生反压。为避免这种情况，用户可以通过将 `snapshot.expire.execution-mode` 设置为 `async` 来使用异步过期模式。但是，如果你的作业以批式模式运行，则不建议使用异步过期模式，因为过期任务可能无法成功完成。
+
+## 手动让快照过期 {#manually-expire-snapshot}
+手动让某张表的快照过期
+<Tabs groupId="manually-expire-snapshot">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+运行以下命令：
+
+```sql
+-- for Flink 1.18
+CALL sys.expire_snapshots('database_name.table_name', 2)
+-- for Flink 1.19 and later
+CALL sys.expire_snapshots(`table` => 'database_name.table_name', retain_max => 2)
+CALL sys.expire_snapshots(`table` => 'database_name.table_name', older_than => '2024-01-01 12:00:00')
+CALL sys.expire_snapshots(`table` => 'database_name.table_name', older_than => '2024-01-01 12:00:00', retain_min => 10)
+CALL sys.expire_snapshots(`table` => 'database_name.table_name', older_than => '2024-01-01 12:00:00', max_deletes => 10, options => 'snapshot.expire.limit=1')
+```
+
+</TabItem>
+
+<TabItem value="flink-action" label="Flink Action">
+
+运行以下命令：
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    expire_snapshots \
+    --warehouse <warehouse-path> \
+    --identifier <identifier> \
+    --older_than <timestamp> \
+    --version <snapshot-id> \
+    --max_deletes <max-deletes> \
+    --retain_max <retain-max> \
+    --retain_min <retain-min> \
+    [--catalog_conf <paimon-catalog-conf> [--catalog_conf <paimon-catalog-conf> ...]]
+```
+
+</TabItem>
+
+<TabItem value="spark" label="Spark">
+
+运行以下 SQL：
+
+```sql
+CALL sys.expire_snapshots(table => 'database_name.table_name', retain_max => 10, options => 'snapshot.expire.limit=1');
+```
+
+</TabItem>
+
+</Tabs>
+
+## 回滚到快照 {#rollback-to-snapshot}
+
+将表回滚到指定的快照 ID。
+
+<Tabs groupId="rollback-to">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+运行以下命令：
+
+```sql
+CALL sys.rollback_to(`table` => 'database_name.table_name', snapshot_id => <snasphot-id>);
+```
+
+</TabItem>
+
+<TabItem value="flink-action" label="Flink Action">
+
+运行以下命令：
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    rollback_to \
+    --warehouse <warehouse-path> \
+    --database <database-name> \
+    --table <table-name> \
+    --version <snapshot-id> \
+    [--catalog_conf <paimon-catalog-conf> [--catalog_conf <paimon-catalog-conf> ...]]
+```
+
+</TabItem>
+
+<TabItem value="java-api" label="Java API">
+
+```java
+import org.apache.paimon.table.Table;
+
+public class RollbackTo {
+
+    public static void main(String[] args) {
+        // before rollback:
+        // snapshot-3
+        // snapshot-4
+        // snapshot-5
+        // snapshot-6
+        // snapshot-7
+      
+        table.rollbackTo(5);
+        
+        // after rollback:
+        // snapshot-3
+        // snapshot-4
+        // snapshot-5
+    }
+}
+```
+
+</TabItem>
+
+<TabItem value="spark" label="Spark">
+
+运行以下 SQL：
+
+```sql
+CALL sys.rollback(table => 'database_name.table_name', snapshot => snasphot_id);
+```
+
+</TabItem>
+
+</Tabs>
+
+## 移除孤儿文件 {#remove-orphan-files}
+
+Paimon 文件只有在快照过期时才会被物理删除。然而，在删除文件时可能发生某些意外错误，从而导致存在未被任何 Paimon 快照使用的文件（即所谓的“孤儿文件”）。你可以提交一个 `remove_orphan_files` 作业来清理它们：
+
+<Tabs groupId="remove-orphan-files">
+
+<TabItem value="spark-sql-flink-sql" label="Spark SQL/Flink SQL">
+
+```sql
+CALL sys.remove_orphan_files(`table` => 'my_db.my_table', [older_than => '2023-10-31 12:00:00'])
+
+CALL sys.remove_orphan_files(`table` => 'my_db.*', [older_than => '2023-10-31 12:00:00'])
+```
+
+</TabItem>
+
+<TabItem value="flink-action" label="Flink Action">
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    remove_orphan_files \
+    --warehouse <warehouse-path> \
+    --database <database-name> \
+    --table <table-name> \
+    [--older_than <timestamp>] \
+    [--dry_run <false/true>] \
+    [--parallelism <parallelism>]
+```
+
+为避免删除其他写入作业新增的文件，该 Action 默认只删除超过 1 天的孤儿文件。该时间间隔可以通过 `--older_than` 修改。例如：
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    remove_orphan_files \
+    --warehouse <warehouse-path> \
+    --database <database-name> \
+    --table T \
+    --older_than '2023-10-31 12:00:00'
+```
+
+table 可以设为 `*`，以清理数据库中的所有表。
+
+</TabItem>
+
+</Tabs>

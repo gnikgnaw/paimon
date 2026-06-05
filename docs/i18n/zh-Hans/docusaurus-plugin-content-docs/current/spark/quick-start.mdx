@@ -1,0 +1,393 @@
+---
+title: "快速开始"
+sidebar_position: 1
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+import Stable from '@site/src/components/Stable';
+import Unstable from '@site/src/components/Unstable';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# 快速开始 {#quick-start}
+
+## 准备工作 {#preparation}
+
+Paimon 支持以下 Spark 版本及其各自的 Java 和 Scala 兼容性。我们推荐使用最新的 Spark 版本以获得更好的体验。
+
+- Spark 4.x（包括 4.1、4.0）：使用 Java 17 和 Scala 2.13 预构建
+
+- Spark 3.x（包括 3.5、3.4、3.3、3.2）：使用 Java 8 和 Scala 2.12/2.13 预构建
+
+下载对应版本的 jar 文件。
+
+<Stable>
+
+
+
+| 版本      | Jar (Scala 2.12)                                                                                                                                                                    | Jar (Scala 2.13)                                                                                                                                                                    |
+|-----------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Spark 4.1 | -                                                                                                                                                                                   | [paimon-spark-4.1_2.13-@@VERSION@@.jar](https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-spark-4.1_2.13/@@VERSION@@/paimon-spark-4.1_2.13-@@VERSION@@.jar) |
+| Spark 4.0 | -                                                                                                                                                                                   | [paimon-spark-4.0_2.13-@@VERSION@@.jar](https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-spark-4.0_2.13/@@VERSION@@/paimon-spark-4.0_2.13-@@VERSION@@.jar) |
+| Spark 3.5 | [paimon-spark-3.5_2.12-@@VERSION@@.jar](https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-spark-3.5_2.12/@@VERSION@@/paimon-spark-3.5_2.12-@@VERSION@@.jar) | [paimon-spark-3.5_2.13-@@VERSION@@.jar](https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-spark-3.5_2.13/@@VERSION@@/paimon-spark-3.5_2.13-@@VERSION@@.jar) |
+| Spark 3.4 | [paimon-spark-3.4_2.12-@@VERSION@@.jar](https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-spark-3.4_2.12/@@VERSION@@/paimon-spark-3.4_2.12-@@VERSION@@.jar) | [paimon-spark-3.4_2.13-@@VERSION@@.jar](https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-spark-3.4_2.13/@@VERSION@@/paimon-spark-3.4_2.13-@@VERSION@@.jar) |
+| Spark 3.3 | [paimon-spark-3.3_2.12-@@VERSION@@.jar](https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-spark-3.3_2.12/@@VERSION@@/paimon-spark-3.3_2.12-@@VERSION@@.jar) | [paimon-spark-3.3_2.13-@@VERSION@@.jar](https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-spark-3.3_2.13/@@VERSION@@/paimon-spark-3.3_2.13-@@VERSION@@.jar) |
+| Spark 3.2 | [paimon-spark-3.2_2.12-@@VERSION@@.jar](https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-spark-3.2_2.12/@@VERSION@@/paimon-spark-3.2_2.12-@@VERSION@@.jar) | [paimon-spark-3.2_2.13-@@VERSION@@.jar](https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-spark-3.2_2.13/@@VERSION@@/paimon-spark-3.2_2.13-@@VERSION@@.jar) |
+
+
+
+</Stable>
+
+<Unstable>
+
+
+
+| 版本      | Jar (Scala 2.12)                                                                                                                              | Jar (Scala 2.13)                                                                                                                              |
+|-----------|-----------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------|
+| Spark 4.1 | -                                                                                                                                             | [paimon-spark-4.1_2.13-@@VERSION@@.jar](https://repository.apache.org/snapshots/org/apache/paimon/paimon-spark-4.1_2.13/@@VERSION@@/) |
+| Spark 4.0 | -                                                                                                                                             | [paimon-spark-4.0_2.13-@@VERSION@@.jar](https://repository.apache.org/snapshots/org/apache/paimon/paimon-spark-4.0_2.13/@@VERSION@@/) |
+| Spark 3.5 | [paimon-spark-3.5_2.12-@@VERSION@@.jar](https://repository.apache.org/snapshots/org/apache/paimon/paimon-spark-3.5_2.12/@@VERSION@@/) | [paimon-spark-3.5_2.13-@@VERSION@@.jar](https://repository.apache.org/snapshots/org/apache/paimon/paimon-spark-3.5_2.13/@@VERSION@@/) |
+| Spark 3.4 | [paimon-spark-3.4_2.12-@@VERSION@@.jar](https://repository.apache.org/snapshots/org/apache/paimon/paimon-spark-3.4_2.12/@@VERSION@@/) | [paimon-spark-3.4_2.13-@@VERSION@@.jar](https://repository.apache.org/snapshots/org/apache/paimon/paimon-spark-3.4_2.13/@@VERSION@@/) |
+| Spark 3.3 | [paimon-spark-3.3_2.12-@@VERSION@@.jar](https://repository.apache.org/snapshots/org/apache/paimon/paimon-spark-3.3_2.12/@@VERSION@@/) | [paimon-spark-3.3_2.13-@@VERSION@@.jar](https://repository.apache.org/snapshots/org/apache/paimon/paimon-spark-3.3_2.13/@@VERSION@@/) |
+| Spark 3.2 | [paimon-spark-3.2_2.12-@@VERSION@@.jar](https://repository.apache.org/snapshots/org/apache/paimon/paimon-spark-3.2_2.12/@@VERSION@@/) | [paimon-spark-3.2_2.13-@@VERSION@@.jar](https://repository.apache.org/snapshots/org/apache/paimon/paimon-spark-3.2_2.13/@@VERSION@@/) |
+
+
+
+</Unstable>
+
+你也可以从源码手动构建 bundled jar。
+
+要从源码构建，请先[克隆 git 仓库](@@GITHUB_REPO@@)，然后使用以下命令构建 bundled jar。
+
+```bash
+# build paimon spark 3.5 with scala 2.12
+mvn clean package -DskipTests -pl paimon-spark/paimon-spark-3.5 -am
+
+# build paimon spark 3.5 with scala 2.13
+mvn clean package -DskipTests -pl paimon-spark/paimon-spark-3.5 -am -Pscala-2.13
+
+# build paimon spark 4.0
+mvn clean package -DskipTests -pl paimon-spark/paimon-spark-4.0 -am -Pspark4
+
+# build paimon spark 4.1
+mvn clean package -DskipTests -pl paimon-spark/paimon-spark-4.1 -am -Pspark4
+```
+
+对于 Spark 3.5，你可以在 `./paimon-spark/paimon-spark-3.5/target/paimon-spark-3.5_2.12-@@VERSION@@.jar` 找到 bundled jar。
+
+## 设置 {#setup}
+
+:::info
+
+如果你使用 HDFS，请确保已设置环境变量 `HADOOP_HOME` 或 `HADOOP_CONF_DIR`。
+
+:::
+
+**第 1 步：指定 Paimon Jar 文件**
+
+在启动 `spark-sql` 时，将 paimon jar 文件的路径追加到 `--jars` 参数。
+
+```bash
+spark-sql ... --jars /path/to/paimon-spark-3.5_2.12-@@VERSION@@.jar
+```
+
+或者使用 `--packages` 选项。
+
+```bash
+spark-sql ... --packages org.apache.paimon:paimon-spark-3.5_2.12:@@VERSION@@
+```
+
+此外，你也可以将 `paimon-spark-3.5_2.12-@@VERSION@@.jar` 复制到 Spark 安装目录下的 `spark/jars` 中。
+
+**第 2 步：指定 Paimon Catalog**
+
+<Tabs groupId="specify-paimon-catalog">
+
+<TabItem value="catalog" label="Catalog">
+
+在启动 `spark-sql` 时，使用以下命令以 `paimon` 为名称注册 Paimon 的 Spark Catalog。warehouse 的表文件存储在 `/tmp/paimon` 下。
+
+```bash
+spark-sql ... \
+    --conf spark.sql.catalog.paimon=org.apache.paimon.spark.SparkCatalog \
+    --conf spark.sql.catalog.paimon.warehouse=file:/tmp/paimon \
+    --conf spark.sql.extensions=org.apache.paimon.spark.extensions.PaimonSparkSessionExtensions
+```
+
+Catalog 通过 spark.sql.catalog.(catalog_name) 下的属性进行配置。在上述例子中，'paimon' 是
+Catalog 名称，你可以将其改为你喜欢的 Catalog 名称。
+
+`spark-sql` 命令行启动后，运行以下 SQL 来创建并切换到数据库 `default`。
+
+```sql
+USE paimon;
+USE default;
+```
+
+切换到该 Catalog（`'USE paimon'`）后，Spark 已有的表将无法直接访问，你
+可以使用 `spark_catalog.${database_name}.${table_name}` 来访问 Spark 表。
+
+</TabItem>
+
+<TabItem value="generic-catalog" label="Generic Catalog">
+
+在启动 `spark-sql` 时，使用以下命令注册 Paimon 的 Spark Generic Catalog，以替换 Spark
+默认的 Catalog `spark_catalog`。（默认 warehouse 为 Spark `spark.sql.warehouse.dir`）
+
+目前，仅推荐在使用 Hive metastore 的场景下使用 `SparkGenericCatalog`，Paimon 会从 Spark session 推断
+Hive conf，你只需配置 Spark 的 Hive conf 即可。
+
+```bash
+spark-sql ... \
+    --conf spark.sql.catalog.spark_catalog=org.apache.paimon.spark.SparkGenericCatalog \
+    --conf spark.sql.extensions=org.apache.paimon.spark.extensions.PaimonSparkSessionExtensions
+```
+
+使用 `SparkGenericCatalog`，你可以在该 Catalog 中使用 Paimon 表，也可以使用非 Paimon 表，例如 Spark 的 csv、
+parquet、Hive 表等。
+
+</TabItem>
+
+</Tabs>
+
+## 创建表 {#create-table}
+
+<Tabs groupId="create-paimon-table">
+
+<TabItem value="catalog" label="Catalog">
+
+```sql
+create table my_table (
+    k int,
+    v string
+) tblproperties (
+    'primary-key' = 'k'
+);
+```
+
+</TabItem>
+
+<TabItem value="generic-catalog" label="Generic Catalog">
+
+```sql
+create table my_table (
+    k int,
+    v string
+) USING paimon
+tblproperties (
+    'primary-key' = 'k'
+);
+
+```
+
+</TabItem>
+
+</Tabs>
+
+## 插入表 {#insert-table}
+
+<Tabs groupId="insert-paimon-table">
+
+<TabItem value="sql" label="SQL">
+
+```sql
+INSERT INTO my_table VALUES (1, 'Hi'), (2, 'Hello');
+```
+
+</TabItem>
+
+<TabItem value="dataframe" label="DataFrame">
+
+```scala
+-- you can use
+Seq((1, "Hi"), (2, "Hello")).toDF("k", "v")
+  .write.format("paimon").mode("append").saveAsTable("my_table")
+
+-- or
+Seq((1, "Hi"), (2, "Hello")).toDF("k", "v")
+  .write.format("paimon").mode("append").save("file:/tmp/paimon/default.db/my_table")
+```
+
+</TabItem>
+
+</Tabs>
+
+## 查询表 {#query-table}
+
+<Tabs groupId="query-paimon-table">
+
+<TabItem value="sql" label="SQL">
+
+```sql
+SELECT * FROM my_table;
+
+/*
+1	Hi
+2	Hello
+*/
+```
+
+</TabItem>
+
+<TabItem value="dataframe" label="DataFrame">
+
+```scala
+-- you can use
+spark.read.format("paimon").table("my_table").show()
+
+-- or
+spark.read.format("paimon").load("file:/tmp/paimon/default.db/my_table").show()
+
+/*
++---+------+
+| k |     v|
++---+------+
+|  1|    Hi|
+|  2| Hello|
++---+------+
+*/
+```
+
+</TabItem>
+
+</Tabs>
+
+## Spark 类型转换 {#spark-type-conversion}
+
+本节列出 Spark 与 Paimon 之间所有支持的类型转换。
+Spark 的所有数据类型都位于包 `org.apache.spark.sql.types` 中。
+
+<table className="table table-bordered">
+    <thead>
+    <tr>
+      <th className="text-left" style={{width: "10%"}}>Spark 数据类型</th>
+      <th className="text-left" style={{width: "10%"}}>Paimon 数据类型</th>
+      <th className="text-left" style={{width: "5%"}}>原子类型</th>
+    </tr>
+    </thead>
+    <tbody>
+    <tr>
+      <td><code>StructType</code></td>
+      <td><code>RowType</code></td>
+      <td>false</td>
+    </tr>
+    <tr>
+      <td><code>MapType</code></td>
+      <td><code>MapType</code></td>
+      <td>false</td>
+    </tr>
+    <tr>
+      <td><code>ArrayType</code></td>
+      <td><code>ArrayType</code></td>
+      <td>false</td>
+    </tr>
+    <tr>
+      <td><code>BooleanType</code></td>
+      <td><code>BooleanType</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>ByteType</code></td>
+      <td><code>TinyIntType</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>ShortType</code></td>
+      <td><code>SmallIntType</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>IntegerType</code></td>
+      <td><code>IntType</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>LongType</code></td>
+      <td><code>BigIntType</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>FloatType</code></td>
+      <td><code>FloatType</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>DoubleType</code></td>
+      <td><code>DoubleType</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>StringType</code></td>
+      <td><code>VarCharType(Integer.MAX_VALUE)</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>VarCharType(length)</code></td>
+      <td><code>VarCharType(length)</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>CharType(length)</code></td>
+      <td><code>CharType(length)</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>DateType</code></td>
+      <td><code>DateType</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>TimestampType</code></td>
+      <td><code>LocalZonedTimestamp</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>TimestampNTZType(Spark3.4+)</code></td>
+      <td><code>TimestampType</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>DecimalType(precision, scale)</code></td>
+      <td><code>DecimalType(precision, scale)</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>BinaryType</code></td>
+      <td><code>VarBinaryType</code>, <code>BinaryType</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>VariantType(Spark4.0+)</code></td>
+      <td><code>VariantType</code></td>
+      <td>true</td>
+    </tr>
+    </tbody>
+</table>
+
+:::warning
+
+由于此前的设计，在 Spark3.3 及以下版本中，Paimon 会将 Paimon 的 TimestampType 和 LocalZonedTimestamp 都映射到 Spark 的 TimestampType，并且只能正确处理 TimestampType。
+
+因此，在使用 Spark3.3 及以下版本时，读取由其他引擎（如 Flink）写入的、带有 LocalZonedTimestamp 类型的 Paimon 表时，LocalZonedTimestamp 类型的查询结果会带有时区偏移，需要手动调整。
+
+在使用 Spark3.4 及以上版本时，所有 timestamp 类型都能被正确解析。
+
+:::

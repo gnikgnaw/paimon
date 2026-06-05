@@ -1,0 +1,130 @@
+---
+title: "本地缓存"
+sidebar_position: 8
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# 本地缓存 {#local-cache}
+
+从远程存储（S3、OSS、HDFS 等）读取文件时，每次 seek+read 都需要经过网络。Paimon 提供了块级别的本地缓存，可以透明地缓存文件读取，从而显著减少重复访问模式下的远程 I/O。
+
+该缓存支持两种模式：
+- **磁盘缓存**：当配置了 `local-cache.dir` 时，数据块会缓存到本地磁盘。
+- **内存缓存**：当未配置 `local-cache.dir` 时，数据块会缓存到内存中。
+
+## 被缓存的文件类型 {#cached-file-types}
+
+缓存会按类型对文件进行分类。默认情况下，只有 `meta` 和 `global-index` 类型会被缓存。你可以通过 `local-cache.whitelist` 配置项自定义这一行为。
+
+| 文件类型 | 配置名 | 示例 | 默认是否缓存 |
+|-----------|-------------|----------|----------------|
+| META | meta | snapshot、schema、manifest、statistics、tag | 是 |
+| GLOBAL_INDEX | global-index | BTree、Lumina、Tantivy 索引文件 | 是 |
+| BUCKET_INDEX | bucket-index | Hash、删除向量（Deletion Vector）索引文件 | 否 |
+| DATA | data | 数据文件（ORC、Parquet 等） | 否 |
+| FILE_INDEX | file-index | 数据文件级别的布隆过滤器、位图 | 否 |
+
+所有文件类型都可以加入白名单。默认白名单为 `meta,global-index`。
+
+## 启用缓存 {#enable-cache}
+
+这是一个 Catalog 级别的配置项。在创建 Catalog 时进行配置：
+
+<Tabs groupId="enable-cache">
+
+<TabItem value="java" label="Java">
+
+```java
+import org.apache.paimon.catalog.CatalogContext;
+import org.apache.paimon.catalog.CatalogFactory;
+import org.apache.paimon.options.Options;
+
+Options options = new Options();
+options.set("warehouse", "s3://my-bucket/warehouse");
+options.set("local-cache.enabled", "true");
+// optional: use disk cache by specifying a directory
+options.set("local-cache.dir", "/tmp/paimon-cache");
+// optional: customize limits
+options.set("local-cache.max-size", "2gb");
+options.set("local-cache.block-size", "1mb");
+
+CatalogContext context = CatalogContext.create(options);
+Catalog catalog = CatalogFactory.createCatalog(context);
+
+// All tables from this catalog will use the cache
+Table table = catalog.getTable(Identifier.create("my_db", "my_table"));
+```
+
+</TabItem>
+
+<TabItem value="python" label="Python">
+
+```python
+import pypaimon
+
+options = {
+    "warehouse": "s3://my-bucket/warehouse",
+    "local-cache.enabled": "true",
+    # optional: use disk cache by specifying a directory
+    "local-cache.dir": "/tmp/paimon-cache",
+    # optional: customize limits
+    "local-cache.max-size": "2gb",
+    "local-cache.block-size": "1mb",
+}
+
+catalog = pypaimon.create_catalog(options)
+
+# All tables from this catalog will use the cache
+table = catalog.get_table("db.my_table")
+```
+
+</TabItem>
+
+</Tabs>
+
+## 缓存配置项 {#cache-options}
+
+| 配置项 | 类型 | 默认值 | 描述 |
+|--------|------|---------|-------------|
+| `local-cache.enabled` | Boolean | false | 是否为文件读取启用本地块缓存。 |
+| `local-cache.dir` | String | （无） | 用于在磁盘上存储缓存块的目录。如果未配置，则使用内存缓存。 |
+| `local-cache.max-size` | MemorySize | unlimited | 缓存的最大总大小。超出后，会淘汰最近最少使用的数据块。 |
+| `local-cache.block-size` | MemorySize | 1 mb | 用于缓存的块大小。文件在逻辑上被划分为固定大小的块，并独立缓存。 |
+| `local-cache.whitelist` | String | meta,global-index | 以逗号分隔的待缓存文件类型列表。支持的取值：`meta`、`global-index`、`bucket-index`、`data`、`file-index`。 |
+
+## 工作原理 {#how-it-works}
+
+- 文件在逻辑上被划分为固定大小的块（默认 1 MB）。
+- 在首次读取时，数据块会从远程存储下载并缓存到本地（磁盘或内存中）。
+- 对同一数据块的后续读取将由本地缓存提供服务，从而跳过远程 I/O。
+- 使用磁盘缓存时，缓存文件以远程文件路径和块偏移量作为键，因此它们可以在进程重启后保留并被复用。
+- 当缓存超过 `max-size` 时，最近最少使用的数据块会被自动淘汰。
+
+## 缓存生命周期 {#cache-lifecycle}
+
+缓存由 Catalog 创建和管理。从同一个 Catalog 获取的所有表共享同一个缓存实例。缓存的存续时间与 Catalog 对象的可达性一致——无需显式关闭。
+
+在分布式计算框架（Flink、Spark）中，`FileIO` 会被序列化并分发到 task manager。反序列化后，缓存**不会**被重新创建——读取会直接落到远程存储。这是有意为之的设计：缓存的生命周期与创建它的 Catalog 绑定，而反序列化后的 `FileIO` 不再由任何 Catalog 管理。
+
+如果你需要在 task manager 上进行缓存，请在每个工作节点上创建一个启用了缓存配置项的新 Catalog。

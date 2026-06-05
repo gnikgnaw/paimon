@@ -1,0 +1,248 @@
+---
+title: "全局索引"
+sidebar_position: 8
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# 全局索引 {#global-index}
+
+## 概述 {#overview}
+
+全局索引（Global Index）是一种面向 Data Evolution（append）表的强大索引机制。它能够在不进行全表扫描的情况下实现高效的行级 Lookup 与过滤。
+Paimon 支持多种全局索引类型：
+
+- **BTree 索引（BTree Index）**：基于 B-tree 的标量列 Lookup 索引。支持等值、IN、范围谓词，并可通过 AND/OR 逻辑跨多列组合使用。
+- **向量索引（Vector Index）**：由 DiskANN 驱动的近似最近邻（ANN）索引，用于向量相似度检索。
+- **全文索引（Full-Text Index）**：由 Tantivy 驱动的全文检索索引，用于文本检索。支持词项匹配与相关性打分。
+
+全局索引构建在 Data Evolution 表之上。要使用全局索引，你的表**必须**具备：
+
+- `'bucket' = '-1'`（无感知分桶模式，unaware-bucket）
+- `'row-tracking.enabled' = 'true'`
+- `'data-evolution.enabled' = 'true'`
+
+> 当索引仅覆盖表数据的一部分时，全局索引查询的结果可能并不精确。如果查询谓词命中了索引，Paimon 仅返回已建立索引部分的结果。尚未建立索引的数据中匹配的记录将不会被返回。
+
+## 前置条件 {#prerequisites}
+
+创建一张带有所需属性的表：
+
+```sql
+CREATE TABLE my_table (
+    id INT,
+    name STRING,
+    embedding ARRAY<FLOAT>,
+    content STRING
+) TBLPROPERTIES (
+    'bucket' = '-1',
+    'row-tracking.enabled' = 'true',
+    'data-evolution.enabled' = 'true',
+    'global-index.enabled' = 'true'
+);
+```
+
+## BTree 索引 {#btree-index}
+
+BTree 索引在 SST 文件之上构建一个逻辑 B-tree 结构，从而在标量列上实现高效的点查 Lookup 与范围查询。
+
+**构建 BTree 索引**
+
+```sql
+-- Create BTree index on 'name' column
+CALL sys.create_global_index(
+    table => 'db.my_table',
+    index_column => 'name',
+    index_type => 'btree'
+);
+```
+
+**使用 BTree 索引进行查询**
+
+一旦构建了 BTree 索引，当过滤谓词命中已建立索引的列时，扫描期间会自动使用该索引。
+
+```sql
+SELECT * FROM my_table WHERE name IN ('a200', 'a300');
+```
+
+## 向量索引 {#vector-index}
+
+向量索引基于 DiskANN 算法提供近似最近邻（ANN）检索。它适用于诸如推荐系统、图像检索以及 RAG（检索增强生成，
+Retrieval Augmented Generation）应用等向量相似度检索场景。
+
+**构建向量索引**
+
+```sql
+-- Create Lumina vector index on 'embedding' column
+CALL sys.create_global_index(
+    table => 'db.my_table',
+    index_column => 'embedding',
+    index_type => 'lumina',
+    options => 'lumina.index.dimension=128'
+);
+```
+
+为兼容既有表及 SQL，旧版索引类型 `lumina-vector-ann` 仍可被接受。
+
+**向量检索**
+
+<Tabs groupId="vector-search">
+
+<TabItem value="spark-sql" label="Spark SQL">
+
+```sql
+-- Search for top-5 nearest neighbors
+SELECT * FROM vector_search('my_table', 'embedding', array(1.0f, 2.0f, 3.0f), 5);
+```
+
+</TabItem>
+
+<TabItem value="flink-sql-procedure" label="Flink SQL（存储过程）">
+
+与 Spark 的表值函数不同，Flink 使用 `CALL` 存储过程来执行向量检索。
+该存储过程以字符串形式返回 JSON 序列化的行。
+
+```sql
+-- Search for top-5 nearest neighbors
+CALL sys.vector_search(
+    `table` => 'db.my_table',
+    vector_column => 'embedding',
+    query_vector => '1.0,2.0,3.0',
+    top_k => 5
+);
+
+-- With projection (only return specific columns)
+CALL sys.vector_search(
+    `table` => 'db.my_table',
+    vector_column => 'embedding',
+    query_vector => '1.0,2.0,3.0',
+    top_k => 5,
+    projection => 'id,name'
+);
+```
+
+</TabItem>
+
+<TabItem value="java-api" label="Java API">
+
+```java
+Table table = catalog.getTable(identifier);
+
+// Step 1: Build vector search
+float[] queryVector = {1.0f, 2.0f, 3.0f};
+GlobalIndexResult result = table.newVectorSearchBuilder()
+        .withVector(queryVector)
+        .withLimit(5)
+        .withVectorColumn("embedding")
+        .executeLocal();
+
+// Step 2: Read matching rows using the search result
+ReadBuilder readBuilder = table.newReadBuilder();
+TableScan.Plan plan = readBuilder.newScan().withGlobalIndexResult(result).plan();
+try (RecordReader<InternalRow> reader = readBuilder.newRead().createReader(plan)) {
+    reader.forEachRemaining(row -> {
+        System.out.println("id=" + row.getInt(0) + ", name=" + row.getString(1));
+    });
+}
+```
+
+</TabItem>
+
+</Tabs>
+
+## 全文索引 {#full-text-index}
+
+全文索引由 Tantivy 驱动，提供文本检索能力。它适用于诸如文档检索、日志分析以及基于内容的过滤等文本检索场景。
+
+**构建全文索引**
+
+```sql
+-- Create full-text index on 'content' column
+CALL sys.create_global_index(
+    table => 'db.my_table',
+    index_column => 'content',
+    index_type => 'tantivy-fulltext'
+);
+```
+
+**全文检索**
+
+<Tabs groupId="fulltext-search">
+
+<TabItem value="spark-sql" label="Spark SQL">
+
+```sql
+-- Search for top-10 documents matching the query
+SELECT * FROM full_text_search('my_table', 'content', 'paimon lake format', 10);
+```
+
+</TabItem>
+
+<TabItem value="java-api" label="Java API">
+
+```java
+Table table = catalog.getTable(identifier);
+
+// Step 1: Build full-text search
+GlobalIndexResult result = table.newFullTextSearchBuilder()
+        .withQueryText("paimon lake format")
+        .withLimit(10)
+        .withTextColumn("content")
+        .executeLocal();
+
+// Step 2: Read matching rows using the search result
+ReadBuilder readBuilder = table.newReadBuilder();
+TableScan.Plan plan = readBuilder.newScan().withGlobalIndexResult(result).plan();
+try (RecordReader<InternalRow> reader = readBuilder.newRead().createReader(plan)) {
+    reader.forEachRemaining(row -> {
+        System.out.println("id=" + row.getInt(0) + ", content=" + row.getString(1));
+    });
+}
+```
+
+</TabItem>
+
+<TabItem value="python-sdk" label="Python SDK">
+
+```python
+table = catalog.get_table('db.my_table')
+
+# Step 1: Build full-text search
+builder = table.new_full_text_search_builder()
+builder.with_text_column('content')
+builder.with_query_text('paimon lake format')
+builder.with_limit(10)
+result = builder.execute_local()
+
+# Step 2: Read matching rows using the search result
+read_builder = table.new_read_builder()
+scan = read_builder.new_scan().with_global_index_result(result)
+plan = scan.plan()
+table_read = read_builder.new_read()
+pa_table = table_read.to_arrow(plan.splits())
+print(pa_table)
+```
+
+</TabItem>
+
+</Tabs>

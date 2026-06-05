@@ -1,0 +1,102 @@
+---
+title: "配置"
+sidebar_position: 100
+---
+
+import ConfigTable from '@site/src/components/ConfigTable';
+import coreConfigurationHtml from '@site/generated/core_configuration.html';
+import catalogConfigurationHtml from '@site/generated/catalog_configuration.html';
+import hiveCatalogConfigurationHtml from '@site/generated/hive_catalog_configuration.html';
+import hiveConnectorConfigurationHtml from '@site/generated/hive_connector_configuration.html';
+import jdbcCatalogConfigurationHtml from '@site/generated/jdbc_catalog_configuration.html';
+import flinkCatalogConfigurationHtml from '@site/generated/flink_catalog_configuration.html';
+import flinkConnectorConfigurationHtml from '@site/generated/flink_connector_configuration.html';
+import sparkCatalogConfigurationHtml from '@site/generated/spark_catalog_configuration.html';
+import sparkConnectorConfigurationHtml from '@site/generated/spark_connector_configuration.html';
+import orcConfigurationHtml from '@site/generated/orc_configuration.html';
+import rocksdbConfigurationHtml from '@site/generated/rocksdb_configuration.html';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# 配置 {#configuration}
+
+### CoreOptions {#coreoptions}
+
+Paimon 的核心配置项。
+
+<ConfigTable html={coreConfigurationHtml} />
+
+### CatalogOptions {#catalogoptions}
+
+Paimon Catalog 的配置项。
+
+<ConfigTable html={catalogConfigurationHtml} />
+
+### HiveCatalogOptions {#hivecatalogoptions}
+
+Hive Catalog 的配置项。
+
+<ConfigTable html={hiveCatalogConfigurationHtml} />
+
+### HiveConnectorOptions {#hiveconnectoroptions}
+
+Paimon 的 Hive 连接器配置项。
+
+<ConfigTable html={hiveConnectorConfigurationHtml} />
+
+### JdbcCatalogOptions {#jdbccatalogoptions}
+
+Jdbc Catalog 的配置项。
+
+<ConfigTable html={jdbcCatalogConfigurationHtml} />
+
+### FlinkCatalogOptions {#flinkcatalogoptions}
+
+Paimon 的 Flink Catalog 配置项。
+
+<ConfigTable html={flinkCatalogConfigurationHtml} />
+
+### FlinkConnectorOptions {#flinkconnectoroptions}
+
+Paimon 的 Flink 连接器配置项。
+
+<ConfigTable html={flinkConnectorConfigurationHtml} />
+
+### SparkCatalogOptions {#sparkcatalogoptions}
+
+Paimon 的 Spark Catalog 配置项。
+
+<ConfigTable html={sparkCatalogConfigurationHtml} />
+
+### SparkConnectorOptions {#sparkconnectoroptions}
+
+Paimon 的 Spark 连接器配置项。
+
+<ConfigTable html={sparkConnectorConfigurationHtml} />
+
+### ORC 配置项 {#orc-options}
+
+<ConfigTable html={orcConfigurationHtml} />
+
+### RocksDB 配置项 {#rocksdb-options}
+
+以下配置项允许用户对 RocksDB 进行精细调优以获得更好的性能。你可以在表属性中指定这些配置项，也可以在动态表 hint 中指定。
+
+<ConfigTable html={rocksdbConfigurationHtml} />

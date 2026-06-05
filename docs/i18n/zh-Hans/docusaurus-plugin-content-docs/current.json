@@ -1,0 +1,74 @@
+{
+  "version.label": {
+    "message": "Next",
+    "description": "The label for version current"
+  },
+  "sidebar.docs.category.Concepts": {
+    "message": "概念",
+    "description": "The label for category 'Concepts' in sidebar 'docs'"
+  },
+  "sidebar.docs.category.RESTCatalog": {
+    "message": "REST Catalog",
+    "description": "The label for category 'RESTCatalog' in sidebar 'docs'"
+  },
+  "sidebar.docs.category.Specification": {
+    "message": "规格说明",
+    "description": "The label for category 'Specification' in sidebar 'docs'"
+  },
+  "sidebar.docs.category.Table with PK": {
+    "message": "主键表",
+    "description": "The label for category 'Table with PK' in sidebar 'docs'"
+  },
+  "sidebar.docs.category.Merge Engine": {
+    "message": "合并引擎",
+    "description": "The label for category 'Merge Engine' in sidebar 'docs'"
+  },
+  "sidebar.docs.category.Table w/o PK": {
+    "message": "非主键表",
+    "description": "The label for category 'Table w/o PK' in sidebar 'docs'"
+  },
+  "sidebar.docs.category.Engine Flink": {
+    "message": "Flink 引擎",
+    "description": "The label for category 'Engine Flink' in sidebar 'docs'"
+  },
+  "sidebar.docs.category.Engine Spark": {
+    "message": "Spark 引擎",
+    "description": "The label for category 'Engine Spark' in sidebar 'docs'"
+  },
+  "sidebar.docs.category.PyPaimon & AI": {
+    "message": "PyPaimon 与 AI",
+    "description": "The label for category 'PyPaimon & AI' in sidebar 'docs'"
+  },
+  "sidebar.docs.category.Ecosystem": {
+    "message": "生态集成",
+    "description": "The label for category 'Ecosystem' in sidebar 'docs'"
+  },
+  "sidebar.docs.category.CDC Ingestion": {
+    "message": "CDC 接入",
+    "description": "The label for category 'CDC Ingestion' in sidebar 'docs'"
+  },
+  "sidebar.docs.category.Maintenance": {
+    "message": "运维管理",
+    "description": "The label for category 'Maintenance' in sidebar 'docs'"
+  },
+  "sidebar.docs.category.Program API": {
+    "message": "程序 API",
+    "description": "The label for category 'Program API' in sidebar 'docs'"
+  },
+  "sidebar.docs.category.Migration": {
+    "message": "迁移",
+    "description": "The label for category 'Migration' in sidebar 'docs'"
+  },
+  "sidebar.docs.category.Iceberg Metadata": {
+    "message": "Iceberg 元数据",
+    "description": "The label for category 'Iceberg Metadata' in sidebar 'docs'"
+  },
+  "sidebar.docs.category.Project": {
+    "message": "项目",
+    "description": "The label for category 'Project' in sidebar 'docs'"
+  },
+  "sidebar.docs.category.Learn Paimon": {
+    "message": "学习 Paimon",
+    "description": "The label for category 'Learn Paimon' in sidebar 'docs'"
+  }
+}

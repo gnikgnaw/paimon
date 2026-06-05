@@ -1,0 +1,319 @@
+---
+title: "SQL 写入"
+sidebar_position: 2
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# SQL 写入 {#sql-write}
+
+## 语法 {#syntax}
+
+```sql
+INSERT { INTO | OVERWRITE } table_identifier [ part_spec ] [ column_list ] { value_expr | query };
+```
+
+更多信息请查阅语法文档：
+
+[Flink INSERT 语句](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/table/sql/insert/)
+
+## INSERT INTO {#insert-into}
+
+使用 `INSERT INTO` 将记录和变更应用到表中。
+
+```sql
+INSERT INTO my_table SELECT ...
+```
+
+`INSERT INTO` 同时支持批式和流式模式。在流式模式下，默认情况下，它还会在 Flink Sink 中执行 Compaction、
+快照过期，甚至分区过期（如果已配置）。
+
+如果有多个作业需要写入同一张表，可以参考[独立 Compaction 作业](../maintenance/dedicated-compaction#dedicated-compaction-job)获取更多信息。
+
+### 聚簇（Clustering） {#clustering}
+
+在 Paimon 中，聚簇（Clustering）是一项功能，它允许你在写入过程中，根据某些列的值对 [Append 表](../append-table/overview)
+中的数据进行聚簇。这种数据组织方式可以显著提升下游任务读取数据时的效率，因为它能实现更快、更有针对性的数据检索。该功能仅支持 [Append 表](../append-table/overview)（bucket = -1）
+以及批式执行模式。
+
+要使用聚簇，你可以在创建表或写入表时指定想要聚簇的列。下面是一个如何启用聚簇的简单示例：
+
+```sql
+CREATE TABLE my_table (
+    a STRING,
+    b STRING,
+    c STRING,
+) WITH (
+  'sink.clustering.by-columns' = 'a,b',
+);
+```
+
+你也可以使用 SQL hint 来动态设置聚簇配置项：
+
+```sql
+INSERT INTO my_table /*+ OPTIONS('sink.clustering.by-columns' = 'a,b') */
+SELECT * FROM source;
+```
+
+数据会使用自动选择的策略（例如 ORDER、ZORDER 或 HILBERT）进行聚簇，但你也可以通过设置 `sink.clustering.strategy`
+手动指定聚簇策略。聚簇依赖于采样和排序。如果聚簇过程耗时过长，你可以通过设置 `sink.clustering.sample-factor` 减少
+采样总数，或者通过将 `sink.clustering.sort-in-cluster` 设置为 false 来禁用排序步骤。
+
+关于上述配置项的更多信息，你可以参考 [FlinkConnectorOptions](../maintenance/configurations#flinkconnectoroptions)。
+
+## 覆盖整张表 {#overwriting-the-whole-table}
+
+对于非分区表，Paimon 支持覆盖整张表。
+（对于禁用了 `dynamic-partition-overwrite` 配置项的分区表也是如此。）
+
+使用 `INSERT OVERWRITE` 覆盖整张非分区表。
+
+```sql
+INSERT OVERWRITE my_table SELECT ...
+```
+
+### 覆盖一个分区 {#overwriting-a-partition}
+
+对于分区表，Paimon 支持覆盖一个分区。
+
+使用 `INSERT OVERWRITE` 覆盖一个分区。
+
+```sql
+INSERT OVERWRITE my_table PARTITION (key1 = value1, key2 = value2, ...) SELECT ...
+```
+
+### 动态覆盖（Dynamic Overwrite） {#dynamic-overwrite}
+
+Flink 的默认覆盖模式是动态分区覆盖（也就是说 Paimon 只会删除出现在被覆盖数据中的分区）。你可以配置
+`dynamic-partition-overwrite` 将其改为静态覆盖。
+
+```sql
+-- MyTable is a Partitioned Table
+
+-- Dynamic overwrite
+INSERT OVERWRITE my_table SELECT ...
+
+-- Static overwrite (Overwrite whole table)
+INSERT OVERWRITE my_table /*+ OPTIONS('dynamic-partition-overwrite' = 'false') */ SELECT ...
+```
+
+## 清空表 {#truncate-tables}
+
+<Tabs groupId="truncate-tables-syntax">
+
+<TabItem value="flink-1-17" label="Flink 1.17-">
+
+你可以使用 `INSERT OVERWRITE`，通过插入空值来清空表。
+
+```sql
+INSERT OVERWRITE my_table /*+ OPTIONS('dynamic-partition-overwrite'='false') */ SELECT * FROM my_table WHERE false;
+```
+
+</TabItem>
+
+<TabItem value="flink-1-18" label="Flink 1.18+">
+
+```sql
+TRUNCATE TABLE my_table;
+```
+
+</TabItem>
+
+</Tabs>
+
+## 清除分区 {#purging-partitions}
+
+目前，Paimon 支持两种方式来清除分区。
+
+1. 与清空表类似，你可以使用 `INSERT OVERWRITE`，通过向分区插入空值来清除分区中的数据。
+
+2. 方式 #1 不支持删除多个分区。如果你需要删除多个分区，可以通过 `flink run` 提交 drop_partition 作业。
+
+```sql
+-- Syntax
+INSERT OVERWRITE my_table /*+ OPTIONS('dynamic-partition-overwrite'='false') */ 
+PARTITION (key1 = value1, key2 = value2, ...) SELECT selectSpec FROM my_table WHERE false;
+
+-- The following SQL is an example:
+-- table definition
+CREATE TABLE my_table (
+    k0 INT,
+    k1 INT,
+    v STRING
+) PARTITIONED BY (k0, k1);
+
+-- you can use
+INSERT OVERWRITE my_table /*+ OPTIONS('dynamic-partition-overwrite'='false') */ 
+PARTITION (k0 = 0) SELECT k1, v FROM my_table WHERE false;
+
+-- or
+INSERT OVERWRITE my_table /*+ OPTIONS('dynamic-partition-overwrite'='false') */ 
+PARTITION (k0 = 0, k1 = 0) SELECT v FROM my_table WHERE false;
+```
+
+## 更新表 {#updating-tables}
+
+:::info
+
+重要的表属性设置：
+1. 仅[主键表](../primary-key-table/overview)支持此功能。
+2. [MergeEngine](../primary-key-table/merge-engine/)（合并引擎）需要为 [deduplicate](../primary-key-table/merge-engine/overview#deduplicate)（去重）
+   或 [partial-update](../primary-key-table/merge-engine/partial-update)（部分更新）才能支持此功能。
+3. 不支持更新主键。
+
+:::
+
+目前，从 Flink 1.17 及以后版本起，Paimon 支持使用 `UPDATE` 更新记录。你可以在 Flink 的 `batch`（批）模式下执行 `UPDATE`。
+
+```sql
+-- Syntax
+UPDATE table_identifier SET column1 = value1, column2 = value2, ... WHERE condition;
+
+-- The following SQL is an example:
+-- table definition
+CREATE TABLE my_table (
+	a STRING,
+	b INT,
+	c INT,
+	PRIMARY KEY (a) NOT ENFORCED
+) WITH ( 
+	'merge-engine' = 'deduplicate' 
+);
+
+-- you can use
+UPDATE my_table SET b = 1, c = 2 WHERE a = 'myTable';
+```
+
+## 从表中删除 {#deleting-from-table}
+
+<Tabs groupId="delete-from-table">
+
+<TabItem value="flink-1-17" label="Flink 1.17+">
+
+:::info
+
+重要的表属性设置：
+1. 仅主键表支持此功能。
+2. 如果表带有主键，以下 [MergeEngine](../primary-key-table/merge-engine/overview)（合并引擎）支持此功能：
+   * [deduplicate](../primary-key-table/merge-engine/overview#deduplicate)（去重）。
+   * 启用了 'partial-update.remove-record-on-delete' 配置项的 [partial-update](../primary-key-table/merge-engine/partial-update)（部分更新）。
+3. 不支持在流式模式下从表中删除。
+
+:::
+
+```sql
+-- Syntax
+DELETE FROM table_identifier WHERE conditions;
+
+-- The following SQL is an example:
+-- table definition
+CREATE TABLE my_table (
+    id BIGINT NOT NULL,
+    currency STRING,
+    rate BIGINT,
+    dt String,
+    PRIMARY KEY (id, dt) NOT ENFORCED
+) PARTITIONED BY (dt) WITH ( 
+    'merge-engine' = 'deduplicate' 
+);
+
+-- you can use
+DELETE FROM my_table WHERE currency = 'UNKNOWN';
+```
+
+</TabItem>
+
+</Tabs>
+
+## 分区标记完成（Partition Mark Done） {#partition-mark-done}
+
+对于分区表，每个分区可能都需要被调度以触发下游的批式计算。因此，
+有必要选择这个时机来表明它已经准备好被调度，并尽量减少调度过程中的数据
+漂移量。我们把这个过程称为：“分区标记完成”（Partition Mark Done）。
+
+标记完成的示例：
+```sql
+CREATE TABLE my_partitioned_table (
+    f0 INT,
+    f1 INT,
+    f2 INT,
+    ...
+    dt STRING
+) PARTITIONED BY (dt) WITH (
+    'partition.timestamp-formatter'='yyyyMMdd',
+    'partition.timestamp-pattern'='$dt',
+    'partition.time-interval'='1 d',
+    'partition.idle-time-to-done'='15 m',
+    'partition.mark-done-action'='done-partition'
+);
+```
+
+你也可以自定义一个 PartitionMarkDoneAction 来将分区标记为完成。
+- partition.mark-done-action: custom
+- partition.mark-done-action.custom.class: 实现 PartitionMarkDoneAction 接口的分区标记完成类（例如 org.apache.paimon.CustomPartitionMarkDoneAction）。
+
+定义一个类 CustomPartitionMarkDoneAction 来实现 PartitionMarkDoneAction 接口。
+```java
+package org.apache.paimon;
+
+public class CustomPartitionMarkDoneAction implements PartitionMarkDoneAction {
+    
+    @Override
+    public void markDone(String partition) {
+        // do something.
+    }
+
+    @Override
+    public void close() {}
+}
+```
+
+Paimon 还支持 http-report 分区标记完成 Action，该 Action 会将分区上报到远程 http 服务器。
+- partition.mark-done-action: http-report
+- partition.mark-done-action.http.url : Action 会将分区上报到远程 http 服务器。
+- partition.mark-done-action.http.params : 请求体 json 中的 Http 客户端请求参数。
+
+Http Post 请求体：
+```json
+{
+    "table": "table fullName",
+    "path": "table location path",
+    "partition": "mark done partition",
+    "params" : "custom params"
+}
+```
+Http 响应体：
+```json
+{
+    "result": "success"
+}
+```
+
+1. 首先，你需要定义分区的时间解析器以及分区之间的时间间隔，以便
+   确定何时可以将分区正确地标记为完成。
+2. 其次，你需要定义 idle-time（空闲时间），它决定了分区需要在多长时间内没有新数据，
+   之后才会被标记为完成。
+3. 第三，默认情况下，分区标记完成会创建 _SUCCESS 文件，_SUCCESS 文件的内容是一个 json，包含
+   `creationTime` 和 `modificationTime`，它们可以帮助你了解是否存在延迟数据。你也可以
+   配置其他 action，例如 `'done-partition'`，举例来说，分区 `'dt=20240501'` 会产生
+   `'dt=20240501.done'` 这样的完成分区。

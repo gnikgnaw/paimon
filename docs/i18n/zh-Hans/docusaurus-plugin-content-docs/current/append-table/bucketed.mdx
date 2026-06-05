@@ -1,0 +1,176 @@
+---
+title: "分桶"
+sidebar_position: 3
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# 分桶 Append 表 {#bucketed-append}
+
+你可以通过定义 `bucket` 和 `bucket-key` 来得到一张分桶的 Append 表（追加表）。
+
+创建分桶 Append 表的示例：
+
+<Tabs groupId="create-bucketed-append">
+
+<TabItem value="flink" label="Flink">
+
+```sql
+CREATE TABLE my_table (
+    product_id BIGINT,
+    price DOUBLE,
+    sales BIGINT
+) WITH (
+    'bucket' = '8',
+    'bucket-key' = 'product_id'
+);
+```
+
+</TabItem>
+
+</Tabs>
+
+## 数据跳过（Data Skipping） {#data-skipping}
+
+分桶 Append 表最主要、最显著的优势是**数据跳过（data skipping）**。当查询在 `bucket-key` 上包含等值
+（`=`）或 `IN` 过滤条件时，Paimon 可以高效地将这些谓词下推，从而完全跳过不相关的桶文件。这意味着大量不匹配
+过滤条件的文件会在读取之前被裁剪掉，从而大幅减少 I/O 并加速查询。
+
+例如，如果 `bucket-key` 是 `product_id`，你执行以下查询：
+
+```sql
+SELECT * FROM my_table WHERE product_id = 12345;
+
+SELECT * FROM my_table WHERE product_id IN (1, 2, 3);
+```
+
+Paimon 只会读取包含匹配 `product_id` 值的桶，过滤掉所有其他桶文件。
+当表拥有很多桶，而你只查询其中一小部分 bucket-key 值时，这种方式极其有效。
+
+## 分桶关联（Bucketed Join） {#bucketed-join}
+
+分桶表还可用于加速关联查询，避免批处理中代价高昂的 shuffle 操作。
+例如，你可以使用以下 Spark SQL 读取一张 Paimon 表：
+
+```sql
+SET spark.sql.sources.v2.bucketing.enabled = true;
+
+CREATE TABLE FACT_TABLE (order_id INT, f1 STRING) TBLPROPERTIES ('bucket'='10', 'bucket-key' = 'order_id');
+
+CREATE TABLE DIM_TABLE (order_id INT, f2 STRING) TBLPROPERTIES ('bucket'='10', 'primary-key' = 'order_id');
+
+SELECT * FROM FACT_TABLE JOIN DIM_TABLE on t1.order_id = t4.order_id;
+```
+
+`spark.sql.sources.v2.bucketing.enabled` 配置用于为 V2 数据源启用分桶。开启后，
+Spark 会通过 SupportsReportPartitioning 识别 V2 数据源所上报的特定分布信息，
+并在必要时尝试避免 shuffle。
+
+如果两张表采用相同的分桶策略且桶数相同，那么代价高昂的关联 shuffle 将被避免。
+
+## 分桶流式（Bucketed Streaming） {#bucketed-streaming}
+
+普通的 Append 表对其流式写入和读取没有严格的顺序保证，但在某些场景下，你需要定义一个类似 Kafka 的键。
+
+同一个桶中的每条记录都是严格有序的，流式读取会严格按照写入顺序把记录传递给下游。要使用这种模式，你不需要
+配置任何特殊配置项，所有数据都会像队列一样进入同一个桶。
+
+![](/img/for-queue.png)
+
+**流式读取顺序**
+
+对于流式读取，记录会按以下顺序产生：
+
+* 对于来自两个不同分区的任意两条记录
+   * 如果 `scan.plan-sort-partition` 设置为 true，则分区值较小的记录会先被产生。
+   * 否则，分区创建时间较早的记录会先被产生。
+* 对于来自同一分区且同一个桶的任意两条记录，先写入的记录会先被产生。
+* 对于来自同一分区但两个不同桶的任意两条记录，不同的桶由不同的任务处理，它们之间没有顺序保证。
+
+**Watermark 定义**
+
+你可以为读取 Paimon 表定义 Watermark：
+
+```sql
+CREATE TABLE t (
+    `user` BIGINT,
+    product STRING,
+    order_time TIMESTAMP(3),
+    WATERMARK FOR order_time AS order_time - INTERVAL '5' SECOND
+) WITH (...);
+
+-- launch a bounded streaming job to read paimon_table
+SELECT window_start, window_end, COUNT(`user`) FROM TABLE(
+ TUMBLE(TABLE t, DESCRIPTOR(order_time), INTERVAL '10' MINUTES)) GROUP BY window_start, window_end;
+```
+
+你还可以启用 [Flink Watermark 对齐](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/event-time/generating_watermarks/#watermark-alignment-_beta_)，
+它可以确保没有任何 source/split/shard/partition 的 Watermark 比其余部分领先太多：
+
+<table className="configuration table table-bordered">
+    <thead>
+        <tr>
+            <th className="text-left" style={{width: "20%"}}>Key</th>
+            <th className="text-left" style={{width: "15%"}}>Default</th>
+            <th className="text-left" style={{width: "10%"}}>Type</th>
+            <th className="text-left" style={{width: "55%"}}>Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><h5>scan.watermark.alignment.group</h5></td>
+            <td style={{wordWrap: "break-word"}}>(none)</td>
+            <td>String</td>
+            <td>用于对齐 Watermark 的一组 source。</td>
+        </tr>
+        <tr>
+            <td><h5>scan.watermark.alignment.max-drift</h5></td>
+            <td style={{wordWrap: "break-word"}}>(none)</td>
+            <td>Duration</td>
+            <td>在我们暂停从 source/task/partition 消费之前，用于对齐 Watermark 的最大漂移量。</td>
+        </tr>
+    </tbody>
+</table>
+
+**有界流（Bounded Stream）**
+
+流式 Source 也可以是有界的，你可以指定 'scan.bounded.watermark' 来定义有界流模式的结束条件，流式读取会一直进行，直到遇到更大 Watermark 的快照才结束。
+
+快照中的 Watermark 由 writer 生成，例如，你可以指定一个 kafka source 并声明 Watermark 的定义。
+当使用该 kafka source 写入 Paimon 表时，Paimon 表的快照会生成对应的 Watermark，
+这样你就可以在流式读取这张 Paimon 表时使用有界 Watermark 特性。
+
+```sql
+CREATE TABLE kafka_table (
+    `user` BIGINT,
+    product STRING,
+    order_time TIMESTAMP(3),
+    WATERMARK FOR order_time AS order_time - INTERVAL '5' SECOND
+) WITH ('connector' = 'kafka'...);
+
+-- launch a streaming insert job
+INSERT INTO paimon_table SELECT * FROM kakfa_table;
+
+-- launch a bounded streaming job to read paimon_table
+SELECT * FROM paimon_table /*+ OPTIONS('scan.bounded.watermark'='...') */;
+```

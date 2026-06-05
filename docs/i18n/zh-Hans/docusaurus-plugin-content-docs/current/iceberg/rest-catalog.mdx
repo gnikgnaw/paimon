@@ -1,0 +1,130 @@
+---
+title: "Rest Catalog"
+sidebar_position: 5
+---
+
+import Stable from '@site/src/components/Stable';
+import Unstable from '@site/src/components/Unstable';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# Rest Catalog {#rest-catalog}
+
+在创建 Paimon 表时，设置 `'metadata.iceberg.storage' = 'rest-catalog'`。
+该配置项的取值不仅会像 hadoop-catalog 那样存储 Iceberg 元数据，还会在 [iceberg rest catalog](https://iceberg.apache.org/terms/#decoupling-using-the-rest-catalog) 中创建表。
+之后即可从 Iceberg Rest catalog 访问该 Paimon 表。
+
+你需要通过设置以 `'metadata.iceberg.rest.'` 为前缀的配置项来提供 Rest Catalog 的相关信息，例如
+`'metadata.iceberg.rest.uri' = 'https://localhost/'`。Paimon 会尝试使用这些配置项来初始化一个 iceberg rest catalog，
+并使用该 rest catalog 来提交元数据。
+
+**依赖：**
+
+此功能需要以下依赖：
+
+<Stable>
+
+
+
+[paimon-iceberg-@@VERSION@@.jar](https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-iceberg/@@VERSION@@/paimon-iceberg-@@VERSION@@.jar)，
+
+
+
+</Stable>
+
+<Unstable>
+
+
+
+[paimon-iceberg-@@VERSION@@.jar](https://repository.apache.org/snapshots/org/apache/paimon/paimon-iceberg/@@VERSION@@/)，
+
+
+
+</Unstable>
+
+并且 JDK 版本应为 11+。
+
+你也可以从源代码手动构建该 jar（需要 JDK 11+）。
+
+要从源代码构建，请[克隆 git 仓库](@@GITHUB_REPO@@)。
+
+使用以下命令构建 bundled jar。
+- `mvn clean install -DskipTests`
+
+你可以在 `./paimon-iceberg/target/paimon-iceberg-@@VERSION@@.jar` 中找到该 jar。
+
+**示例：**
+
+这是一个使用 flink sql 的示例：
+```sql
+-- create a paimon table
+CREATE TABLE `paimon`.`default`.`T` (
+  pt INT,
+  k INT,
+  v INT,
+  PRIMARY KEY (pt, k) NOT ENFORCED
+) PARTITIONED BY (pt) WITH (
+  'metadata.iceberg.storage' = 'rest-catalog',
+  'metadata.iceberg.rest.uri' = 'http://localhost:55807/',
+  'metadata.iceberg.rest.warehouse' = 'rck_warehouse',
+  'metadata.iceberg.rest.clients' = '1'
+);
+
+-- insert some data
+INSERT INTO `paimon`.`default`.`T` VALUES(1, 9, 90),(1, 10, 100),(1, 11, 110),(2, 20, 200);
+
+-- create an iceberg rest catalog
+CREATE CATALOG `iceberg` WITH (
+  'type' = 'iceberg',
+  'catalog-type' = 'rest',
+  'uri' = 'http://localhost:55807/',
+  'clients' = '1',
+  'cache-enabled' = 'false'
+)
+
+-- verify the data in iceberg rest-catalog
+SELECT v, k, pt FROM `iceberg`.`default`.`T` ORDER BY pt, k;
+/*
+the query results:
+ 90,  9, 1
+100, 10, 1
+110, 11, 1
+200, 20, 2
+*/
+```
+
+**Schema 兼容性与分区演进：**
+
+Paimon 与 Iceberg 在起始 fieldId 上存在一个根本性差异。Paimon 使用 fieldId 0，而 Iceberg 使用 fieldId 1。如果我们直接使用 Paimon 的 schema（表结构）创建一个 Iceberg 表，会使所有 fieldId 偏移 +1，从而导致字段错乱。不过，可以在表创建之后更新 schema，使其从 fieldId 0 开始。
+
+表创建会通过以下两种选项逻辑，尽量减少 fieldId 错乱和分区演进带来的问题：
+
+- 分区 fieldId = 0：Paimon 先创建一个空的 schema，然后将 schema 更新为实际的 schema。此时无法避免分区演进。
+- 分区 fieldId > 0：Paimon 先创建一个初始的占位 schema，正确地偏移分区字段，然后将 schema 更新为实际的 schema，从而避免分区演进。
+
+**注意：**
+
+Paimon 会先像 hadoop-catalog 那样，将 iceberg 元数据写入一个单独的目录，然后再将元数据提交到 iceberg rest catalog。
+如果两者不兼容，我们以存储在单独目录中的元数据为准。
+
+向 iceberg rest catalog 提交时存在以下几种情况：
+1. 表在 iceberg rest-catalog 中不存在。此时会先在 rest catalog 中创建该表，然后提交元数据。
+2. 表在 iceberg rest-catalog 中已存在，且与存储在单独目录中的基础元数据兼容。此时会直接获取该表并提交元数据。
+3. 表已存在，但与存储在单独目录中的基础元数据不兼容。此时会**删除该表并重新创建该表**，然后提交元数据。

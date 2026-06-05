@@ -1,0 +1,263 @@
+---
+title: "管理权限"
+sidebar_position: 10
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# 管理权限 {#manage-privileges}
+
+Paimon 在 Catalog 上提供了一套权限（privilege）系统。
+权限决定了哪些用户可以对哪些对象执行哪些操作，
+从而让你能够以细粒度的方式管理表的访问。
+
+目前，Paimon 采用基于身份的访问控制（IBAC，identity-based access control）权限模型。
+也就是说，权限会直接分配给用户。
+
+:::warning
+
+该权限系统仅能阻止不希望访问的用户通过 Catalog 访问表。
+它无法阻止通过临时表（temporary table，即在文件系统上指定表路径）进行的访问，
+也无法阻止用户直接修改文件系统上的数据文件。
+如果你需要更严格的保护，请改用具备访问管理能力的文件系统。
+
+:::
+
+## 基本概念 {#basic-concepts}
+
+下面我们介绍权限系统的基本概念。
+
+### 对象 {#object}
+
+对象（Object）是可以被授予访问权限的实体。除非有授权允许，否则访问将被拒绝。
+
+目前，Paimon 的权限系统有三种类型的对象：CATALOG、DATABASE 和 TABLE。
+对象之间存在逻辑层级关系，这与它们所代表的概念相关。
+例如：
+* 如果某个用户被授予了 Catalog 上的某项权限，
+那么他在该 Catalog 中的所有数据库和所有表上也将拥有该权限。
+* 如果某个用户被授予了数据库上的某项权限，
+那么他在该数据库中的所有表上也将拥有该权限。
+* 如果某个用户被收回了 Catalog 上的某项权限，
+那么他在该 Catalog 中的所有数据库和所有表上也将失去该权限。
+* 如果某个用户被收回了数据库上的某项权限，
+那么他在该数据库中的所有表上也将失去该权限。
+
+### 权限 {#privilege}
+
+权限（Privilege）是对某个对象的一种已定义的访问级别。
+可以使用多个权限来控制对某个对象所授予访问的粒度。
+权限是与对象相关的。不同的对象可能拥有不同的权限。
+
+目前，我们支持以下权限。
+
+| 权限        | 说明                                                                                       | 可授予的对象             |
+|-------------|-------------------------------------------------------------------------------------------|--------------------------|
+| SELECT      | 查询表中的数据。                                                                            | TABLE、DATABASE、CATALOG |
+| INSERT      | 插入、更新或删除表中的数据。在表中创建或删除标签（Tag）和分支（Branch）。                    | TABLE、DATABASE、CATALOG |
+| ALTER_TABLE | 修改表的元数据，包括表名、列名、表配置项等。                                                 | TABLE、DATABASE、CATALOG |
+| DROP_TABLE | 删除一张表。 | TABLE、DATABASE、CATALOG |
+| CREATE_TABLE | 在某个数据库中创建一张表。 | DATABASE、CATALOG |
+| DROP_DATABASE | 删除一个数据库。 | DATABASE、CATALOG |
+| CREATE_DATABASE | 在 Catalog 中创建一个数据库。 | CATALOG |
+| ADMIN | 创建或删除特权用户，在某个 Catalog 中为用户授予或收回权限。 | CATALOG |
+
+### 用户 {#user}
+
+用户（User）是可以被授予权限的实体。用户通过其密码进行身份认证。
+
+当权限系统启用时，会自动创建两个特殊用户。
+
+* `root` 用户，
+该用户由启用权限系统时所提供的 root 密码标识。
+此用户在该 Catalog 中始终拥有所有权限。
+* `anonymous` 用户。
+当创建 Catalog 时未提供用户名和密码，则使用此默认用户。
+
+## 启用权限 {#enable-privileges}
+
+Paimon 目前仅支持基于文件的权限系统。
+只有 `'metastore' = 'filesystem'`（默认值）或 `'metastore' = 'hive'` 的 Catalog 才支持这种权限系统。
+
+要在文件系统 / Hive Catalog 上启用权限系统，请执行以下步骤。
+
+<Tabs groupId="enable-privileges">
+
+<TabItem value="flink-1-18" label="Flink 1.18+">
+
+运行以下 Flink SQL。
+```sql
+-- use the catalog where you want to enable the privilege system
+USE CATALOG `my-catalog`;
+    
+-- initialize privilege system by providing a root password
+-- change 'root-password' to the password you want
+CALL sys.init_file_based_privilege('root-password');
+```
+
+</TabItem>
+
+</Tabs>
+
+权限系统启用后，
+请重新创建 Catalog 并以 `root` 身份进行认证，以便创建其他用户并为他们授予权限。
+
+:::info
+
+权限系统不会影响已有的 Catalog。
+也就是说，这些 Catalog 仍然可以自由地访问和修改表。
+如果你希望在这些 Catalog 中使用权限系统，
+请删除并以期望的 warehouse（仓库目录）路径重新创建所有 Catalog。
+
+:::
+
+## 访问开启了权限的 Catalog {#accessing-privileged-catalogs}
+
+要访问一个开启了权限的 Catalog 并以某个用户身份进行认证，
+你需要在创建 Catalog 时定义 `user` 和 `password` 这两个 Catalog 配置项。
+例如，下面的 SQL 在创建 Catalog 时尝试以 `root` 身份进行认证，
+其密码为 `mypassword`。
+
+<Tabs groupId="access-catalog">
+
+<TabItem value="flink" label="Flink">
+
+```sql
+CREATE CATALOG `my-catalog` WITH (
+    'type' = 'paimon',
+    -- ...
+    'user' = 'root',
+    'password' = 'mypassword'
+);
+```
+
+</TabItem>
+
+</Tabs>
+
+## 创建用户 {#creating-users}
+
+你必须以拥有 `ADMIN` 权限的用户身份（例如 `root`）进行认证，才能执行此操作。
+
+执行以下步骤以在权限系统中创建一个用户。
+
+<Tabs groupId="create-users">
+
+<TabItem value="flink-1-18" label="Flink 1.18+">
+
+运行以下 Flink SQL。
+```sql
+-- use the catalog where you want to create a user
+-- you must be authenticated as a user with ADMIN privilege in this catalog
+USE CATALOG `my-catalog`;
+
+-- create a user authenticated by the specified password
+-- change 'user' and 'password' to the username and password you want
+CALL sys.create_privileged_user('user', 'password');
+```
+
+</TabItem>
+
+</Tabs>
+
+## 删除用户 {#dropping-users}
+
+你必须以拥有 `ADMIN` 权限的用户身份（例如 `root`）进行认证，才能执行此操作。
+
+执行以下步骤以在权限系统中删除一个用户。
+
+<Tabs groupId="drop-users">
+
+<TabItem value="flink-1-18" label="Flink 1.18+">
+
+运行以下 Flink SQL。
+```sql
+-- use the catalog where you want to drop a user
+-- you must be authenticated as a user with ADMIN privilege in this catalog
+USE CATALOG `my-catalog`;
+
+-- change 'user' to the username you want to drop
+CALL sys.drop_privileged_user('user');
+```
+
+</TabItem>
+
+</Tabs>
+
+## 向用户授予权限 {#granting-privileges-to-users}
+
+你必须以拥有 `ADMIN` 权限的用户身份（例如 `root`）进行认证，才能执行此操作。
+
+执行以下步骤以在权限系统中为某个用户授予权限。
+
+<Tabs groupId="grant-to-users">
+
+<TabItem value="flink-1-18" label="Flink 1.18+">
+
+运行以下 Flink SQL。
+```sql
+-- use the catalog where you want to drop a user
+-- you must be authenticated as a user with ADMIN privilege in this catalog
+USE CATALOG `my-catalog`;
+
+-- you can change 'user' to the username you want, and 'SELECT' to other privilege you want
+-- grant 'user' with privilege 'SELECT' on the whole catalog
+CALL sys.grant_privilege_to_user('user', 'SELECT');
+-- grant 'user' with privilege 'SELECT' on database my_db
+CALL sys.grant_privilege_to_user('user', 'SELECT', 'my_db');
+-- grant 'user' with privilege 'SELECT' on table my_db.my_tbl
+CALL sys.grant_privilege_to_user('user', 'SELECT', 'my_db', 'my_tbl');
+```
+
+</TabItem>
+
+</Tabs>
+
+## 从用户收回权限 {#revoking-privileges-to-users}
+
+你必须以拥有 `ADMIN` 权限的用户身份（例如 `root`）进行认证，才能执行此操作。
+
+执行以下步骤以在权限系统中从某个用户收回权限。
+
+<Tabs groupId="revoke-from-users">
+
+<TabItem value="flink-1-18" label="Flink 1.18+">
+
+运行以下 Flink SQL。
+```sql
+-- use the catalog where you want to drop a user
+-- you must be authenticated as a user with ADMIN privilege in this catalog
+USE CATALOG `my-catalog`;
+
+-- you can change 'user' to the username you want, and 'SELECT' to other privilege you want
+-- revoke 'user' with privilege 'SELECT' on the whole catalog
+CALL sys.revoke_privilege_from_user('user', 'SELECT');
+-- revoke 'user' with privilege 'SELECT' on database my_db
+CALL sys.revoke_privilege_from_user('user', 'SELECT', 'my_db');
+-- revoke 'user' with privilege 'SELECT' on table my_db.my_tbl
+CALL sys.revoke_privilege_from_user('user', 'SELECT', 'my_db', 'my_tbl');
+```
+
+</TabItem>
+
+</Tabs>

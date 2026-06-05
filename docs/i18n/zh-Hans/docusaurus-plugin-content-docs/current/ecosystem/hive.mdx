@@ -1,0 +1,321 @@
+---
+title: "Hive"
+sidebar_position: 4
+---
+
+import Stable from '@site/src/components/Stable';
+import Unstable from '@site/src/components/Unstable';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# Hive
+
+本文档是在 Hive 中使用 Paimon 的指南。
+
+## 版本 {#version}
+
+Paimon 当前支持 Hive 3.1、2.3、2.2、2.1 和 2.1-cdh-6.3。
+
+## 执行引擎 {#execution-engine}
+
+Paimon 当前在 Hive 读取时支持 MR 和 Tez 执行引擎，在 Hive 写入时支持 MR 执行引擎。
+注意：如果你使用 beeline，请重启 hive 集群。
+
+## 安装 {#installation}
+
+下载对应版本的 jar 文件。
+
+<Stable>
+
+
+
+|                  | Jar                                                                                                                                                                                                                     |
+|------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Hive 3.1         | [paimon-hive-connector-3.1-@@VERSION@@.jar](https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-hive-connector-3.1/@@VERSION@@/paimon-hive-connector-3.1-@@VERSION@@.jar)                         |
+| Hive 2.3         | [paimon-hive-connector-2.3-@@VERSION@@.jar](https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-hive-connector-2.3/@@VERSION@@/paimon-hive-connector-2.3-@@VERSION@@.jar)                         |
+| Hive 2.2         | [paimon-hive-connector-2.2-@@VERSION@@.jar](https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-hive-connector-2.2/@@VERSION@@/paimon-hive-connector-2.2-@@VERSION@@.jar)                         |
+| Hive 2.1         | [paimon-hive-connector-2.1-@@VERSION@@.jar](https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-hive-connector-2.1/@@VERSION@@/paimon-hive-connector-2.1-@@VERSION@@.jar)                         |
+| Hive 2.1-cdh-6.3 | [paimon-hive-connector-2.1-cdh-6.3-@@VERSION@@.jar](https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-hive-connector-2.1-cdh-6.3/@@VERSION@@/paimon-hive-connector-2.1-cdh-6.3-@@VERSION@@.jar) |
+
+
+
+</Stable>
+
+<Unstable>
+
+
+
+|                  | Jar                                                                                                                                                                   |
+|------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Hive 3.1         | [paimon-hive-connector-3.1-@@VERSION@@.jar](https://repository.apache.org/snapshots/org/apache/paimon/paimon-hive-connector-3.1/@@VERSION@@/)                 |
+| Hive 2.3         | [paimon-hive-connector-2.3-@@VERSION@@.jar](https://repository.apache.org/snapshots/org/apache/paimon/paimon-hive-connector-2.3/@@VERSION@@/)                 |
+| Hive 2.2         | [paimon-hive-connector-2.2-@@VERSION@@.jar](https://repository.apache.org/snapshots/org/apache/paimon/paimon-hive-connector-2.2/@@VERSION@@/)                 |
+| Hive 2.1         | [paimon-hive-connector-2.1-@@VERSION@@.jar](https://repository.apache.org/snapshots/org/apache/paimon/paimon-hive-connector-2.1/@@VERSION@@/)                 |
+| Hive 2.1-cdh-6.3 | [paimon-hive-connector-2.1-cdh-6.3-@@VERSION@@.jar](https://repository.apache.org/snapshots/org/apache/paimon/paimon-hive-connector-2.1-cdh-6.3/@@VERSION@@/) |
+
+
+
+</Unstable>
+
+你也可以从源代码手动构建 bundled jar。
+
+要从源代码构建，请[克隆 git 仓库](@@GITHUB_REPO@@)。
+
+使用以下命令构建 bundled jar。
+`mvn clean install -DskipTests`
+
+你可以在 `./paimon-hive/paimon-hive-connector-<hive-version>/target/paimon-hive-connector-<hive-version>-@@VERSION@@.jar` 中找到 Hive connector jar。
+
+有几种方式可以将该 jar 添加到 Hive。
+
+* 你可以在 Hive 的根目录下创建一个 `auxlib` 文件夹，并将 `paimon-hive-connector-@@VERSION@@.jar` 复制到 `auxlib` 中。
+* 你也可以将该 jar 复制到 Hive 可访问的路径下，然后使用 `add jar /path/to/paimon-hive-connector-@@VERSION@@.jar` 在 Hive 中启用 paimon 支持。注意，不推荐使用此方法。如果你使用 MR 执行引擎并运行 join 语句，可能会遇到异常 `org.apache.hive.com.esotericsoftware.kryo.kryoexception: unable to find class`。
+
+注意：
+
+* 如果你使用 HDFS：
+  * 确保已设置环境变量 `HADOOP_HOME` 或 `HADOOP_CONF_DIR`。
+  * 你可以设置 `paimon.hadoop-load-default-config` =`false` 来禁止从 `core-default.xml`、`hdfs-default.xml` 加载默认值，这可能会导致 split 的尺寸更小。
+* 在使用 hive cbo 时，可能会导致部分查询结果不正确，例如查询带 `not null` 谓词的 `struct` 类型时，你可以通过 `set hive.cbo.enable=false;` 命令禁用 cbo。
+
+## Hive SQL：访问 Hive metastore 中已有的 Paimon 表 {#hive-sql-access-paimon-tables-already-in-hive-metastore}
+
+在 Hive CLI 中运行以下 Hive SQL 来访问已创建的表。
+
+```sql
+-- Assume that paimon-hive-connector-<hive-version>-@@VERSION@@.jar is already in auxlib directory.
+-- List tables in Hive
+-- (you might need to switch to "default" database if you're not there by default)
+
+SHOW TABLES;
+
+/*
+OK
+test_table
+*/
+
+-- Read records from test_table
+
+SELECT a, b FROM test_table ORDER BY a;
+
+/*
+OK
+1	Table
+2	Store
+*/
+
+-- Insert records into test table
+-- Limitations:
+-- Only support INSERT INTO, not support INSERT OVERWRITE
+-- It is recommended to write to a non primary key table
+-- Writing to a primary key table may result in a large number of small files
+
+INSERT INTO test_table VALUES (3, 'Paimon');
+
+SELECT a, b FROM test_table ORDER BY a;
+
+/*
+OK
+1	Table
+2	Store
+3	Paimon
+*/
+
+-- time travel
+
+SET paimon.scan.snapshot-id=1;
+SELECT a, b FROM test_table ORDER BY a;
+/*
+OK
+1	Table
+2	Store
+3	Paimon
+*/
+SET paimon.scan.snapshot-id=null;
+
+```
+
+## Hive SQL：创建新的 Paimon 表 {#hive-sql-create-new-paimon-tables}
+
+你可以在 Hive 中创建新的 paimon 表。在 Hive CLI 中运行以下 Hive SQL。
+
+```sql
+-- Assume that paimon-hive-connector-@@VERSION@@.jar is already in auxlib directory.
+-- Let's create a new paimon table.
+
+SET hive.metastore.warehouse.dir=warehouse_path;
+
+CREATE TABLE hive_test_table(
+    a INT COMMENT 'The a field',
+    b STRING COMMENT 'The b field'
+)
+STORED BY 'org.apache.paimon.hive.PaimonStorageHandler';
+```
+
+## Hive SQL：通过外部表访问 Paimon 表 {#hive-sql-access-paimon-tables-by-external-table}
+
+要访问已有的 paimon 表，你也可以将它们注册为 Hive 中的外部表。在 Hive CLI 中运行以下 Hive SQL。
+
+```sql
+-- Assume that paimon-hive-connector-@@VERSION@@.jar is already in auxlib directory.
+-- Let's use the test_table created in the above section.
+-- To create an external table, you don't need to specify any column or table properties.
+-- Pointing the location to the path of table is enough.
+
+CREATE EXTERNAL TABLE external_test_table
+STORED BY 'org.apache.paimon.hive.PaimonStorageHandler'
+LOCATION '/path/to/table/store/warehouse/default.db/test_table';
+    
+-- In addition to the way setting location above, you can also place the location setting in TBProperties
+-- to avoid Hive accessing Paimon's location through its own file system when creating tables.
+-- This method is effective in scenarios using Object storage,such as s3.
+
+CREATE EXTERNAL TABLE external_test_table
+STORED BY 'org.apache.paimon.hive.PaimonStorageHandler'
+TBLPROPERTIES (
+ 'paimon_location' ='s3://xxxxx/path/to/table/store/warehouse/default.db/test_table'
+);
+
+-- Read records from external_test_table
+
+SELECT a, b FROM external_test_table ORDER BY a;
+
+/*
+OK
+1	Table
+2	Store
+*/
+
+-- Insert records into test table
+
+INSERT INTO external_test_table VALUES (3, 'Paimon');
+
+SELECT a, b FROM external_test_table ORDER BY a;
+
+/*
+OK
+1	Table
+2	Store
+3	Paimon
+*/
+
+```
+
+## Hive 类型转换 {#hive-type-conversion}
+
+本节列出了 Hive 与 Paimon 之间支持的所有类型转换。
+Hive 的所有数据类型都位于 `org.apache.hadoop.hive.serde2.typeinfo` 包中。
+
+<table className="table table-bordered">
+    <thead>
+    <tr>
+      <th className="text-left" style={{width: "10%"}}>Hive 数据类型</th>
+      <th className="text-left" style={{width: "10%"}}>Paimon 数据类型</th>
+      <th className="text-left" style={{width: "5%"}}>原子类型</th>
+    </tr>
+    </thead>
+    <tbody>
+    <tr>
+      <td><code>StructTypeInfo</code></td>
+      <td><code>RowType</code></td>
+      <td>false</td>
+    </tr>
+    <tr>
+      <td><code>MapTypeInfo</code></td>
+      <td><code>MapType</code></td>
+      <td>false</td>
+    </tr>
+    <tr>
+      <td><code>ListTypeInfo</code></td>
+      <td><code>ArrayType</code></td>
+      <td>false</td>
+    </tr>
+    <tr>
+      <td><code>PrimitiveTypeInfo("boolean")</code></td>
+      <td><code>BooleanType</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>PrimitiveTypeInfo("tinyint")</code></td>
+      <td><code>TinyIntType</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>PrimitiveTypeInfo("smallint")</code></td>
+      <td><code>SmallIntType</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>PrimitiveTypeInfo("int")</code></td>
+      <td><code>IntType</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>PrimitiveTypeInfo("bigint")</code></td>
+      <td><code>BigIntType</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>PrimitiveTypeInfo("float")</code></td>
+      <td><code>FloatType</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>PrimitiveTypeInfo("double")</code></td>
+      <td><code>DoubleType</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>CharTypeInfo(length)</code></td>
+      <td><code>CharType(length)</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>PrimitiveTypeInfo("string")</code></td>
+      <td><code>VarCharType(VarCharType.MAX_LENGTH)</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>VarcharTypeInfo(length)</code></td>
+      <td><code>VarCharType(length), length is less than VarCharType.MAX_LENGTH</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>PrimitiveTypeInfo("date")</code></td>
+      <td><code>DateType</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>PrimitiveTypeInfo("timestamp")</code></td>
+      <td><code>TimestampType</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>DecimalTypeInfo(precision, scale)</code></td>
+      <td><code>DecimalType(precision, scale)</code></td>
+      <td>true</td>
+    </tr>
+    <tr>
+      <td><code>PrimitiveTypeInfo("binary")</code></td>
+      <td><code>VarBinaryType</code>, <code>BinaryType</code></td>
+      <td>true</td>
+    </tr>
+    </tbody>
+</table>

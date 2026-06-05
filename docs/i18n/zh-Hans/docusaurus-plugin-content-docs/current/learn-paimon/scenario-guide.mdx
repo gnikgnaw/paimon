@@ -1,0 +1,616 @@
+---
+title: "场景指南"
+sidebar_position: 2
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# 场景指南 {#scenario-guide}
+
+本指南帮助你为特定用例选择合适的 Paimon 表类型与配置。Paimon 提供
+**主键表（Primary Key Table）**、**Append 表（追加表）** 以及 **多模态数据湖** 能力——每种都有适用于不同场景的不同模式与
+配置。
+
+## 快速决策 {#quick-decision}
+
+| 场景 | 表类型 | 关键配置 |
+|---|---|---|
+| 从数据库进行 CDC 实时同步 | 主键表 | `deletion-vectors.enabled = true` |
+| 流式聚合 / 指标 | 主键表 | `merge-engine = aggregation` |
+| 多流部分列更新 | 主键表 | `merge-engine = partial-update` |
+| 日志去重（保留首条） | 主键表 | `merge-engine = first-row` |
+| 批式 ETL / 数据仓库分层 | Append 表 | 默认（unaware-bucket） |
+| 基于 key 的高频点查 | Append 表 | `bucket = N, bucket-key = col` |
+| 类队列的有序流式 | Append 表 | `bucket = N, bucket-key = col` |
+| 大规模 OLAP 即席查询 | Append 表 | 增量聚簇（Incremental Clustering） |
+| 存储图片 / 视频 / 文档 | Append 表（Blob） | `blob-field`，启用 Data Evolution |
+| AI 向量检索 / RAG | Append 表（向量） | `VECTOR` 类型，全局索引（DiskANN） |
+| AI 特征工程与列演进 | Append 表 | `data-evolution.enabled = true` |
+| Python AI 流水线（Ray / PyTorch） | Append 表 | PyPaimon SDK |
+
+---
+
+## 主键表 {#primary-key-table}
+
+当你的数据具有天然的唯一 key，并且需要 **实时更新**（插入、更新、删除）时，使用主键表（Primary Key Table）。
+参见 [主键表概述](../primary-key-table/overview)。
+
+### 场景 1：CDC 实时同步 {#scenario-1-cdc-real-time-sync}
+
+**适用场景：** 你希望以 Upsert 语义将 MySQL / PostgreSQL / MongoDB 表实时同步到数据湖。
+这是主键表最常见的用例。
+
+**推荐配置：**
+
+```sql
+CREATE TABLE orders (
+    order_id BIGINT,
+    user_id BIGINT,
+    amount DECIMAL(10,2),
+    status STRING,
+    update_time TIMESTAMP,
+    dt STRING,
+    PRIMARY KEY (order_id, dt) NOT ENFORCED
+) PARTITIONED BY (dt) WITH (
+    'deletion-vectors.enabled' = 'true',
+    'changelog-producer' = 'lookup',
+    'sequence.field' = 'update_time'
+);
+```
+
+**为什么采用这套配置：**
+
+- **`deletion-vectors.enabled = true`**（MOW 模式）：启用带删除向量（Deletion Vector）的 [Merge On Write](../primary-key-table/table-mode#merge-on-write)。
+  该模式在写入与读取性能之间提供最佳平衡。相比默认的 MOR 模式，MOW
+  避免了读时合并，从而大幅提升 OLAP 查询性能。
+- **`changelog-producer = lookup`**：为下游流式消费者生成完整的 [changelog](../primary-key-table/changelog-producer#lookup)。
+  如果你的 CDC 源直接连接数据库（例如 MySQL CDC、Postgres CDC），
+  可以改用 `changelog-producer = input`，因为数据库 CDC 流已经提供了完整的 changelog。
+  不过，如果你的 CDC 源来自 Kafka（或其他消息队列），`input` 可能不可靠——请使用 `lookup` 以
+  保证 changelog 的正确性。如果不需要下游流式读取，可以省略此项以节省 Compaction 资源。
+- **`sequence.field = update_time`**：即使数据乱序到达，也能保证正确的更新顺序。
+- **分桶**：使用默认的动态分桶（`bucket = -1`）。系统会根据数据量自动调整桶数。
+  如果你对数据可见性延迟敏感，请设置固定桶数（例如 `'bucket' = '5'`）
+  ——分区中大约每 1GB 数据对应 1 个桶。
+
+**CDC 接入提示：** 使用 [Paimon CDC 接入](../cdc-ingestion/overview) 进行整库同步，
+它支持自动建表与 schema 演进。
+
+### 场景 2：多流部分列更新 {#scenario-2-multi-stream-partial-column-updates}
+
+**适用场景：** 多个数据源各自为同一条记录贡献不同的列，你希望逐步将它们
+合并为一张完整的宽表（例如一个流的订单信息 + 另一个流的物流信息）。
+
+**推荐配置：**
+
+```sql
+CREATE TABLE order_wide (
+    order_id BIGINT PRIMARY KEY NOT ENFORCED,
+    -- from order stream
+    user_name STRING,
+    amount DECIMAL(10,2),
+    order_time TIMESTAMP,
+    -- from logistics stream
+    tracking_no STRING,
+    delivery_status STRING,
+    delivery_time TIMESTAMP
+) WITH (
+    'merge-engine' = 'partial-update',
+    'fields.order_time.sequence-group' = 'user_name,amount',
+    'fields.delivery_time.sequence-group' = 'tracking_no,delivery_status',
+    'deletion-vectors.enabled' = 'true',
+    'changelog-producer' = 'lookup'
+);
+```
+
+**原因：** [partial-update](../primary-key-table/merge-engine/partial-update) 合并引擎允许每个
+流只更新自己的列，而不覆盖其他列。`sequence-group` 确保每个流内部独立的顺序。
+
+### 场景 3：流式聚合 / 指标 {#scenario-3-streaming-aggregation--metrics}
+
+**适用场景：** 你需要实时预聚合指标（例如页面浏览量、总销售额、UV 数）。每条到达的记录
+都应与现有值进行聚合，而非替换它。
+
+**推荐配置：**
+
+```sql
+CREATE TABLE product_metrics (
+    product_id BIGINT,
+    dt STRING,
+    total_sales BIGINT,
+    max_price DOUBLE,
+    uv VARBINARY,
+    PRIMARY KEY (product_id, dt) NOT ENFORCED
+) PARTITIONED BY (dt) WITH (
+    'merge-engine' = 'aggregation',
+    'fields.total_sales.aggregate-function' = 'sum',
+    'fields.max_price.aggregate-function' = 'max',
+    'fields.uv.aggregate-function' = 'hll_sketch',
+    'deletion-vectors.enabled' = 'true',
+    'changelog-producer' = 'lookup'
+);
+```
+
+**原因：** [aggregation](../primary-key-table/merge-engine/aggregation) 合并引擎支持 20 多种
+聚合函数（`sum`、`max`、`min`、`count`、`hll_sketch`、`theta_sketch`、`collect`、`merge_map` 等），
+非常适合实时指标累加。
+
+### 场景 4：日志去重（保留首条记录） {#scenario-4-log-deduplication-keep-first-record}
+
+**适用场景：** 你收到一条可能包含重复项的大流量日志流，且只想保留每个 key 的首次出现
+（例如每个用户每天的首次登录事件）。
+
+**推荐配置：**
+
+```sql
+CREATE TABLE first_login (
+    user_id BIGINT,
+    dt STRING,
+    login_time TIMESTAMP,
+    device STRING,
+    ip STRING,
+    PRIMARY KEY (user_id, dt) NOT ENFORCED
+) PARTITIONED BY (dt) WITH (
+    'merge-engine' = 'first-row',
+    'changelog-producer' = 'lookup'
+);
+```
+
+**原因：** [first-row](../primary-key-table/merge-engine/first-row) 合并引擎对每个主键只保留最早的
+记录，并产生仅含插入（insert-only）的 changelog，因此非常适合流式日志去重。
+
+### 主键表：分桶模式对比 {#primary-key-table-bucket-mode-comparison}
+
+| 模式 | 配置 | 最适合 | 权衡 |
+|---|---|---|---|
+| 动态分桶（默认） | `bucket = -1` | 大多数场景，自动扩缩容 | 需要单一写入作业 |
+| 固定分桶 | `bucket = N` | 稳定负载、分桶关联 | 需要手动调整桶数 |
+| Postpone 分桶 | `bucket = -2` | 自适应分区级分桶 | 新数据在 Compaction 前不可见 |
+
+**通用准则：** 分区中大约每 1GB 数据对应 1 个桶，每个桶包含 200MB–1GB 数据。
+
+### 主键表：表模式对比 {#primary-key-table-table-mode-comparison}
+
+| 模式 | 配置 | 写性能 | 读性能 | 最适合 |
+|---|---|---|---|---|
+| MOR（默认） | — | 非常好 | 不太好 | 写多查少 |
+| COW | `full-compaction.delta-commits = 1` | 非常差 | 非常好 | 读多、批式作业 |
+| MOW | `deletion-vectors.enabled = true` | 好 | 好 | 均衡（推荐用于大多数场景） |
+
+---
+
+## Append 表 {#append-table}
+
+当你的数据 **没有天然主键**，或者你在处理只插入、不需要 Upsert 语义的 **批式 ETL** 流水线时，
+使用 Append 表（追加表）。
+参见 [Append 表概述](../append-table/overview)。
+
+相比主键表，Append 表的批式读/写性能要好得多，设计更简单，资源消耗更低。
+**我们建议在大多数批处理场景中使用 Append 表。**
+
+### 场景 5：批式 ETL / 数据仓库分层（Unaware-Bucket） {#scenario-5-batch-etl--data-warehouse-layers-unaware-bucket}
+
+**适用场景：** 标准的数据仓库分层（ODS → DWD → DWS → ADS）、批量 INSERT OVERWRITE，或 Spark / Hive 风格的
+批处理。
+
+**推荐配置：**
+
+```sql
+CREATE TABLE dwd_events (
+    event_id BIGINT,
+    user_id BIGINT,
+    event_type STRING,
+    event_time TIMESTAMP,
+    dt STRING
+) PARTITIONED BY (dt);
+```
+
+无需任何分桶配置。这是一张 **unaware-bucket** 的 Append 表——最简单、也最常用的形式。
+Paimon 会自动处理小文件合并，并支持：
+
+- **时间旅行** 与版本回滚。
+- **Schema 演进**（增加 / 删除 / 重命名列）。
+- 通过 manifest（清单）文件中的 min-max 统计信息实现 **数据跳过（Data skipping）**。
+- **文件索引**（布隆过滤器、位图、Range Bitmap）以进一步加速查询。
+- **行级操作**（Spark SQL 中的 DELETE / UPDATE / MERGE INTO）。
+- 用于高级数据布局优化的 **增量聚簇（Incremental Clustering）**。
+
+**查询优化提示：** 如果你的查询经常基于特定列进行过滤，可以考虑使用
+[增量聚簇](../append-table/incremental-clustering) 按这些列对数据排序：
+
+```sql
+ALTER TABLE dwd_events SET (
+    'clustering.incremental' = 'true',
+    'clustering.columns' = 'user_id'
+);
+```
+
+或者为点查定义文件索引：
+
+```sql
+ALTER TABLE dwd_events SET (
+    'file-index.bloom-filter.columns' = 'user_id'
+);
+```
+
+### 场景 6：高频点查（分桶 Append） {#scenario-6-high-frequency-point-queries-bucketed-append}
+
+**适用场景：** 你的 Append 表经常基于特定列以等值或 IN 过滤进行查询
+（例如 `WHERE product_id = xxx`）。这是分桶 Append 表 **最有影响力** 的优势。
+
+**推荐配置：**
+
+```sql
+CREATE TABLE product_logs (
+    product_id BIGINT,
+    log_time TIMESTAMP,
+    message STRING,
+    dt STRING
+) PARTITIONED BY (dt) WITH (
+    'bucket' = '16',
+    'bucket-key' = 'product_id'
+);
+```
+
+**为什么这很强大：** `bucket-key` 启用了 **数据跳过**——当查询包含针对 bucket-key 的 `=` 或 `IN`
+条件时，Paimon 会将这些谓词下推，并完全裁剪掉所有不相关的桶文件。在 16 个桶的情况下，
+针对 `product_id` 的点查只会读取约 1/16 的数据。
+
+```sql
+-- Only reads the bucket containing product_id=12345, skips all other 15 buckets
+SELECT * FROM product_logs WHERE product_id = 12345;
+
+-- Only reads buckets for these 3 values
+SELECT * FROM product_logs WHERE product_id IN (1, 2, 3);
+```
+
+参见 [分桶 Append — 数据跳过](../append-table/bucketed#data-skipping)。
+
+**分桶关联的额外收益：** 如果两张分桶表共享相同的 `bucket-key` 和桶数，Spark 可以
+**无需 shuffle** 地对它们进行关联，从而显著加速批式关联查询：
+
+```sql
+SET spark.sql.sources.v2.bucketing.enabled = true;
+
+-- Both tables have bucket=16, bucket-key=product_id
+SELECT * FROM product_logs JOIN product_dim
+ON product_logs.product_id = product_dim.product_id;
+```
+
+参见 [分桶关联](../append-table/bucketed#bucketed-join)。
+
+### 场景 7：类队列的有序流式（分桶 Append） {#scenario-7-queue-like-ordered-streaming-bucketed-append}
+
+**适用场景：** 你希望将 Paimon 用作消息队列的替代品，并对每个 key 提供严格的顺序保证（类似于
+Kafka 分区），同时享受过滤下推与更低成本的好处。
+
+**推荐配置：**
+
+```sql
+CREATE TABLE event_stream (
+    user_id BIGINT,
+    event_type STRING,
+    event_time TIMESTAMP(3),
+    payload STRING,
+    WATERMARK FOR event_time AS event_time - INTERVAL '5' SECOND
+) WITH (
+    'bucket' = '8',
+    'bucket-key' = 'user_id'
+);
+```
+
+**原因：** 在同一个桶内，记录严格按写入时间排序。流式读取会按每个桶的精确写入顺序投递记录。
+这让你在数据湖的成本下获得类似 Kafka 的分区有序性。
+
+参见 [分桶流式](../append-table/bucketed#bucketed-streaming)。
+
+### Append 表：分桶模式对比 {#append-table-bucket-mode-comparison}
+
+| 模式 | 配置 | 数据跳过 | 分桶关联 | 有序流式 | 增量聚簇 |
+|---|---|---|---|---|---|
+| Unaware-Bucket（默认） | 无分桶配置 | 通过 min-max / 文件索引 | 否 | 否 | 是 |
+| 分桶 | `bucket = N, bucket-key = col` | **bucket-key 过滤下推** | 是 | 是 | 否 |
+
+---
+
+## 多模态数据湖 {#multimodal-data-lake}
+
+Paimon 是面向 AI 的多模态湖仓。你可以将多模态数据、元数据和 embedding 保存在同一张表中，
+并通过向量检索、全文检索或 SQL 进行查询。所有多模态特性都构建在启用了
+[Data Evolution](../append-table/data-evolution) 模式的 Append 表之上。
+
+### 场景 8：存储多模态数据（Blob 表） {#scenario-8-storing-multimodal-data-blob-table}
+
+**适用场景：** 你需要在数据湖中将图片、视频、音频文件、文档或模型权重与结构化元数据一同存储，
+并希望在不加载大型二进制数据的前提下进行高效的列投影。
+
+**推荐配置：**
+
+<Tabs groupId="blob-scenario">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+```sql
+CREATE TABLE image_table (
+    id INT,
+    name STRING,
+    label STRING,
+    image BYTES
+) WITH (
+    'row-tracking.enabled' = 'true',
+    'data-evolution.enabled' = 'true',
+    'blob-field' = 'image'
+);
+```
+
+</TabItem>
+
+<TabItem value="spark-sql" label="Spark SQL">
+
+```sql
+CREATE TABLE image_table (
+    id INT,
+    name STRING,
+    label STRING,
+    image BINARY
+) TBLPROPERTIES (
+    'row-tracking.enabled' = 'true',
+    'data-evolution.enabled' = 'true',
+    'blob-field' = 'image'
+);
+```
+
+</TabItem>
+
+</Tabs>
+
+**原因：** [Blob 存储](../append-table/blob) 将大型二进制数据分离到专门的 `.blob` 文件中，
+而元数据仍保存在标准的列式文件（Parquet/ORC）里。这意味着：
+
+- `SELECT id, name, label FROM image_table` **不会** 加载任何 Blob 数据——非常快。
+- Blob 数据支持对大对象（视频、模型权重）的流式读取，无需将整个文件加载到内存中。
+- 支持多种输入方式：本地文件、HTTP URL、InputStream 以及字节数组。
+
+**对于外部存储（例如 Blob 已存在于 S3 中）：**
+
+```sql
+CREATE TABLE video_table (
+    id INT,
+    title STRING,
+    video BYTES
+) WITH (
+    'row-tracking.enabled' = 'true',
+    'data-evolution.enabled' = 'true',
+    'blob-descriptor-field' = 'video',
+    'blob-external-storage-field' = 'video',
+    'blob-external-storage-path' = 's3://my-bucket/paimon-blobs/'
+);
+```
+
+这样只会在内联存储描述符引用，而实际的 Blob 数据驻留在外部存储中。
+
+### 场景 9：向量检索 / RAG 应用 {#scenario-9-vector-search--rag-applications}
+
+**适用场景：** 你正在构建推荐系统、图像检索，或需要在 embedding 上进行近似最近邻（ANN）
+检索的 RAG（检索增强生成，Retrieval Augmented Generation）应用。
+
+**推荐配置：**
+
+<Tabs groupId="vector-scenario">
+
+<TabItem value="spark-sql" label="Spark SQL">
+
+```sql
+CREATE TABLE doc_embeddings (
+    doc_id INT,
+    title STRING,
+    content STRING,
+    embedding ARRAY<FLOAT>
+) TBLPROPERTIES (
+    'row-tracking.enabled' = 'true',
+    'data-evolution.enabled' = 'true',
+    'global-index.enabled' = 'true',
+    'vector-field' = 'embedding',
+    'field.embedding.vector-dim' = '768',
+    'vector.file.format' = 'lance'
+);
+```
+
+</TabItem>
+
+<TabItem value="java-api" label="Java API">
+
+```java
+Schema schema = Schema.newBuilder()
+    .column("doc_id", DataTypes.INT())
+    .column("title", DataTypes.STRING())
+    .column("content", DataTypes.STRING())
+    .column("embedding", DataTypes.VECTOR(768, DataTypes.FLOAT()))
+    .option("bucket", "-1")
+    .option("row-tracking.enabled", "true")
+    .option("data-evolution.enabled", "true")
+    .option("global-index.enabled", "true")
+    .option("vector.file.format", "lance")
+    .build();
+```
+
+</TabItem>
+
+</Tabs>
+
+**构建向量索引并检索：**
+
+```sql
+-- Build DiskANN vector index
+CALL sys.create_global_index(
+    table => 'db.doc_embeddings',
+    index_column => 'embedding',
+    index_type => 'lumina',
+    options => 'lumina.index.dimension=768'
+);
+
+-- Search for top-5 nearest neighbors
+SELECT * FROM vector_search('doc_embeddings', 'embedding', array(0.1f, 0.2f, ...), 5);
+```
+
+为了向后兼容现有表与 SQL，旧的索引类型 `lumina-vector-ann` 仍然被接受。
+
+**原因：** 基于 DiskANN 的 [全局索引](../append-table/global-index) 提供高性能的 ANN 检索。
+向量数据存储在针对稠密向量优化的专用 `.vector.lance` 文件中，而标量列仍保留在
+Parquet 中。你还可以在标量列上构建 **BTree 索引** 以实现高效过滤：
+
+```sql
+-- Build BTree index for scalar filtering
+CALL sys.create_global_index(
+    table => 'db.doc_embeddings',
+    index_column => 'title',
+    index_type => 'btree'
+);
+
+-- Scalar lookup is accelerated by BTree index
+SELECT * FROM doc_embeddings WHERE title IN ('doc_a', 'doc_b');
+```
+
+### 场景 10：使用 Data Evolution 的 AI 特征工程 {#scenario-10-ai-feature-engineering-with-data-evolution}
+
+**适用场景：** 你拥有一个特征库或数据流水线，其中会频繁新增特征列，并且你希望
+在不重写整个数据文件的前提下回填或更新特定列。
+
+**推荐配置：**
+
+```sql
+CREATE TABLE feature_store (
+    user_id INT,
+    age INT,
+    gender STRING,
+    purchase_count INT
+) TBLPROPERTIES (
+    'row-tracking.enabled' = 'true',
+    'data-evolution.enabled' = 'true'
+);
+```
+
+**通过 MERGE INTO 仅更新特定列：**
+
+```sql
+-- Later, add a new feature column
+ALTER TABLE feature_store ADD COLUMNS (embedding ARRAY<FLOAT>);
+
+-- Backfill only the new column — no full file rewrite!
+MERGE INTO feature_store AS t
+USING embedding_source AS s
+ON t.user_id = s.user_id
+WHEN MATCHED THEN UPDATE SET t.embedding = s.embedding;
+```
+
+**原因：** [Data Evolution](../append-table/data-evolution) 模式只将更新过的列写入新文件，
+并在读时进行合并。这非常适合：
+
+- 新增特征列并回填数据，而无需重写整张表。
+- 迭代式 ML 特征工程——随着模型演进而增加、更新或优化特征。
+- 在频繁进行部分列更新时降低 I/O 成本与存储开销。
+
+### 场景 11：Python AI 流水线（PyPaimon） {#scenario-11-python-ai-pipeline-pypaimon}
+
+**适用场景：** 你正在用 Python 构建 ML 训练或推理流水线，并需要在无 JDK 依赖的情况下
+原生读/写 Paimon 表。
+
+**示例：读取数据用于模型训练：**
+
+```python
+from pypaimon import CatalogFactory
+from torch.utils.data import DataLoader
+
+# Connect to Paimon
+catalog = CatalogFactory.create({'warehouse': 's3://my-bucket/warehouse'})
+table = catalog.get_table('db.feature_store')
+
+# Read with filter and projection
+read_builder = table.new_read_builder()
+read_builder = read_builder.with_projection(['user_id', 'embedding'])
+read_builder = read_builder.with_filter(
+    read_builder.new_predicate_builder().equal('gender', 'M')
+)
+splits = read_builder.new_scan().plan().splits()
+table_read = read_builder.new_read()
+
+# Option 1: Load into PyTorch DataLoader
+dataset = table_read.to_torch(splits, streaming=True, prefetch_concurrency=2)
+dataloader = DataLoader(dataset, batch_size=32, num_workers=4)
+for batch in dataloader:
+    # Training loop
+    pass
+
+# Option 2: Load into Ray for distributed processing
+ray_dataset = table_read.to_ray(splits, override_num_blocks=8)
+mapped = ray_dataset.map(lambda row: {'feat': row['embedding']})
+
+# Option 3: Load into Pandas / PyArrow
+df = table_read.to_pandas(splits)
+arrow_table = table_read.to_arrow(splits)
+```
+
+**原因：** [PyPaimon](../pypaimon/overview) 是一个纯 Python SDK（无需 JDK），可与
+Python AI 生态无缝集成：
+
+- **PyTorch**：直接与 `DataLoader` 集成，支持流式读取与预取（prefetch）。
+- **Ray**：支持可配置并行度的分布式数据处理。
+- **Pandas / PyArrow**：为数据科学工作流原生支持 DataFrame 与 Arrow Table。
+- **Data Evolution**：Python API 支持 `update_by_arrow_with_row_id` 与 `upsert_by_arrow_with_key`，
+  可从 Python 进行行级更新。参见 [PyPaimon Data Evolution](../pypaimon/data-evolution)。
+
+---
+
+## 总结：表类型决策树 {#summary-table-type-decision-tree}
+
+```
+Do you need upsert / update / delete?
+├── YES → Primary Key Table
+│   ├── Simple upsert (keep latest)? → merge-engine = deduplicate (default)
+│   ├── Progressive multi-column updates? → merge-engine = partial-update
+│   ├── Pre-aggregate metrics? → merge-engine = aggregation
+│   └── Dedup keep first? → merge-engine = first-row
+│
+│   Table mode:
+│   ├── Most scenarios → deletion-vectors.enabled = true (MOW, recommended)
+│   ├── Write-heavy, query-light → default MOR
+│   └── Read-heavy, batch → full-compaction.delta-commits = 1 (COW)
+│
+│   Bucket mode:
+│   ├── Most scenarios → bucket = -1 (Dynamic, default)
+│   ├── Stable workload, need bucketed join → bucket = N (Fixed)
+│   └── Unknown distribution → bucket = -2 (Postpone)
+│
+└── NO → Append Table
+    ├── Standard batch ETL? → No bucket config (unaware-bucket)
+    │   └── Need query acceleration? → Incremental Clustering or File Index
+    │
+    ├── Need bucket-key filter pushdown / join / ordered streaming?
+    │   → bucket = N, bucket-key = col (Bucketed Append)
+    │
+    └── AI / Multimodal scenarios? → Enable Data Evolution
+        ├── Store images / videos / docs? → Blob Table (blob-field)
+        ├── Vector search / RAG? → VECTOR type + Global Index (DiskANN)
+        ├── Feature engineering? → Data Evolution (MERGE INTO partial columns)
+        └── Python pipeline? → PyPaimon (Ray / PyTorch / Pandas)
+```

@@ -1,0 +1,1401 @@
+---
+title: "Python API"
+sidebar_position: 2
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# Python API {#python-api}
+
+## 创建 Catalog {#create-catalog}
+
+在接触 Table 之前，你需要先创建一个 Catalog。
+
+<Tabs groupId="create-catalog">
+
+<TabItem value="filesystem" label="文件系统">
+
+```python
+from pypaimon import CatalogFactory
+
+# Note that keys and values are all string
+catalog_options = {
+    'warehouse': 'file:///path/to/warehouse'
+}
+catalog = CatalogFactory.create(catalog_options)
+```
+
+对于 S3 warehouse（仓库目录），需要将 S3 认证配置项与文件系统 Catalog 配置项一起传入：
+
+```python
+from pypaimon import CatalogFactory
+
+catalog_options = {
+    'warehouse': 's3://bucket/path/to/warehouse',
+    's3.endpoint': 'https://s3.amazonaws.com',
+    's3.access-key': 'xxx',
+    's3.secret-key': 'yyy',
+    # Optional. Required for temporary credentials.
+    's3.session-token': 'zzz',
+    # Optional. Useful for S3 compatible stores such as MinIO.
+    's3.path-style-access': 'true',
+}
+catalog = CatalogFactory.create(catalog_options)
+```
+
+对于使用 Kerberos 认证的 HDFS warehouse：
+
+```python
+from pypaimon import CatalogFactory
+
+catalog_options = {
+    'warehouse': 'hdfs://namenode:8020/path/to/warehouse',
+    # Keytab mode: automatic kinit
+    'security.kerberos.login.principal': 'user@YOUR.REALM',
+    'security.kerberos.login.keytab': '/path/to/user.keytab',
+}
+catalog = CatalogFactory.create(catalog_options)
+```
+
+如果你已经在外部执行过 `kinit`，则可以省略 `principal` 和 `keytab`。
+PyPaimon 会自动从 `KRB5CCNAME` 环境变量或默认的 `/tmp/krb5cc_<uid>`
+中获取票据（ticket）：
+
+```python
+from pypaimon import CatalogFactory
+
+catalog_options = {
+    'warehouse': 'hdfs://namenode:8020/path/to/warehouse',
+    # Ticket cache mode: uses existing Kerberos ticket
+}
+catalog = CatalogFactory.create(catalog_options)
+```
+
+如需禁用票据缓存自动检测并强制使用 SIMPLE 认证，请设置：
+
+```python
+catalog_options = {
+    'warehouse': 'hdfs://namenode:8020/path/to/warehouse',
+    'security.kerberos.login.use-ticket-cache': 'false',
+}
+```
+
+</TabItem>
+
+<TabItem value="rest-catalog" label="rest catalog">
+
+示例代码如下。配置项的详细含义可参见 [REST](../concepts/rest/overview)。
+
+```python
+from pypaimon import CatalogFactory
+
+# Note that keys and values are all string
+catalog_options = {
+  'metastore': 'rest',
+  'warehouse': 'xxx',
+  'uri': 'xxx',
+  'token.provider': 'xxx'
+}
+catalog = CatalogFactory.create(catalog_options)
+```
+
+</TabItem>
+
+</Tabs>
+
+目前，PyPaimon 仅支持文件系统 Catalog 和 rest Catalog。参见 [Catalog](../concepts/catalog)。
+
+你可以使用 Catalog 创建用于写入数据的表。
+
+## 创建数据库 {#create-database}
+
+表位于数据库中。如果你想在一个新的数据库中创建表，那么应当先创建这个数据库。
+
+```python
+catalog.create_database(
+    name='database_name',
+    ignore_if_exists=True,  # To raise error if the database exists, set False
+    properties={'key': 'value'}  # optional database properties
+)
+```
+
+## 创建表 {#create-table}
+
+表的 schema（表结构）包含字段定义、分区键、主键、表配置项和注释。
+字段定义通过 `pyarrow.Schema` 来描述。除字段定义外，其余参数都是可选的。
+
+通常有两种方式来构建 `pyarrow.Schema`。
+
+第一种，你可以直接使用 `pyarrow.schema` 方法，例如：
+
+```python
+import pyarrow as pa
+
+from pypaimon import Schema
+
+pa_schema = pa.schema([
+    ('dt', pa.string()),
+    ('hh', pa.string()),
+    ('pk', pa.int64()),
+    ('value', pa.string())
+])
+
+schema = Schema.from_pyarrow_schema(
+    pa_schema=pa_schema,
+    partition_keys=['dt', 'hh'],
+    primary_keys=['dt', 'hh', 'pk'],
+    options={'bucket': '2'},
+    comment='my test table')
+```
+
+所有支持的 `pyarrow-to-paimon` 数据类型映射，请参见 [Data Types](./python-api#data-types)。
+
+第二种，如果你已有一些 Pandas 数据，则可以从 `DataFrame` 中提取 `pa_schema`：
+
+```python
+import pandas as pd
+import pyarrow as pa
+
+from pypaimon import Schema
+
+# Example DataFrame data
+data = {
+    'dt': ['2024-01-01', '2024-01-01', '2024-01-02'],
+    'hh': ['12', '15', '20'],
+    'pk': [1, 2, 3],
+    'value': ['a', 'b', 'c'],
+}
+dataframe = pd.DataFrame(data)
+
+# Get Paimon Schema
+record_batch = pa.RecordBatch.from_pandas(dataframe)
+schema = Schema.from_pyarrow_schema(
+    pa_schema=record_batch.schema,
+    partition_keys=['dt', 'hh'],
+    primary_keys=['dt', 'hh', 'pk'],
+    options={'bucket': '2'},
+    comment='my test table'
+)
+```
+
+构建好表的 schema 之后，你就可以创建对应的表：
+
+```python
+schema = ...
+catalog.create_table(
+    identifier='database_name.table_name',
+    schema=schema,
+    ignore_if_exists=True  # To raise error if the table exists, set False
+)
+
+# Get Table
+table = catalog.get_table('database_name.table_name')
+```
+
+## 修改表（Alter Table） {#alter-table}
+
+通过一组 schema 变更来修改表。使用 `pypaimon.schema.schema_change` 中的 `SchemaChange`，以及 `pypaimon.schema.data_types` 中的类型（例如 `AtomicType`）。
+
+```python
+from pypaimon.schema.schema_change import SchemaChange
+from pypaimon.schema.data_types import AtomicType
+
+# Add column(s)
+catalog.alter_table(
+    'database_name.table_name',
+    [
+        SchemaChange.add_column('new_col', AtomicType('STRING')),
+        SchemaChange.add_column('score', AtomicType('DOUBLE'), comment='optional'),
+    ],
+    ignore_if_not_exists=False
+)
+
+# Drop column
+catalog.alter_table(
+    'database_name.table_name',
+    [SchemaChange.drop_column('col_name')],
+    ignore_if_not_exists=False
+)
+```
+
+其他支持的变更：`SchemaChange.rename_column`、`update_column_type`、`update_column_comment`、`set_option`、`remove_option`、`update_comment`。
+
+## 批式写入（Batch Write） {#batch-write}
+
+Paimon 表的写入采用两阶段提交（Two-Phase Commit），你可以多次写入，但一旦提交，就不能再写入更多数据。
+
+:::warning
+
+目前，「多次写入、一次提交」这一特性仅支持 Append 表（追加表）。
+
+:::
+
+```python
+table = catalog.get_table('database_name.table_name')
+
+# 1. Create table write and commit
+write_builder = table.new_batch_write_builder()
+table_write = write_builder.new_write()
+table_commit = write_builder.new_commit()
+
+# 2. Write data. Support 4 methods:
+# 2.1 Write pandas.DataFrame
+dataframe = ...
+table_write.write_pandas(dataframe)
+
+# 2.2 Write pyarrow.Table
+pa_table = ...
+table_write.write_arrow(pa_table)
+
+# 2.3 Write pyarrow.RecordBatch
+record_batch = ...
+table_write.write_arrow_batch(record_batch)
+
+# 3. Commit data (required for write_pandas/write_arrow/write_arrow_batch only)
+commit_messages = table_write.prepare_commit()
+table_commit.commit(commit_messages)
+
+# 4. Close resources
+table_write.close()
+table_commit.close()
+```
+
+默认情况下，数据会被追加到表中。如果你想覆盖（overwrite）表，则应使用 `TableWrite#overwrite`
+API：
+
+```python
+# overwrite whole table
+write_builder = table.new_batch_write_builder().overwrite()
+
+# overwrite partition 'dt=2024-01-01'
+write_builder = table.new_batch_write_builder().overwrite({'dt': '2024-01-01'})
+```
+
+### 提交回调（Commit Callback） {#commit-callback}
+
+你可以在 `TableCommit` 上注册 `CommitCallback` 实例，以便在每次成功提交快照后收到通知。这对于提交后的操作（例如将元数据同步到外部系统）非常有用。
+
+回调的实现必须是**幂等的**——如果在提交成功后立即发生故障，同一次提交的回调可能会被多次调用。
+
+```python
+from pypaimon.write.commit_callback import CommitCallback, CommitCallbackContext
+
+class MyCallback(CommitCallback):
+    def call(self, context: CommitCallbackContext) -> None:
+        print(f"Committed snapshot {context.snapshot.id}, "
+              f"{len(context.commit_entries)} entries, "
+              f"identifier {context.identifier}")
+
+    def close(self) -> None:
+        pass  # release resources if needed
+
+write_builder = table.new_batch_write_builder()
+table_write = write_builder.new_write()
+table_commit = write_builder.new_commit()
+table_commit.add_commit_callback(MyCallback())
+
+table_write.write_arrow(data)
+table_commit.commit(table_write.prepare_commit())
+table_write.close()
+table_commit.close()
+```
+
+`CommitCallbackContext` 提供以下内容：
+
+| 字段             | 类型                | 描述                              |
+|------------------|---------------------|------------------------------------------|
+| `snapshot`       | `Snapshot`          | 已提交的快照（id、commit_kind、time_millis、next_row_id 等） |
+| `commit_entries` | `List[ManifestEntry]` | 本次提交中的增量（delta）manifest（清单）文件条目（当启用行追踪时，每个条目都携带 `file.first_row_id`） |
+| `identifier`     | `int`               | 提交标识符                        |
+
+## 批式读取（Batch Read） {#batch-read}
+
+### 谓词下推（Predicate pushdown） {#predicate-pushdown}
+
+`ReadBuilder` 用于构建读取工具，并执行过滤与投影下推。
+
+```python
+table = catalog.get_table('database_name.table_name')
+read_builder = table.new_read_builder()
+```
+
+你可以使用 `PredicateBuilder` 构建过滤条件，并通过 `ReadBuilder` 将其下推：
+
+```python
+# Example filter: ('f0' < 3 OR 'f1' > 6) AND 'f3' = 'A'
+
+predicate_builder = read_builder.new_predicate_builder()
+
+predicate1 = predicate_builder.less_than('f0', 3)
+predicate2 = predicate_builder.greater_than('f1', 6)
+predicate3 = predicate_builder.or_predicates([predicate1, predicate2])
+
+predicate4 = predicate_builder.equal('f3', 'A')
+predicate_5 = predicate_builder.and_predicates([predicate3, predicate4])
+
+read_builder = read_builder.with_filter(predicate_5)
+```
+
+所有支持的过滤条件及其构建方法，请参见 [Predicate](./python-api#predicate)。按 `_ROW_ID` 过滤：参见 [Data Evolution](./data-evolution#filter-by-_row_id)。
+
+你也可以通过 `ReadBuilder` 下推投影：
+
+```python
+# select f3 and f2 columns
+read_builder = read_builder.with_projection(['f3', 'f2'])
+```
+
+对于包含嵌套 struct 列的表，你可以使用点号分隔的名称来投影各个子字段：
+
+```python
+# Given a table with schema: id BIGINT, info ROW<name STRING, age INT>, val STRING
+
+# Select a nested sub-field and a top-level field
+read_builder = read_builder.with_projection(['info.name', 'val'])
+
+# The result columns are flattened with underscore-joined names:
+# info_name, val
+```
+
+这会将嵌套列裁剪下推到文件读取器（Parquet/ORC 使用 PyArrow 的原生嵌套投影；Avro 则回退到 Python 端提取）。只会从磁盘读取所请求的叶子字段。
+
+限制：
+- 嵌套投影仅在 Append 表上受支持。需要进行合并读取的主键表会抛出 `NotImplementedError`。
+- 尚不支持 `ARRAY<ROW>` 和 `MAP` 类型的嵌套路径。
+
+### 生成 Split（Generate Splits） {#generate-splits}
+
+接着，你可以进入扫描计划（Scan Plan）阶段以获取 `splits`：
+
+```python
+table_scan = read_builder.new_scan()
+splits = table_scan.plan().splits()
+```
+
+最后，你可以从 `splits` 中读取数据，并转换为各种数据格式。
+
+### 读取 Apache Arrow {#read-apache-arrow}
+
+这需要安装 `pyarrow`。
+
+你可以将所有数据读取到一个 `pyarrow.Table` 中：
+
+```python
+table_read = read_builder.new_read()
+pa_table = table_read.to_arrow(splits)
+print(pa_table)
+
+# pyarrow.Table
+# f0: int32
+# f1: string
+# ----
+# f0: [[1,2,3],[4,5,6],...]
+# f1: [["a","b","c"],["d","e","f"],...]
+```
+
+你也可以将数据读取到一个 `pyarrow.RecordBatchReader` 中，并迭代各个 record batch：
+
+```python
+table_read = read_builder.new_read()
+for batch in table_read.to_arrow_batch_reader(splits):
+    print(batch)
+
+# pyarrow.RecordBatch
+# f0: int32
+# f1: string
+# ----
+# f0: [1,2,3]
+# f1: ["a","b","c"]
+```
+
+### 读取 Python 迭代器 {#read-python-iterator}
+
+你可以将数据逐行读取到一个原生 Python 迭代器中。
+这对于自定义的、基于行的处理逻辑非常方便。
+
+```python
+table_read = read_builder.new_read()
+for row in table_read.to_iterator(splits):
+    print(row)
+
+# [1,2,3]
+# ["a","b","c"]
+```
+
+### 读取 Pandas {#read-pandas}
+
+这需要安装 `pandas`。
+
+你可以将所有数据读取到一个 `pandas.DataFrame` 中：
+
+```python
+table_read = read_builder.new_read()
+df = table_read.to_pandas(splits)
+print(df)
+
+#    f0 f1
+# 0   1  a
+# 1   2  b
+# 2   3  c
+# 3   4  d
+# ...
+```
+
+### 读取 DuckDB {#read-duckdb}
+
+这需要安装 `duckdb`。
+
+你可以将 splits 转换为一个内存中的 DuckDB 表并进行查询：
+
+```python
+table_read = read_builder.new_read()
+duckdb_con = table_read.to_duckdb(splits, 'duckdb_table')
+
+print(duckdb_con.query("SELECT * FROM duckdb_table").fetchdf())
+#    f0 f1
+# 0   1  a
+# 1   2  b
+# 2   3  c
+# 3   4  d
+# ...
+
+print(duckdb_con.query("SELECT * FROM duckdb_table WHERE f0 = 1").fetchdf())
+#    f0 f1
+# 0   1  a
+```
+
+### 增量读取（Incremental Read） {#incremental-read}
+
+该 API 允许读取在两个快照时间戳之间提交的数据。步骤如下。
+
+- 通过 `table.copy({...})` 在一个拷贝出的表上设置配置项 `CoreOptions.INCREMENTAL_BETWEEN_TIMESTAMP`。该值必须
+  是一个字符串：`"startMillis,endMillis"`，其中 `startMillis` 是开区间（不含），`endMillis` 是闭区间（含）。
+- 使用 `SnapshotManager` 来获取快照时间戳，或者你也可以自行确定它们。
+- 按上文所述读取数据。
+
+示例：
+
+```python
+from pypaimon import CatalogFactory
+from pypaimon.common.core_options import CoreOptions
+from pypaimon.snapshot.snapshot_manager import SnapshotManager
+
+# Prepare catalog and obtain a table
+catalog = CatalogFactory.create({'warehouse': '/path/to/warehouse'})
+table = catalog.get_table('default.your_table_name')
+
+# Assume the table has at least two snapshots (1 and 2)
+snapshot_manager = SnapshotManager(table)
+t1 = snapshot_manager.get_snapshot_by_id(1).time_millis
+t2 = snapshot_manager.get_snapshot_by_id(2).time_millis
+
+# Read records committed between [t1, t2]
+table_inc = table.copy({CoreOptions.INCREMENTAL_BETWEEN_TIMESTAMP: f"{t1},{t2}"})
+
+read_builder = table_inc.new_read_builder()
+table_scan = read_builder.new_scan()
+table_read = read_builder.new_read()
+splits = table_scan.plan().splits()
+
+# To Arrow
+arrow_table = table_read.to_arrow(splits)
+
+# Or to pandas
+pandas_df = table_read.to_pandas(splits)
+```
+
+### 分片读取（Shard Read） {#shard-read}
+
+分片读取允许你通过将表划分为多个分片（shard）来并行读取数据。这对于
+分布式处理和并行计算非常有用。
+
+你可以指定分片索引和分片总数，以读取数据的特定部分：
+
+```python
+# Prepare read builder
+table = catalog.get_table('database_name.table_name')
+read_builder = table.new_read_builder()
+table_read = read_builder.new_read()
+
+# Read the second shard (index 1) out of 3 total shards
+splits = read_builder.new_scan().with_shard(1, 3).plan().splits()
+
+# Read all shards and concatenate results
+splits1 = read_builder.new_scan().with_shard(0, 3).plan().splits()
+splits2 = read_builder.new_scan().with_shard(1, 3).plan().splits()
+splits3 = read_builder.new_scan().with_shard(2, 3).plan().splits()
+
+# Combine results from all shards
+
+all_splits = splits1 + splits2 + splits3
+pa_table = table_read.to_arrow(all_splits)
+```
+
+分片读取的示例：
+
+```python
+import pyarrow as pa
+from pypaimon import CatalogFactory, Schema
+
+# Create catalog
+catalog_options = {'warehouse': 'file:///path/to/warehouse'}
+catalog = CatalogFactory.create(catalog_options)
+catalog.create_database("default", False)
+# Define schema
+pa_schema = pa.schema([
+    ('user_id', pa.int64()),
+    ('item_id', pa.int64()),
+    ('behavior', pa.string()),
+    ('dt', pa.string()),
+])
+
+# Create table and write data
+schema = Schema.from_pyarrow_schema(pa_schema, partition_keys=['dt'])
+catalog.create_table('default.test_table', schema, False)
+table = catalog.get_table('default.test_table')
+
+# Write data in two batches
+write_builder = table.new_batch_write_builder()
+
+# First write
+table_write = write_builder.new_write()
+table_commit = write_builder.new_commit()
+data1 = {
+    'user_id': [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+    'item_id': [1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014],
+    'behavior': ['a', 'b', 'c', None, 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm'],
+    'dt': ['p1', 'p1', 'p2', 'p1', 'p2', 'p1', 'p2', 'p1', 'p2', 'p1', 'p2', 'p1', 'p2', 'p1'],
+}
+pa_table = pa.Table.from_pydict(data1, schema=pa_schema)
+table_write.write_arrow(pa_table)
+table_commit.commit(table_write.prepare_commit())
+table_write.close()
+table_commit.close()
+
+# Second write
+table_write = write_builder.new_write()
+table_commit = write_builder.new_commit()
+data2 = {
+    'user_id': [5, 6, 7, 8, 18],
+    'item_id': [1005, 1006, 1007, 1008, 1018],
+    'behavior': ['e', 'f', 'g', 'h', 'z'],
+    'dt': ['p2', 'p1', 'p2', 'p2', 'p1'],
+}
+pa_table = pa.Table.from_pydict(data2, schema=pa_schema)
+table_write.write_arrow(pa_table)
+table_commit.commit(table_write.prepare_commit())
+table_write.close()
+table_commit.close()
+
+# Read specific shard
+read_builder = table.new_read_builder()
+table_read = read_builder.new_read()
+
+# Read shard 2 out of 3 total shards
+splits = read_builder.new_scan().with_shard(2, 3).plan().splits()
+shard_data = table_read.to_arrow(splits)
+
+# Verify shard distribution by reading all shards
+splits1 = read_builder.new_scan().with_shard(0, 3).plan().splits()
+splits2 = read_builder.new_scan().with_shard(1, 3).plan().splits()
+splits3 = read_builder.new_scan().with_shard(2, 3).plan().splits()
+
+# Combine all shards should equal full table read
+all_shards_data = pa.concat_tables([
+    table_read.to_arrow(splits1),
+    table_read.to_arrow(splits2),
+    table_read.to_arrow(splits3),
+])
+full_table_data = table_read.to_arrow(read_builder.new_scan().plan().splits())
+```
+
+关于分片读取的要点：
+
+- **分片索引（Shard Index）**：要读取的分片的从零开始的索引（0 到 total_shards-1）
+- **分片总数（Total Shards）**：将数据划分成的分片总数
+- **数据分布（Data Distribution）**：数据在各分片之间均匀分布，余下的行被分到最后一个分片
+- **并行处理（Parallel Processing）**：每个分片都可以独立处理，以获得更好的性能
+- **一致性（Consistency）**：合并所有分片应得到完整的表数据
+
+### 解释扫描计划（Explain Scan Plan） {#explain-scan-plan}
+
+`ReadBuilder.explain()` 返回扫描计划的结构化视图，且不读取任何数据文件。它有助于理解某次查询将产生哪些 split、下推对输入的裁剪有多激进，以及生成的 split 是否可以走零拷贝（zero-copy）快速路径来读取。
+
+```python
+table = catalog.get_table('default.events')
+read_builder = table.new_read_builder()
+predicate_builder = read_builder.new_predicate_builder()
+read_builder = read_builder.with_filter(predicate_builder.equal('dt', '2026-05-16'))
+print(read_builder.explain())
+
+# == PyPaimon Scan Plan ==
+# Table:              default.events (PK, HASH_FIXED)
+# Snapshot:           1  (schema 0)
+# Predicate:          dt = '2026-05-16'
+# Projection:         <all columns>
+# Limit:              <none>
+#
+# Partition pruning:  12 -> 4  (pruned 8)
+# Bucket pruning:     4 -> 4  (pruned 0)
+# File skipping:      4 -> 4  (pruned 0)
+#
+# Splits:             4
+#   raw-convertible:  4 / 4
+#   with DV:          0 / 4
+#   all-above-L0:     0 / 4
+#   files/split:      min=1  max=1  avg=1.00
+#   size/split:       min=2.8 KiB  p50=2.9 KiB  p95=3.0 KiB  max=3.0 KiB
+#
+# Files:              4
+# Total size:         11.6 KiB
+# Estimated rows:     20   (merged: 20)
+# Level histogram:    L0=4
+# Deletion files:     0
+```
+
+传入 `verbose=True` 还可以列出每个 split 及其分区、桶、文件数、大小、层（level）直方图和文件路径：
+
+```python
+print(read_builder.explain(verbose=True))
+
+# ...
+#
+# Splits[]
+#   [0] partition={'dt': '2026-05-16'} bucket=3 files=1 size=2.9 KiB rows=4 raw=True dv=False
+#       levels: L0=1
+#       file: /warehouse/default.db/events/dt=2026-05-16/bucket-3/data-...parquet
+#   [1] partition={'dt': '2026-05-16'} bucket=2 files=1 size=2.8 KiB rows=2 raw=True dv=False
+#       levels: L0=1
+#       file: /warehouse/default.db/events/dt=2026-05-16/bucket-2/data-...parquet
+#   ...
+```
+
+这些字段告诉你：
+
+- **下推**（`Predicate` / `Projection` / `Limit`）：在 `with_filter` / `with_projection` / `with_limit` 之后读取器实际看到的内容。
+- **裁剪漏斗**（`Partition pruning` / `Bucket pruning` / `File skipping`）：三个 `before -> after` 计数，展示谓词在哪个阶段发挥了作用。`n/a` 表示该阶段未生效——例如，对于谓词将每个桶键都固定下来的 HASH_FIXED 表会报告桶裁剪，而对于跳过其合成桶（synthetic-bucket）条目的 POSTPONE_BUCKET 表也会报告桶裁剪。
+- **Split 形态**：`raw-convertible` 统计可以零拷贝读取（无需合并、无需应用删除向量）的 split；`with DV` 统计其文件需要应用删除向量（Deletion Vector）的 split；`all-above-L0` 统计其数据全部位于 L1+ 上的 split，即合并流水线可以跳过 L0 缓冲区。
+- **文件汇总**：文件总大小 + 估计行数（括号中为主键表合并后的行数估计），以及一个展示数据所在位置的层直方图。
+
+:::info
+
+**开销**：`explain()` 会读取 manifest 列表和 manifest 文件，但不会打开任何数据文件。它会抑制 manifest 读取器的早期桶过滤，并强制单线程 manifest 解码，从而保证 before/after 计数器的准确性。在那些早期过滤通常会激进裁剪的表上（例如带有严格谓词的非常宽的 HASH_FIXED 表），这可能会使 `explain()` 明显慢于普通的 `new_scan().plan()`。
+
+:::
+
+`ExplainResult` 是一个普通的 dataclass——除了上文展示的人类可读 `__str__` 之外，其每个字段（`partition_pruning`、`bucket_pruning`、`file_skipping`、`split_count`、`splits_raw_convertible`、`level_histogram`、`splits` 等）都可以在 Python 中被寻址，以供编程使用。
+
+#### CLI {#cli}
+
+同样的扫描计划也可以从 `paimon` 命令行获得——这对于在不编写任何 Python 代码的情况下预览谓词的裁剪效果非常有用：
+
+```bash
+# Whole-table scan
+paimon -c paimon.yaml table explain default.events
+
+# Push down filter / projection / limit and list every split
+paimon -c paimon.yaml table explain default.events \
+    --where "dt = '2026-05-16' AND id = 7" \
+    --select dt,id,val \
+    --limit 100 \
+    --verbose
+
+# Machine-readable output (level_histogram keys are JSON strings)
+paimon -c paimon.yaml table explain default.events --format json
+```
+
+`--where` 接受与 `paimon table read` 相同的类 SQL 语法。使用 `--format json` 时，结果是 `ExplainResult` 的结构化转储，适合管道传入 `jq` 或进行进一步处理。
+
+## 回滚（Rollback） {#rollback}
+
+Paimon 支持将表回滚到之前的某个快照或标签（Tag）。这对于撤销不想要的更改，或
+将表恢复到一个已知的良好状态非常有用。
+
+### 回滚到快照（Rollback to Snapshot） {#rollback-to-snapshot}
+
+你可以通过快照 ID 将表回滚到特定快照：
+
+```python
+table = catalog.get_table('database_name.table_name')
+
+# Rollback to snapshot 3
+table.rollback_to(3)  # snapshot id
+```
+
+### 回滚到标签（Rollback to Tag） {#rollback-to-tag}
+
+你也可以将表回滚到之前创建的某个标签：
+
+```python
+table = catalog.get_table('database_name.table_name')
+
+# Rollback to tag 'v3'
+table.rollback_to('v3')  # tag name
+```
+
+`rollback_to` 方法接受一个 `int`（快照 ID）或一个 `str`（标签名），并会自动分派
+到相应的回滚逻辑。
+
+## 流式读取（Streaming Read） {#streaming-read}
+
+流式读取允许你随着新数据到达 Paimon 表而持续读取它们。这对于构建
+实时数据管道和 ETL 作业非常有用。
+
+### 基础流式读取（Basic Streaming Read） {#basic-streaming-read}
+
+使用 `StreamReadBuilder` 创建一个持续轮询新快照的流式扫描：
+
+```python
+table = catalog.get_table('database_name.table_name')
+
+# Create streaming read builder
+stream_builder = table.new_stream_read_builder()
+stream_builder.with_poll_interval_ms(1000)  # Poll every 1 second
+
+# Create streaming scan and table read
+scan = stream_builder.new_streaming_scan()
+table_read = stream_builder.new_read()
+
+# Async streaming (recommended for ETL pipelines)
+import asyncio
+
+async def process_stream():
+    async for plan in scan.stream():
+        for split in plan.splits():
+            arrow_batch = table_read.to_arrow([split])
+            # Process the data
+            print(f"Received {arrow_batch.num_rows} rows")
+
+asyncio.run(process_stream())
+```
+
+### 同步流式读取（Synchronous Streaming） {#synchronous-streaming}
+
+对于较简单的使用场景，你可以使用同步封装：
+
+```python
+# Synchronous streaming
+for plan in scan.stream_sync():
+    arrow_table = table_read.to_arrow(plan.splits())
+    process(arrow_table)
+```
+
+### 手动位置控制（Manual Position Control） {#manual-position-control}
+
+你可以通过 `next_snapshot_id` 直接读取和设置扫描位置：
+
+```python
+# Save current position
+saved_position = scan.next_snapshot_id
+
+# Later, restore position
+scan.next_snapshot_id = saved_position
+
+# Or start from a specific snapshot
+scan.next_snapshot_id = 42
+```
+
+### 过滤流式数据（Filtering Streaming Data） {#filtering-streaming-data}
+
+你可以对流式读取应用谓词和投影：
+
+```python
+stream_builder = table.new_stream_read_builder()
+
+# Build predicate
+predicate_builder = stream_builder.new_predicate_builder()
+predicate = predicate_builder.greater_than('timestamp', 1704067200000)
+
+# Apply filter and projection
+stream_builder.with_filter(predicate)
+stream_builder.with_projection(['id', 'name', 'timestamp'])
+
+scan = stream_builder.new_streaming_scan()
+```
+
+关于流式读取的要点：
+
+- **轮询间隔（Poll Interval）**：控制检查新快照的频率（默认：1000ms）
+- **初始扫描（Initial Scan）**：第一次迭代返回所有已存在的数据，后续迭代仅返回新数据
+- **提交类型（Commit Types）**：默认情况下，只处理 APPEND 提交；COMPACT 和 OVERWRITE 会被跳过
+
+### 并行消费（Parallel Consumption） {#parallel-consumption}
+
+对于高吞吐的流式场景，你可以并行运行多个消费者，每个消费者读取一个不相交的桶子集。
+这类似于 Kafka 消费者组。
+
+**使用 `with_buckets()` 进行显式的桶分配**：
+
+```python
+# Consumer 0 reads buckets 0, 1, 2
+stream_builder.with_buckets([0, 1, 2])
+
+# Consumer 1 reads buckets 3, 4, 5
+stream_builder.with_buckets([3, 4, 5])
+```
+
+**使用 `with_bucket_filter()` 进行自定义过滤**：
+
+```python
+# Read only even buckets
+stream_builder.with_bucket_filter(lambda b: b % 2 == 0)
+```
+
+### RowKind 支持（Row Kind Support） {#row-kind-support}
+
+对于 changelog（变更日志）流，你可以包含 row kind 以区分插入、更新和删除：
+
+```python
+stream_builder = table.new_stream_read_builder()
+stream_builder.with_include_row_kind(True)
+
+scan = stream_builder.new_streaming_scan()
+table_read = stream_builder.new_read()
+
+async for plan in scan.stream():
+    arrow_table = table_read.to_arrow(plan.splits())
+    for row in arrow_table.to_pylist():
+        row_kind = row['_row_kind']  # +I, -U, +U, or -D
+        if row_kind == '+I':
+            handle_insert(row)
+        elif row_kind == '-D':
+            handle_delete(row)
+        elif row_kind in ('-U', '+U'):
+            handle_update(row)
+```
+
+RowKind 取值：
+- `+I`：插入（Insert）
+- `-U`：更新前（旧值）
+- `+U`：更新后（新值）
+- `-D`：删除（Delete）
+
+## 数据类型（Data Types） {#data-types}
+
+### 标量类型（Scalar Types） {#scalar-types}
+
+| Python 原生类型      | PyArrow 类型                            | Paimon 类型                        |
+|:--------------------|:---------------------------------------|:----------------------------------|
+| `int`               | `pyarrow.int8()`                       | `TINYINT`                         |
+| `int`               | `pyarrow.int16()`                      | `SMALLINT`                        |
+| `int`               | `pyarrow.int32()`                      | `INT`                             |
+| `int`               | `pyarrow.int64()`                      | `BIGINT`                          |
+| `float`             | `pyarrow.float32()`                    | `FLOAT`                           |
+| `float`             | `pyarrow.float64()`                    | `DOUBLE`                          |
+| `bool`              | `pyarrow.bool_()`                      | `BOOLEAN`                         |
+| `str`               | `pyarrow.string()`                     | `STRING`, `CHAR(n)`, `VARCHAR(n)` |
+| `bytes`             | `pyarrow.binary()`                     | `BYTES`, `VARBINARY(n)`           |
+| `bytes`             | `pyarrow.binary(length)`               | `BINARY(length)`                  |
+| `bytes`             | `pyarrow.large_binary()`               | `BLOB`                            |
+| `decimal.Decimal`   | `pyarrow.decimal128(precision, scale)` | `DECIMAL(precision, scale)`       |
+| `datetime.datetime` | `pyarrow.timestamp(unit, tz=None)`     | `TIMESTAMP(p)` — unit: `'s'` p=0, `'ms'` p=1–3, `'us'` p=4–6, `'ns'` p=7–9 |
+| `datetime.datetime` | `pyarrow.timestamp(unit, tz='UTC')`    | `TIMESTAMP_LTZ(p)` — same unit/p mapping as above                             |
+| `datetime.date`     | `pyarrow.date32()`                     | `DATE`                            |
+| `datetime.time`     | `pyarrow.time32('ms')`                 | `TIME(p)`                         |
+
+### 复杂类型（Complex Types） {#complex-types}
+
+| Python 原生类型     | PyArrow 类型                           | Paimon 类型             |
+|:-------------------|:--------------------------------------|:-----------------------|
+| `list`             | `pyarrow.list_(element_type)`         | `ARRAY<element_type>`  |
+| `dict`             | `pyarrow.map_(key_type, value_type)`  | `MAP<key, value>`      |
+| `dict`             | `pyarrow.struct([field, ...])`        | `ROW<field ...>`       |
+
+### VARIANT 类型（VARIANT Type） {#variant-type}
+
+`VARIANT` 以 [Parquet Variant 二进制编码](https://github.com/apache/parquet-format/blob/master/VariantEncoding)
+存储半结构化、schema 灵活的数据（JSON 对象、数组和基本类型）。
+
+pypaimon 将 VARIANT 列暴露为 Arrow 的 `struct<value: binary NOT NULL, metadata: binary NOT NULL>`，并
+提供 `GenericVariant` 用于编码和解码。
+
+Paimon 为 VARIANT 支持两种 Parquet 存储布局：
+
+- **普通 VARIANT（Plain VARIANT）**——标准的双字段 struct（`value` + `metadata`）。所有写入的默认值。
+- **拆分 VARIANT（Shredded VARIANT）**——带类型的子列与溢出字节一起存储，从而在 Parquet 文件内部实现
+  列跳过（column-skipping）。由 `variant.shreddingSchema` 表配置项控制。
+
+<Tabs groupId="variant-read-write">
+
+<TabItem value="plain-variant" label="普通 VARIANT">
+
+**读取**
+
+在每个 Arrow batch 中，VARIANT 列都以 `struct<value: binary, metadata: binary>` 的形式到达。
+使用 `GenericVariant.from_arrow_struct` 解码每一行：
+
+```python
+from pypaimon.data.generic_variant import GenericVariant
+
+read_builder = table.new_read_builder()
+result = read_builder.new_read().to_arrow(read_builder.new_scan().plan().splits())
+
+for record in result.to_pylist():
+    if (payload := record["payload"]) is not None:
+        gv = GenericVariant.from_arrow_struct(payload)
+        print(gv.to_python())   # decode to Python dict / list / scalar
+```
+
+`from_arrow_struct` 是一个轻量级操作——它只是包装两个原始字节数组而不会
+解析它们。实际的 variant 二进制解码会延迟到 `to_python()` 时进行。
+
+**写入**
+
+构建 `GenericVariant` 值，并使用 `to_arrow_array` 将它们转换为 Arrow 列：
+
+```python
+import pyarrow as pa
+from pypaimon.data.generic_variant import GenericVariant
+
+gv1 = GenericVariant.from_python({'city': 'Beijing', 'age': 30})
+gv2 = GenericVariant.from_python({'tags': [1, 2, 3], 'active': True})
+# None represents SQL NULL
+
+data = pa.table({
+    'id':      pa.array([1, 2, 3], type=pa.int32()),
+    'payload': GenericVariant.to_arrow_array([gv1, gv2, None]),
+})
+
+write_builder = table.new_batch_write_builder()
+table_write = write_builder.new_write()
+table_commit = write_builder.new_commit()
+table_write.write_arrow(data)
+table_commit.commit(table_write.prepare_commit())
+table_write.close()
+table_commit.close()
+```
+
+</TabItem>
+
+<TabItem value="shredded-variant" label="拆分 VARIANT">
+
+在拆分模式下，VARIANT 列在 Parquet 内部被物理拆分为一个三字段组：
+
+```
+payload (GROUP)
+├── metadata   BYTE_ARRAY          -- key dictionary (always present)
+├── value      BYTE_ARRAY OPTIONAL -- overflow bytes for un-shredded fields
+└── typed_value (GROUP) OPTIONAL
+    ├── age    (GROUP)
+    │   ├── value        BYTE_ARRAY OPTIONAL
+    │   └── typed_value  INT64 OPTIONAL
+    └── city   (GROUP)
+        ├── value        BYTE_ARRAY OPTIONAL
+        └── typed_value  BYTE_ARRAY OPTIONAL
+```
+
+**读取——自动重组**
+
+当 pypaimon 读取一个包含拆分 VARIANT 列的 Parquet 文件时（无论它是由 Paimon Java
+还是由启用了拆分的 pypaimon 写入的），它会在返回任何 batch 之前**自动检测并重组**它们，
+还原为标准的 `struct<value, metadata>` 形式。读取端无需更改任何代码：
+
+```python
+from pypaimon.data.generic_variant import GenericVariant
+
+# Works identically for both shredded and plain Parquet files
+read_builder = table.new_read_builder()
+result = read_builder.new_read().to_arrow(read_builder.new_scan().plan().splits())
+
+for record in result.to_pylist():
+    if (payload := record["payload"]) is not None:
+        gv = GenericVariant.from_arrow_struct(payload)   # same API as plain VARIANT
+        print(gv.to_python())
+```
+
+重组（从 `typed_value` 子列和溢出字节重建 variant 二进制）
+发生在 `FormatPyArrowReader.read_arrow_batch()` 内部——也就是说，**在 batch 读取时**，在
+将 Arrow 数据返回给调用方之前进行。注意：当子字段投影处于激活状态时
+（`with_variant_sub_fields`），会完全跳过重组，仅解码所请求的带类型
+子列。
+
+**写入——拆分模式**
+
+将 `variant.shreddingSchema` 表配置项设置为一个 JSON 编码的 `ROW` 类型，用以描述要对哪些 VARIANT 列
+的哪些子字段进行拆分。顶层字段将 VARIANT 列名映射到它们的
+子字段 schema：
+
+```python
+import json
+
+shredding_schema = json.dumps({
+    "type": "ROW",
+    "fields": [
+        {
+            "id": 0,
+            "name": "payload",          # VARIANT column name in the table
+            "type": {
+                "type": "ROW",
+                "fields": [             # sub-fields to extract as typed columns
+                    {"id": 0, "name": "age",  "type": "BIGINT"},
+                    {"id": 1, "name": "city", "type": "VARCHAR"},
+                ]
+            }
+        }
+    ]
+})
+
+# Pass the option when creating the table
+schema = Schema.from_pyarrow_schema(
+    pa_schema,
+    options={'variant.shreddingSchema': shredding_schema}
+)
+catalog.create_table('db.events', schema, ignore_if_exists=True)
+```
+
+一旦设置了该配置项，每次 `write_arrow` 调用都会透明地将 VARIANT 列转换为拆分的
+Parquet 布局。这样，读取路径——包括 Java Paimon 和其他引擎——便可以利用带类型的
+子列，通过子字段投影实现列跳过。
+
+未在 `variant.shreddingSchema` 中列出的字段将被存储在溢出的 `value` 字节中，并在读取路径上保持
+完全可访问。
+
+拆分子字段所支持的 Paimon 类型字符串：`BOOLEAN`、`INT`、`BIGINT`、`FLOAT`、`DOUBLE`、
+`VARCHAR`、`DECIMAL(p,s)`，以及用于递归对象拆分的嵌套 `ROW` 类型。
+
+</TabItem>
+
+</Tabs>
+
+
+**`GenericVariant` API：**
+
+| 方法 | 描述 |
+|:-------|:------------|
+| `GenericVariant.from_python(obj)` | 从一个 Python 对象（`dict`、`list`、`int`、`str` 等）构建 |
+| `GenericVariant.from_arrow_struct({"value": b"...", "metadata": b"..."})` | 包装来自 Arrow VARIANT struct 行的原始字节（读取路径） |
+| `GenericVariant.to_arrow_array([gv1, gv2, None, ...])` | 将一组 `GenericVariant`（或 `None`）转换为 `pa.StructArray` 以供写入 |
+| `gv.to_python()` | 解码为原生 Python（`dict`、`list`、`int`、`str`、`None` 等） |
+| `gv.value()` | 返回原始 value 字节 |
+| `gv.metadata()` | 返回原始 metadata 字节 |
+
+**限制：**
+
+- `VARIANT` 仅在 Parquet 文件格式下受支持。ORC 和 Avro 不受支持。
+- `VARIANT` 不能用作主键或分区键。
+
+## 谓词（Predicate） {#predicate}
+
+| 谓词种类               | 谓词方法                                       | 
+|:----------------------|:----------------------------------------------|
+| p1 and p2             | PredicateBuilder.and_predicates([p1, p2])     |
+| p1 or p2              | PredicateBuilder.or_predicates([p1, p2])      |
+| f = literal           | PredicateBuilder.equal(f, literal)            |
+| f != literal          | PredicateBuilder.not_equal(f, literal)        |
+| f \< literal           | PredicateBuilder.less_than(f, literal)        |
+| f \<= literal          | PredicateBuilder.less_or_equal(f, literal)    |
+| f > literal           | PredicateBuilder.greater_than(f, literal)     |
+| f >= literal          | PredicateBuilder.greater_or_equal(f, literal) |
+| f is null             | PredicateBuilder.is_null(f)                   |
+| f is not null         | PredicateBuilder.is_not_null(f)               |
+| f.startswith(literal) | PredicateBuilder.startswith(f, literal)       |
+| f.endswith(literal)   | PredicateBuilder.endswith(f, literal)         |
+| f.contains(literal)   | PredicateBuilder.contains(f, literal)         |
+| f is in [l1, l2]      | PredicateBuilder.is_in(f, [l1, l2])           |
+| f is not in [l1, l2]  | PredicateBuilder.is_not_in(f, [l1, l2])       |
+| lower \<= f \<= upper   | PredicateBuilder.between(f, lower, upper)     |
+
+## 消费者管理（Consumer Management） {#consumer-management}
+
+消费者管理允许你跟踪消费进度、防止快照过期，并从断点处恢复。
+
+### 创建 ConsumerManager（Create ConsumerManager） {#create-consumermanager}
+
+```python
+from pypaimon import CatalogFactory
+
+# Get table and file_io
+catalog = CatalogFactory.create({'warehouse': 'file:///path/to/warehouse'})
+table = catalog.get_table('database_name.table_name')
+file_io = table.file_io()
+
+# Create consumer manager
+manager = table.consumer_manager()
+```
+
+### 获取消费者（Get Consumer） {#get-consumer}
+
+通过 ID 检索一个消费者：
+
+```python
+from pypaimon.consumer.consumer import Consumer
+
+consumer = manager.consumer('consumer_id')
+if consumer:
+    print(f"Next snapshot: {consumer.next_snapshot}")
+else:
+    print("Consumer not found")
+```
+
+### 重置消费者（Reset Consumer） {#reset-consumer}
+
+使用新的快照 ID 创建或重置一个消费者：
+
+```python
+# Reset consumer to snapshot 10
+manager.reset_consumer('consumer_id', Consumer(next_snapshot=10))
+```
+
+### 删除消费者（Delete Consumer） {#delete-consumer}
+
+通过 ID 删除一个消费者：
+
+```python
+manager.delete_consumer('consumer_id')
+```
+
+### 列出消费者（List Consumers） {#list-consumers}
+
+获取所有消费者及其 next snapshot ID：
+
+```python
+consumers = manager.consumers()
+for consumer_id, next_snapshot in consumers.items():
+    print(f"Consumer {consumer_id}: next snapshot {next_snapshot}")
+```
+
+### 列出所有 consumer id（List All Consumer IDs） {#list-all-consumer-ids}
+
+列出所有 consumer id：
+
+```python
+consumer_ids = manager.list_all_ids()
+for consumer_id in consumer_ids:
+    print(consumer_id)
+```
+
+### 获取最小的 next snapshot（Get Minimum Next Snapshot） {#get-minimum-next-snapshot}
+
+获取所有消费者中最小的 next snapshot：
+
+```python
+min_snapshot = manager.min_next_snapshot()
+if min_snapshot:
+    print(f"Minimum next snapshot: {min_snapshot}")
+```
+
+### 使消费者过期（Expire Consumers） {#expire-consumers}
+
+使在给定 datetime 之前修改过的消费者过期：
+
+```python
+from datetime import datetime, timedelta
+
+# Expire consumers older than 1 day
+expire_time = datetime.now() - timedelta(days=1)
+manager.expire(expire_time)
+```
+
+### 清除消费者（Clear Consumers） {#clear-consumers}
+
+清除匹配正则表达式模式的消费者：
+
+```python
+# Clear all consumers starting with "test_"
+manager.clear_consumers('test_.*')
+
+# Clear all consumers except those starting with "prod_"
+manager.clear_consumers(
+    '.*',
+    'prod_.*'
+)
+```
+
+### 分支支持（Branch Support） {#branch-support}
+
+ConsumerManager 支持多个分支（Branch）：
+
+```python
+# Custom branch
+branch_manager = manager.with_branch('feature_branch')
+
+# Each branch maintains its own consumers
+print(branch_manager.consumers())  # Consumers on feature branch
+```
+
+## 分支管理（Branch Management） {#branch-management}
+
+分支管理允许你创建一张表的多个版本，从而实现并行开发和实验。Paimon 支持从当前状态或从特定标签（Tag）创建分支。
+
+:::info
+
+PyPaimon 提供 `BranchManager` 的两种实现：
+- **FileSystemBranchManager**：用于直接通过文件系统访问的表（文件系统 Catalog 的默认实现）
+- **CatalogBranchManager**：用于通过 Catalog 访问的表（例如 REST Catalog）
+
+`table.branch_manager()` 方法会根据表所处的 Catalog 环境自动返回相应的实现。
+
+:::
+
+### 创建分支（Create Branch） {#create-branch}
+
+从当前表状态创建一个新分支：
+
+```python
+from pypaimon import CatalogFactory
+
+catalog = CatalogFactory.create({'warehouse': 'file:///path/to/warehouse'})
+table = catalog.get_table('database_name.table_name')
+
+# Create a branch from current state
+table.branch_manager().create_branch('feature_branch')
+```
+
+从特定标签创建一个分支：
+
+```python
+# Create a branch from tag 'v1.0'
+table.branch_manager().create_branch('feature_branch', tag_name='v1.0')
+```
+
+创建分支，并在其已存在时忽略：
+
+```python
+# No error if branch already exists
+table.branch_manager().create_branch('feature_branch', ignore_if_exists=True)
+```
+
+### 列出分支（List Branches） {#list-branches}
+
+列出一张表的所有分支：
+
+```python
+# Get all branch names
+branches = table.branch_manager().branches()
+
+for branch in branches:
+    print(f"Branch: {branch}")
+```
+
+### 检查分支是否存在（Check Branch Exists） {#check-branch-exists}
+
+检查某个特定分支是否存在：
+
+```python
+if table.branch_manager().branch_exists('feature_branch'):
+    print("Branch exists")
+else:
+    print("Branch does not exist")
+```
+
+### 删除分支（Drop Branch） {#drop-branch}
+
+删除一个已存在的分支：
+
+```python
+# Drop a branch
+table.branch_manager().drop_branch('feature_branch')
+```
+
+### 重命名分支（Rename Branch） {#rename-branch}
+
+将一个已存在的分支重命名为新名称：
+
+```python
+# Rename a branch
+table.branch_manager().rename_branch('old_branch_name', 'new_branch_name')
+```
+
+:::warning
+
+源分支必须存在，且不能是主（main）分支。目标分支名必须合法且尚不存在。
+
+:::
+
+### 快进（Fast Forward） {#fast-forward}
+
+将主分支快进到某个特定分支：
+
+```python
+# Fast forward main to feature branch
+# This is useful when you want to merge changes from a feature branch back to main
+table.branch_manager().fast_forward('feature_branch')
+```
+
+:::warning
+
+快进操作不可逆，它会用目标分支的状态替换主分支的当前状态。
+
+:::
+
+### 分支路径结构（Branch Path Structure） {#branch-path-structure}
+
+Paimon 在文件系统中按如下方式组织分支：
+
+- **主分支（Main branch）**：直接存储在表目录中（例如 `/path/to/table/`）
+- **功能分支（Feature branches）**：存储在 `branch` 子目录中（例如 `/path/to/table/branch/branch-feature_branch/`）
+
+### 分支名校验（Branch Name Validation） {#branch-name-validation}
+
+分支名有以下约束：
+
+- 不能为 "main"（默认分支）
+- 不能为空白或仅含空白字符
+- 不能为纯数字字符串
+- 合法示例：`feature`、`develop`、`feature-123`、`my-branch`
+
+## 支持的特性（Supported Features） {#supported-features}
+
+下面展示了 Python Paimon 相比 Java Paimon 所支持的特性：
+
+**Catalog 层级**
+
+- FileSystemCatalog
+- RestCatalog
+
+**文件系统与安全**
+
+- 本地文件系统（`file://`）
+- 使用 SIMPLE 认证的 HDFS（`hdfs://`）
+- 使用 Kerberos 认证（keytab 或票据缓存）的 HDFS（`hdfs://`）
+- 阿里云 OSS（`oss://`）
+- S3（`s3://`）
+
+**表层级**
+
+- Append 表
+    - `bucket = -1`（无感知，unaware）
+    - `bucket > 0`（固定）
+- 主键表
+    - 仅支持去重（deduplicate）
+    - `bucket = -2`（推迟，postpone）
+    - `bucket > 0`（固定）
+    - 在启用删除向量（Deletion Vector）的情况下读取
+- 格式表（Format Tables）
+    - PARQUET
+    - CSV
+    - JSON
+    - ORC
+    - TEXT
+- 读/写操作
+    - Append 表和主键表的批式读和写
+    - 谓词过滤
+    - 覆盖（Overwrite）语义
+    - Delta 数据的增量读取
+    - 读写 Blob 数据
+    - `with_shard` 特性
+    - 回滚特性
+    - 流式读取
+    - 带桶过滤的并行消费
+    - 针对 changelog 流的 RowKind 支持

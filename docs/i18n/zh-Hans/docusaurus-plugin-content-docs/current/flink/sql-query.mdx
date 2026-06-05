@@ -1,0 +1,296 @@
+---
+title: "SQL 查询"
+sidebar_position: 4
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+import Label from '@site/src/components/Label';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# SQL 查询 {#sql-query}
+
+与所有其他表一样，Paimon 表可以使用 `SELECT` 语句进行查询。
+
+## 批式查询 {#batch-query}
+
+Paimon 的批式读取会返回表某个快照中的全部数据。默认情况下，批式读取返回最新快照。
+
+```sql
+-- Flink SQL
+SET 'execution.runtime-mode' = 'batch';
+```
+
+### 批式时间旅行 {#batch-time-travel}
+
+Paimon 的批式读取可以结合时间旅行（time travel），指定某个快照或某个标签（Tag）并读取相应的数据。
+
+<Tabs groupId="time-travel-example">
+
+<TabItem value="flink-dynamic-option" label="Flink（动态参数）">
+
+```sql
+-- read the snapshot with id 1L
+SELECT * FROM t /*+ OPTIONS('scan.snapshot-id' = '1') */;
+
+-- read the snapshot from specified timestamp in unix milliseconds
+SELECT * FROM t /*+ OPTIONS('scan.timestamp-millis' = '1678883047356') */;
+
+-- read the snapshot from specified timestamp string ,it will be automatically converted to timestamp in unix milliseconds
+-- Supported formats include：yyyy-MM-dd, yyyy-MM-dd HH:mm:ss, yyyy-MM-dd HH:mm:ss.SSS, use default local time zone
+SELECT * FROM t /*+ OPTIONS('scan.timestamp' = '2023-12-09 23:09:12') */;
+
+-- read tag 'my-tag'
+SELECT * FROM t /*+ OPTIONS('scan.tag-name' = 'my-tag') */;
+
+-- read the snapshot from watermark, will match the first snapshot after the watermark
+SELECT * FROM t /*+ OPTIONS('scan.watermark' = '1678883047356') */; 
+```
+
+</TabItem>
+
+<TabItem value="flink-1-18" label="Flink 1.18+">
+
+Flink SQL 在 1.18 之后支持时间旅行语法。
+
+```sql
+-- read the snapshot from specified timestamp
+SELECT * FROM t FOR SYSTEM_TIME AS OF TIMESTAMP '2023-01-01 00:00:00';
+
+-- you can also use some simple expressions (see flink document to get supported functions)
+SELECT * FROM t FOR SYSTEM_TIME AS OF TIMESTAMP '2023-01-01 00:00:00' + INTERVAL '1' DAY
+```
+
+</TabItem>
+
+</Tabs>
+
+### 批式增量读取 {#batch-incremental}
+
+读取起始快照（不含）和结束快照之间的增量变更。
+
+例如：
+- '5,10' 表示快照 5 与快照 10 之间的变更。
+- 'TAG1,TAG3' 表示 TAG1 与 TAG3 之间的变更。
+
+```sql
+-- incremental between snapshot ids
+SELECT * FROM t /*+ OPTIONS('incremental-between' = '12,20') */;
+
+-- incremental between snapshot time mills
+SELECT * FROM t /*+ OPTIONS('incremental-between-timestamp' = '1692169000000,1692169900000') */;
+SELECT * FROM t /*+ OPTIONS('incremental-between-timestamp' = '2025-03-12 00:00:00,2025-03-12 00:08:00') */;
+```
+
+默认情况下，对于会产生 changelog 文件的表，将扫描其 changelog 文件；否则扫描新近变更的文件。
+你也可以强制指定 `'incremental-between-scan-mode'`。
+
+在批式 SQL 中，不允许返回 `DELETE` 记录，因此 `-D` 的记录会被丢弃。
+如果你想查看 `DELETE` 记录，可以使用 audit_log 表：
+
+```sql
+SELECT * FROM t$audit_log /*+ OPTIONS('incremental-between' = '12,20') */;
+```
+
+### 在自动创建的标签之间进行批式增量读取 {#batch-incremental-between-auto-created-tags}
+
+你可以使用 `incremental-between` 来查询两个标签之间的增量变更。但对于自动创建的标签，由于数据延迟，标签可能不会及时创建。
+
+例如，假设标签 '2024-12-01'、'2024-12-02' 和 '2024-12-04' 是每日自动创建的。12/03 的数据发生了延迟，与 12/04 的数据一起接入。现在如果你想查询标签之间的增量变更，而你并不知道 12/03 的标签尚未创建，于是你会分别使用 `incremental-between` 指定 '2024-12-01,2024-12-02'、'2024-12-02,2024-12-03' 和 '2024-12-03,2024-12-04'，那么你会收到一个错误，提示标签 '2024-12-03' 不存在。
+
+为此场景，我们引入了一个新的配置项 `incremental-to-auto-tag`。你只需指定结束标签，Paimon 就会找到一个更早的标签并返回它们之间的变更。如果该标签不存在，或者更早的标签不存在，则返回空。
+
+例如，当你查询 'incremental-to-auto-tag=2024-12-01' 或 'incremental-to-auto-tag=2024-12-03' 时，结果为空；查询 'incremental-to-auto-tag=2024-12-02'，结果是 12/01 与 12/02 之间的变更；查询 'incremental-to-auto-tag=2024-12-04'，结果是 12/02 与 12/04 之间的变更。
+
+## 流式查询 {#streaming-query}
+
+默认情况下，流式读取在首次启动时会产生表的最新快照，并继续读取最新的变更。
+
+Paimon 默认会确保你的启动得到正确处理，包含所有数据。
+
+:::warning
+
+流模式下的 Paimon Source 是无界的，就像一个永不结束的队列。
+
+:::
+
+```sql
+-- Flink SQL
+SET 'execution.runtime-mode' = 'streaming';
+```
+
+你也可以在不包含快照数据的情况下进行流式读取，可以使用 `latest` 扫描模式：
+```sql
+-- Continuously reads latest changes without producing a snapshot at the beginning.
+SELECT * FROM t /*+ OPTIONS('scan.mode' = 'latest') */;
+```
+
+### 流式时间旅行 {#streaming-time-travel}
+
+如果你只想处理今天及以后的数据，可以通过分区过滤器实现：
+
+```sql
+SELECT * FROM t WHERE dt > '2023-06-26';
+```
+
+如果不是分区表，或者你无法按分区过滤，可以使用时间旅行的流式读取。
+
+<Tabs groupId="streaming-time-travel">
+
+<TabItem value="flink-dynamic-option" label="Flink（动态参数）">
+
+```sql
+-- read changes from snapshot id 1L 
+SELECT * FROM t /*+ OPTIONS('scan.snapshot-id' = '1') */;
+
+-- read changes from snapshot specified timestamp
+SELECT * FROM t /*+ OPTIONS('scan.timestamp-millis' = '1678883047356') */;
+
+-- read snapshot id 1L upon first startup, and continue to read the changes
+SELECT * FROM t /*+ OPTIONS('scan.mode'='from-snapshot-full','scan.snapshot-id' = '1') */;
+```
+
+</TabItem>
+
+<TabItem value="flink-1-18" label="Flink 1.18+">
+
+Flink SQL 在 1.18 之后支持时间旅行语法。
+```sql
+-- read the snapshot from specified timestamp
+SELECT * FROM t FOR SYSTEM_TIME AS OF TIMESTAMP '2023-01-01 00:00:00';
+
+-- you can also use some simple expressions (see flink document to get supported functions)
+SELECT * FROM t FOR SYSTEM_TIME AS OF TIMESTAMP '2023-01-01 00:00:00' + INTERVAL '1' DAY
+```
+
+</TabItem>
+
+</Tabs>
+
+时间旅行的流式读取依赖于快照，但默认情况下，快照仅保留 1 小时内的数据，这会导致你无法读取更早的增量数据。因此，Paimon 还为流式读取提供了另一种模式 `scan.file-creation-time-millis`，它会进行粗粒度的过滤，保留在 `timeMillis` 之后生成的文件。
+
+```sql
+SELECT * FROM t /*+ OPTIONS('scan.file-creation-time-millis' = '1678883047356') */;
+```
+
+### 读取 Overwrite {#read-overwrite}
+
+默认情况下，流式读取会忽略由 `INSERT OVERWRITE` 产生的提交。如果你想读取 `OVERWRITE` 的提交，可以配置 `streaming-read-overwrite`。
+
+## 读取并行度 {#read-parallelism}
+
+默认情况下，批式读取的并行度与 split 的数量相同，而流式读取的并行度与桶的数量相同，但不超过 `scan.infer-parallelism.max`。
+
+禁用 `scan.infer-parallelism` 后，读取将使用全局并行度。
+
+你也可以通过 `scan.parallelism` 手动指定并行度。
+
+<table className="configuration table table-bordered">
+    <thead>
+        <tr>
+            <th className="text-left" style={{width: "20%"}}>Key</th>
+            <th className="text-left" style={{width: "15%"}}>默认值</th>
+            <th className="text-left" style={{width: "10%"}}>类型</th>
+            <th className="text-left" style={{width: "55%"}}>描述</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><h5>scan.infer-parallelism</h5></td>
+            <td style={{wordWrap: "break-word"}}>true</td>
+            <td>Boolean</td>
+            <td>如果为 false，则 Source 的并行度由全局并行度设置。否则，Source 并行度从 split 数量（批模式）或桶数量（流模式）推断得出。</td>
+        </tr>
+         <tr>
+            <td><h5>scan.infer-parallelism.max</h5></td>
+            <td style={{wordWrap: "break-word"}}>1024</td>
+            <td>Integer</td>
+            <td>如果 scan.infer-parallelism 为 true，则通过此配置项限制 Source 的并行度。</td>
+        </tr>
+        <tr>
+            <td><h5>scan.parallelism</h5></td>
+            <td style={{wordWrap: "break-word"}}>(none)</td>
+            <td>Integer</td>
+            <td>为扫描 Source 定义自定义并行度。默认情况下，如果未定义此配置项，规划器（planner）会综合考虑全局配置，为每条语句单独推导并行度。如果用户启用了 scan.infer-parallelism，规划器将根据推断出的并行度来推导并行度。</td>
+        </tr>
+    </tbody>
+</table>
+
+## 查询优化 {#query-optimization}
+
+<Label>Batch</Label><Label>Streaming</Label>
+
+强烈建议在查询时同时指定分区和主键过滤器，这将加速查询的数据跳过（data skipping）。
+
+能够加速数据跳过的过滤函数有：
+- `=`
+- `<`
+- `<=`
+- `>`
+- `>=`
+- `IN (...)`
+- `LIKE 'abc%'`
+- `IS NULL`
+
+Paimon 会按主键对数据进行排序，从而加速点查询和范围查询。当使用复合主键时，最好让查询过滤器构成主键的[最左前缀](https://dev.mysql.com/doc/refman/5.7/en/multiple-column-indexes.html)，以获得良好的加速效果。
+
+假设有一张表，其定义如下：
+
+```sql
+CREATE TABLE orders (
+    catalog_id BIGINT,
+    order_id BIGINT,
+    .....,
+    PRIMARY KEY (catalog_id, order_id) NOT ENFORCED -- composite primary key
+);
+```
+
+通过为主键的最左前缀指定范围过滤器，查询可以获得良好的加速效果。
+
+```sql
+SELECT * FROM orders WHERE catalog_id=1025;
+
+SELECT * FROM orders WHERE catalog_id=1025 AND order_id=29495;
+
+SELECT * FROM orders
+  WHERE catalog_id=1025
+  AND order_id>2035 AND order_id<6000;
+```
+
+然而，以下过滤器无法很好地加速查询。
+
+```sql
+SELECT * FROM orders WHERE order_id=29495;
+
+SELECT * FROM orders WHERE catalog_id=1025 OR order_id=29495;
+```
+
+## 独立的 Split 生成 {#dedicated-split-generation}
+
+当 Paimon 表的快照包含大量 Source split 时，从该表读取的 Flink 作业可能会经历漫长的初始化时间，甚至在 JobManager 中发生 OOM。在这种情况下，你可以配置 `'scan.dedicated-split-generation' = 'true'` 来避免此类问题。该配置项会让 Source split 生成过程在运行于 TaskManager 上的一个独立子任务中执行，而不是在 JobManager 上的 Source 协调器中执行。
+
+请注意，此特性可能会对你的 Flink 作业产生一些副作用。例如：
+
+1. 它会改变 Flink 作业的 DAG，因此如果在已有作业上启用，会破坏 checkpoint 的兼容性。
+2. 它可能导致 Flink AdaptiveBatchScheduler 为 Source reader 算子推断出较小的并行度。你可以配置 `scan.infer-parallelism` 来避免这一可能的缺点。
+3. Flink 作业的故障恢复策略会被强制为全局故障恢复（global failover），而不是局部故障恢复（regional failover），因为独立的 Source split 生成任务会连接到所有下游子任务。
+
+因此，在启用此特性之前，请确保你能接受这些副作用。

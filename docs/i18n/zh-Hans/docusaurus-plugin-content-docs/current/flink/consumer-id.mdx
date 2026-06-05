@@ -1,0 +1,155 @@
+---
+title: "Consumer ID"
+sidebar_position: 5
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# Consumer ID
+
+consumer id 可以帮助你完成以下两件事：
+
+1. 安全消费：在判断某个快照是否已过期时，Paimon 会查看文件系统中该表的所有消费者，如果仍有消费者依赖该快照，那么该快照不会被过期删除。
+2. 断点续传：当先前的作业停止后，新启动的作业可以从先前的进度继续消费，而无需从状态恢复。
+
+## 用法 {#usage}
+
+你可以在流式读取表时指定 `consumer-id`。
+
+消费者会阻止快照过期。为了避免因误操作而产生过多快照，你需要指定 `'consumer.expiration-time'` 来管理消费者的生命周期。
+
+```sql
+ALTER TABLE t SET ('consumer.expiration-time' = '1 d');
+```
+
+然后，重启该表的流式写入作业，消费者的过期会在写入作业中被触发。
+
+```sql
+SELECT * FROM t /*+ OPTIONS('consumer-id' = 'myid', 'consumer.mode' = 'at-least-once') */;
+```
+
+## 忽略进度 {#ignore-progress}
+
+有时，你只想要「安全消费」这一特性。如果你希望在重启流式消费作业时获取一个新的快照进度，可以启用 `'consumer.ignore-progress'` 配置项。
+
+```sql
+SELECT * FROM t /*+ OPTIONS('consumer-id' = 'myid', 'consumer.ignore-progress' = 'true') */;
+```
+
+该作业启动时将重新获取应当读取的快照。
+
+## 消费者模式 {#consumer-mode}
+
+默认情况下，快照的消费会在 checkpoint 内严格对齐，从而使「断点续传」特性达到精确一次（exactly-once）。
+
+但在某些场景下，如果你不需要「断点续传」，或者不需要严格的「断点续传」，可以考虑启用 `'consumer.mode' = 'at-least-once'` 模式。该模式：
+1. 允许读取器以不同的速率消费快照，并将所有读取器中最慢的 snapshot-id 记录到消费者中。它不影响 checkpoint 时间，且具有良好的性能。
+2. 该模式可以提供更多能力，例如 Watermark 对齐。
+
+:::info
+
+关于 `'consumer.mode'`，由于 `exactly-once` 模式和 `at-least-once` 模式的实现完全不同，Flink 的状态彼此不兼容，在切换模式时无法从状态恢复。
+
+:::
+
+## 重置消费者 {#reset-consumer}
+
+你可以使用给定的 consumer ID 和下一个 snapshot ID 来重置消费者，或使用给定的 consumer ID 删除消费者。首先，你需要停止使用该 consumer ID 的流式任务，然后执行重置消费者的 Action 作业。
+
+运行以下命令：
+
+<Tabs groupId="reset-consumer">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+```sql
+CALL sys.reset_consumer(
+   `table` => 'database_name.table_name', 
+   consumer_id => 'consumer_id', 
+   next_snapshot_id => <snapshot_id>
+);
+-- No next_snapshot_id if you want to delete the consumer
+```
+
+</TabItem>
+
+<TabItem value="flink-action" label="Flink Action">
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    reset-consumer \
+    --warehouse <warehouse-path> \
+    --database <database-name> \
+    --table <table-name> \
+    --consumer_id <consumer-id> \
+    [--next_snapshot <next-snapshot-id>] \
+    [--catalog_conf <paimon-catalog-conf> [--catalog_conf <paimon-catalog-conf> ...]]
+
+## No next_snapshot if you want to delete the consumer
+```
+
+</TabItem>
+
+</Tabs>
+
+## 清理消费者 {#clear-consumers}
+
+你可以通过给定的包含消费者和排除消费者（支持正则表达式）来批量清理消费者。
+
+运行以下命令：
+
+<Tabs groupId="clear-consumers">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+```sql
+CALL sys.clear_consumers(
+   `table` => 'database_name.table_name', 
+   `including_consumers` => 'including_consumers', 
+   `excluding_consumers` => 'excluding_consumers'
+);
+-- No including_consumers if you want to clear all consumers except excluding_consumers in the table
+```
+
+</TabItem>
+
+<TabItem value="flink-action" label="Flink Action">
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    clear_consumers \
+    --warehouse <warehouse-path> \
+    --database <database-name> \
+    --table <table-name> \
+    [--including_consumers <including-consumers>] \
+    [--excluding_consumers <excluding-consumers>] \
+    [--catalog_conf <paimon-catalog-conf> [--catalog_conf <paimon-catalog-conf> ...]]
+    
+## No including_consumers if you want to clear all consumers except excluding_consumers in the table
+```
+
+</TabItem>
+
+</Tabs>

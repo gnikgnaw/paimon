@@ -1,2415 +1,712 @@
 # Apache Paimon Schema 演进机制深度分析
 
-> **基于源码版本**: Apache Paimon 1.5-SNAPSHOT (commit: 55f4fd175)
-> **分析日期**: 2026-04-21
-> **分析范围**: paimon-api、paimon-core、paimon-common、paimon-flink、paimon-spark 模块中 Schema 演进相关的全部核心代码
+> **版本**：1.5-SNAPSHOT　**源码模块**：`paimon-api`（`Schema`/`TableSchema`/`SchemaChange`/`DataTypeCasts`）+ `paimon-core`（`SchemaManager` 及演进/合并/验证工具）+ 引擎适配（`paimon-flink`/`paimon-spark`）　**核对日期**：2026-06
+
+**一句话定位**：Schema 演进让 Paimon 表能在**不重写历史数据**的前提下增删改列、变更类型——靠"文件即元数据 + 乐观锁版本文件"管理 schema 版本，靠"字段 ID 映射 + 读时类型转换"让旧数据文件按新 schema 正确读出。
+
+读完本文你应能回答：① 一条 `ALTER TABLE ... ADD COLUMN` 从引擎到落盘 `schema-N` 文件经历了什么，并发时怎么保证只有一个赢；② 为什么用字段 ID 而非列名关联新旧 schema，`highestFieldId` 为什么必须独立存储；③ 12 种 `SchemaChange` 各自能改什么、被什么约束挡住（分区键/主键/类型/可空性/不可变选项）；④ 旧数据文件按新 schema 读时，`SchemaEvolutionUtil` 如何构建索引映射 + 类型转换，恒等映射优化省了什么；⑤ 类型变更要同时过 `DataTypeCasts.supportsCast` 与 `CastExecutors.resolve` 两关，缺一会怎样；⑥ CDC 自动演进（`SchemaMergingUtils.mergeSchemas`）和手动 ALTER 走的是不是同一条路，为什么新字段强制 nullable；⑦ Schema Rollback 删版本文件为什么要从大 ID 往小删；⑧ 哪些变更只改元数据（秒级），哪些会留下"读时开销"或"占着旧空间"的长尾代价。
+
+> 阅读约定：本文每个机制按"① 要解决什么问题 → ② 设计原理与取舍 → ③ 关键源码（精选片段 + `路径:行号`）→ ④ 风险/陷阱/边界 → ⑤ 收益与代价"组织。源码行号以本次核对（1.5-SNAPSHOT）为准；与旧稿不符处用 `（已修正）` 标注。数据类型系统本身详见 **19-数据类型系统**；CDC 场景的 schema 自动同步应用详见 **14-局部列更新与CDC数据集成**，本文只讲演进引擎本身。
 
 ---
 
 ## 目录
 
-- [1. 概述与设计哲学](#1-概述与设计哲学)
-- [2. 核心数据模型](#2-核心数据模型)
-  - [2.1 Schema 与 TableSchema 的区别](#21-schema-与-tableschema-的区别)
-  - [2.2 TableSchema 字段详解](#22-tableschema-字段详解)
+- [1. 快速理解（核心问题 / 概念 / 陷阱）](#1-快速理解核心问题--概念--陷阱)
+  - [1.1 核心问题：怎样改表结构而不重写 PB 级历史数据](#11-核心问题怎样改表结构而不重写-pb-级历史数据)
+  - [1.2 核心概念速查表](#12-核心概念速查表)
+  - [1.3 高频生产陷阱](#13-高频生产陷阱)
+- [2. 数据模型：Schema / TableSchema / 字段 ID](#2-数据模型schema--tableschema--字段-id)
+  - [2.1 Schema 与 TableSchema 的分层](#21-schema-与-tableschema-的分层)
+  - [2.2 字段 ID 与 highestFieldId 不变式](#22-字段-id-与-highestfieldid-不变式)
   - [2.3 Schema 文件存储结构](#23-schema-文件存储结构)
-- [3. SchemaChange 的 12 种变更类型](#3-schemachange-的-12-种变更类型)
-  - [3.1 表级别变更](#31-表级别变更)
-  - [3.2 列级别变更](#32-列级别变更)
-  - [3.3 约束级别变更](#33-约束级别变更)
-  - [3.4 Move 位置指定机制](#34-move-位置指定机制)
-  - [3.5 JSON 多态序列化](#35-json-多态序列化)
-- [4. SchemaManager 乐观锁并发控制](#4-schemamanager-乐观锁并发控制)
-  - [4.1 乐观锁实现原理](#41-乐观锁实现原理)
-  - [4.2 createTable 的乐观锁循环](#42-createtable-的乐观锁循环)
-  - [4.3 commitChanges 的乐观锁循环](#43-commitchanges-的乐观锁循环)
-  - [4.4 tryToWriteAtomic 原子写入](#44-trytowriteatomic-原子写入)
-  - [4.5 CatalogLock 双重保护](#45-cataloglock-双重保护)
-- [5. generateTableSchema 核心流程](#5-generatetableschema-核心流程)
-  - [5.1 整体流程概览](#51-整体流程概览)
-  - [5.2 AddColumn 处理流程](#52-addcolumn-处理流程)
-  - [5.3 RenameColumn 处理流程](#53-renamecolumn-处理流程)
-  - [5.4 DropColumn 处理流程](#54-dropcolumn-处理流程)
-  - [5.5 UpdateColumnType 处理流程](#55-updatecolumntype-处理流程)
-  - [5.6 嵌套列修改机制 (NestedColumnModifier)](#56-嵌套列修改机制-nestedcolumnmodifier)
-  - [5.7 选项重命名级联更新](#57-选项重命名级联更新)
+- [3. SchemaChange：12 种变更类型](#3-schemachange12-种变更类型)
+  - [3.1 三类变更与完整清单](#31-三类变更与完整清单)
+  - [3.2 Move 位置指定与 JSON 多态](#32-move-位置指定与-json-多态)
+- [4. SchemaManager：乐观锁并发控制](#4-schemamanager乐观锁并发控制)
+- [5. generateTableSchema：变更如何被应用](#5-generatetableschema变更如何被应用)
+  - [5.1 整体流程与原子性](#51-整体流程与原子性)
+  - [5.2 AddColumn / RenameColumn / DropColumn / UpdateColumnType](#52-addcolumn--renamecolumn--dropcolumn--updatecolumntype)
+  - [5.3 嵌套列修改机制 NestedColumnModifier](#53-嵌套列修改机制-nestedcolumnmodifier)
+  - [5.4 选项重命名级联更新](#54-选项重命名级联更新)
 - [6. 列操作约束体系](#6-列操作约束体系)
-  - [6.1 分区键约束](#61-分区键约束)
-  - [6.2 主键约束](#62-主键约束)
-  - [6.3 类型转换约束](#63-类型转换约束)
-  - [6.4 可空性约束](#64-可空性约束)
-  - [6.5 不可变选项约束](#65-不可变选项约束)
-  - [6.6 删除向量约束](#66-删除向量约束)
-  - [6.7 Bucket 约束](#67-bucket-约束)
-  - [6.8 完整约束汇总表](#68-完整约束汇总表)
-- [7. SchemaValidation 全面验证](#7-schemavalidation-全面验证)
-  - [7.1 建表时验证](#71-建表时验证)
-  - [7.2 变更时验证](#72-变更时验证)
-  - [7.3 Fallback Branch 验证](#73-fallback-branch-验证)
-- [8. Schema Evolution 在读路径的影响](#8-schema-evolution-在读路径的影响)
+  - [6.1 分区键 / 主键约束](#61-分区键--主键约束)
+  - [6.2 类型转换与可空性约束](#62-类型转换与可空性约束)
+  - [6.3 不可变选项与 bucket / DV 约束](#63-不可变选项与-bucket--dv-约束)
+  - [6.4 完整约束汇总表](#64-完整约束汇总表)
+- [7. SchemaValidation：提交前的全面验证](#7-schemavalidation提交前的全面验证)
+- [8. 读路径上的 Schema Evolution](#8-读路径上的-schema-evolution)
   - [8.1 基于字段 ID 的索引映射](#81-基于字段-id-的索引映射)
-  - [8.2 IndexCastMapping 机制](#82-indexcastmapping-机制)
-  - [8.3 谓词下推的 Schema 适配](#83-谓词下推的-schema-适配)
-  - [8.4 嵌套类型的 Cast 链](#84-嵌套类型的-cast-链)
-  - [8.5 DataFileMeta 中的 schemaId](#85-datafilemeta-中的-schemaid)
-  - [8.6 Snapshot 与 Schema 的关系](#86-snapshot-与-schema-的关系)
-- [9. CDC 自动 Schema 演进 (SchemaMergingUtils)](#9-cdc-自动-schema-演进-schemamergingutils)
-  - [9.1 mergeSchema 整体流程](#91-mergeschema-整体流程)
-  - [9.2 递归类型合并算法](#92-递归类型合并算法)
-  - [9.3 新字段 ID 分配](#93-新字段-id-分配)
-  - [9.4 diffSchemaChanges 差异检测](#94-diffschemachanges-差异检测)
-  - [9.5 SchemaModification 委托机制](#95-schemamodification-委托机制)
-- [10. 嵌套列演进 (NestedSchemaUtils)](#10-嵌套列演进-nestedschemautils)
-  - [10.1 ROW 类型嵌套演进](#101-row-类型嵌套演进)
-  - [10.2 ARRAY/MAP/MULTISET 类型演进](#102-arraymapultiset-类型演进)
+  - [8.2 IndexCastMapping 与类型转换链](#82-indexcastmapping-与类型转换链)
+  - [8.3 谓词退化与嵌套 Cast 链](#83-谓词退化与嵌套-cast-链)
+  - [8.4 schemaId：数据文件与快照的锚点](#84-schemaid数据文件与快照的锚点)
+- [9. CDC 自动 Schema 演进（SchemaMergingUtils）](#9-cdc-自动-schema-演进schemamergingutils)
+- [10. 嵌套列演进（NestedSchemaUtils）](#10-嵌套列演进nestedschemautils)
 - [11. Schema Rollback 机制](#11-schema-rollback-机制)
-  - [11.1 rollbackTo 实现原理](#111-rollbackto-实现原理)
-  - [11.2 安全检查机制](#112-安全检查机制)
-- [12. Flink ALTER TABLE 实现](#12-flink-alter-table-实现)
-  - [12.1 FlinkCatalog.alterTable 两种重载](#121-flinkcatalogaltertable-两种重载)
-  - [12.2 toSchemaChange 转换逻辑](#122-toschemachange-转换逻辑)
-  - [12.3 非物理列处理](#123-非物理列处理)
-- [13. Spark ALTER TABLE 实现](#13-spark-alter-table-实现)
-  - [13.1 SparkCatalog.alterTable](#131-sparkcatalogaltertable)
-  - [13.2 toSchemaChange 转换逻辑](#132-toschemachange-转换逻辑)
-  - [13.3 Flink 与 Spark 实现差异对比](#133-flink-与-spark-实现差异对比)
-- [14. 类型转换规则体系 (DataTypeCasts)](#14-类型转换规则体系-datatypecasts)
-  - [14.1 三级转换规则](#141-三级转换规则)
-  - [14.2 具体类型转换矩阵](#142-具体类型转换矩阵)
-- [15. 与 Iceberg Schema Evolution 对比](#15-与-iceberg-schema-evolution-对比)
-  - [15.1 架构对比](#151-架构对比)
-  - [15.2 字段标识策略](#152-字段标识策略)
-  - [15.3 并发控制对比](#153-并发控制对比)
-  - [15.4 类型演进能力对比](#154-类型演进能力对比)
-  - [15.5 优劣势总结](#155-优劣势总结)
-- [16. 设计决策分析](#16-设计决策分析)
-- [17. 整体架构图](#17-整体架构图)
+- [12. 引擎适配：Flink / Spark ALTER TABLE](#12-引擎适配flink--spark-alter-table)
+- [13. 类型转换规则体系（DataTypeCasts）](#13-类型转换规则体系datatypecasts)
+- [14. 与 Iceberg Schema Evolution 对比](#14-与-iceberg-schema-evolution-对比)
+- [15. 设计决策总结](#15-设计决策总结)
+- [16. 架构与读路径全景图](#16-架构与读路径全景图)
+- [附录：源码索引 / 配置项 / 变更类型速查](#附录源码索引--配置项--变更类型速查)
 
 ---
 
-## 1. 概述与设计哲学
+## 1. 快速理解（核心问题 / 概念 / 陷阱）
 
-### 解决什么问题
+### 1.1 核心问题：怎样改表结构而不重写 PB 级历史数据
 
-**核心业务问题**：
-1. **上游数据源变更频繁**：CDC 同步场景下，MySQL 表结构每天可能变更多次（新增字段、修改类型）
-2. **多租户场景字段爆炸**：SaaS 平台每个租户可能有自定义字段，导致表结构持续膨胀
-3. **数据类型优化需求**：业务初期用 INT 存储金额，后期需要改为 DECIMAL 保证精度
-4. **分布式环境并发修改**：多个 Flink 作业同时尝试修改同一张表的 Schema
+**① 要解决什么问题**
 
-**没有这个设计的后果**：
-- 每次表结构变更都需要重写全部历史数据（成本高、耗时长）
-- 依赖外部 Metastore（如 Hive）做 Schema 管理，引入单点故障和运维复杂度
-- 并发修改导致 Schema 不一致，读取数据时出现列错位或类型不匹配
-- 旧数据文件无法被新 Schema 正确读取，导致数据丢失
+数据湖里表结构是高频变化对象：CDC 上游 MySQL 一天可能 DDL 多次、SaaS 多租户字段持续膨胀、业务初期 INT 存金额后期要改 DECIMAL。难点在于约束彼此冲突：
 
-**实际场景**：
-```sql
--- 场景1: 电商订单表新增优惠券字段
-ALTER TABLE orders ADD COLUMN coupon_code STRING;
--- 旧订单数据（100TB）不需要重写，读取时自动填充 null
+- 历史数据可能是 PB 级，**任何变更都不能要求重写全量旧文件**；
+- Paimon 定位"无服务器依赖的 Lake Format"，**不能把 schema 托管给外部 Metastore**（否则引入单点和运维成本）；
+- 多个 Flink/Spark 作业可能**并发改同一张表**，对象存储上又没有可靠的分布式锁原语。
 
--- 场景2: 用户年龄字段从 INT 改为 BIGINT
-ALTER TABLE users MODIFY COLUMN age BIGINT;
--- 历史数据文件中的 INT 值在读取时自动转换为 BIGINT
+**② 设计原理与取舍**
 
--- 场景3: CDC 同步时 MySQL 表新增字段
--- Paimon 自动检测差异并更新 Schema，无需人工干预
-```
+Paimon 的答案分两层，各自解一个问题：
 
-### 有什么坑
+| 子问题 | 方案 | 取舍 |
+|--------|------|------|
+| 元数据怎么存、并发怎么控 | **文件即元数据**：每个版本一个 `schema/schema-{id}` JSON 文件；`tryToWriteAtomic`（写临时文件 + rename）做乐观锁 CAS | 放弃数据库的强一致与高并发，换零外部依赖、天然适配对象存储；schema 变更低频（通常 < 10 次/天），冲突概率极低，可接受 |
+| 旧数据怎么按新 schema 读 | **字段 ID + 读时演进**：列靠全局唯一、永不复用的字段 ID 关联；旧文件不重写，读时按 ID 构建索引映射 + 类型转换链 | 列重命名/重排零成本（只改名不改 ID）；代价是读路径多一层映射/转换，但恒等映射时退化为零开销 |
 
-**误区陷阱**：
-1. **误以为重命名列会重写数据**：实际上只改元数据，数据文件不动（基于字段 ID 关联）
-2. **误以为可以随意修改主键类型**：主键类型变更会破坏 LSM 树的排序逻辑，因此被禁止
-3. **误以为新增列可以是 NOT NULL**：旧数据文件中没有该列，只能填充 null，因此必须 nullable
-4. **误以为删除列会立即释放存储空间**：旧数据文件仍包含该列，只有 compaction 后才会真正删除
+一句话设计哲学：**用"版本化的小 JSON 文件 + 字段 ID 稳定锚点"，把"改 schema"和"重写数据"彻底解耦——前者秒级、后者永不强制。**
 
-**错误配置**：
-```java
-// 错误1: 尝试将 nullable 列改为 NOT NULL（默认禁止）
-ALTER TABLE t MODIFY COLUMN name STRING NOT NULL;
-// 报错: Cannot update column type from nullable to non nullable
-// 解决: 设置 'alter-column-null-to-not-null.disabled' = 'false'（需确保旧数据无 null）
+**与同类格式横向对比**（理解 Paimon 定位的关键）：
 
-// 错误2: 在有数据的表上删除主键
-ALTER TABLE t DROP PRIMARY KEY;
-// 报错: Cannot drop primary key when the table contains snapshots
-// 解决: 只能在空表上删除主键
-
-// 错误3: 修改分区键名称
-ALTER TABLE t RENAME COLUMN dt TO date;
-// 报错: Cannot rename partition key column
-// 原因: 分区路径依赖列名（如 dt=2024-01-01）
-```
-
-**生产环境注意事项**：
-1. **并发修改重试风暴**：高并发场景下乐观锁重试可能导致性能下降，建议配置 CatalogLock
-2. **Schema 文件堆积**：频繁变更会产生大量 schema-{id} 文件，需定期清理（通过 Schema Rollback）
-3. **类型转换性能开销**：INT -> BIGINT 转换在读路径上有 CPU 开销，大规模查询时需注意
-4. **对象存储的 rename 语义**：S3 的 rename 实际是 copy+delete，原子性保证较弱，建议使用支持原子 rename 的文件系统
-
-**性能陷阱**：
-```java
-// 陷阱1: 频繁修改 Schema 导致读取时索引映射开销
-// 每个数据文件都需要构建 IndexCastMapping，文件数多时影响查询性能
-// 建议: 批量变更，避免每次只改一个字段
-
-// 陷阱2: 嵌套类型的深度类型转换
-// ROW<ARRAY<MAP<STRING, INT>>> 中修改 INT -> BIGINT
-// 需要递归构建 Cast 链，性能开销大
-// 建议: 避免在深层嵌套类型上频繁修改类型
-```
-
-### 核心概念解释
-
-**术语定义**：
-1. **Schema vs TableSchema**：
-   - Schema：用户接口层，只包含字段、分区键、主键、选项
-   - TableSchema：存储层，额外包含 schemaId、highestFieldId、version、timeMillis
-   
-2. **字段 ID (Field ID)**：
-   - 全局唯一的整数标识符，创建列时分配，永不改变
-   - 即使列被重命名或删除，ID 也不会复用
-   - 读取数据时通过 ID 而非列名匹配字段
-
-3. **highestFieldId**：
-   - 历史上分配过的最大字段 ID
-   - 删除列后仍保持不变，确保新列 ID 不与已删除列冲突
-   - 复合类型（ROW、ARRAY）的子字段也占用 ID
-
-4. **读时演进 (Schema-on-Read)**：
-   - 旧数据文件不重写，在读取时动态适配当前 Schema
-   - 通过 IndexCastMapping 实现字段位置映射和类型转换
-   - 新增列返回 null，删除列被忽略，类型变更自动转换
-
-5. **乐观锁 (Optimistic Locking)**：
-   - 基于文件系统 rename 的原子性实现并发控制
-   - 新 Schema 文件名为 schema-{id}，id = 旧 id + 1
-   - 如果文件已存在（并发冲突），rename 失败，重新读取最新 Schema 重试
-
-**概念关系**：
-```
-TableSchema (id=5)
-  ├── fields: [DataField(id=1, name=a), DataField(id=3, name=c), DataField(id=5, name=d)]
-  ├── highestFieldId: 5  (字段 b 的 id=2 已被删除，但 highestFieldId 保留)
-  └── schemaId: 5
-
-DataFileMeta (写入时 schemaId=3)
-  └── 包含字段: [id=1 (a), id=2 (b), id=3 (c)]
-
-读取时映射:
-  当前 Schema 字段 [1->a, 3->c, 5->d]
-  数据文件字段 [1->a, 2->b, 3->c]
-  索引映射: [0, 2, -1]  (a从位置0读取, c从位置2读取, d不存在返回null)
-```
-
-**与其他系统对比**：
-| 特性 | Paimon | Iceberg | Hudi | Delta Lake |
+| 维度 | Paimon | Iceberg | Hudi | Delta Lake |
 |------|--------|---------|------|-----------|
-| 字段标识 | 字段 ID | 字段 ID | 字段名 | 字段名 |
-| 并发控制 | 文件 rename 乐观锁 | metadata.json 乐观锁 | Timeline 乐观锁 | Delta Log 乐观锁 |
-| Schema 存储 | 独立 JSON 文件 | 嵌入 metadata.json | 嵌入 commit 文件 | 嵌入 _delta_log |
-| 分区键演进 | 不支持 | 支持 | 不支持 | 不支持 |
-| CDC 自动演进 | 内置 | 需外部工具 | 内置 | 需外部工具 |
+| 列标识 | 字段 ID | 字段 ID | 字段名 | 字段名 |
+| Schema 存储 | 独立 `schema-{id}` 文件 | 嵌入 `metadata.json` | 嵌入 commit 文件 | 嵌入 `_delta_log` |
+| 并发控制 | 文件 rename 乐观锁（+ 可选 CatalogLock） | `metadata.json` 乐观锁 | Timeline 乐观锁 | Delta Log 乐观锁 |
+| 列重命名免重写 | 是（基于 ID） | 是（基于 ID） | 否（基于名） | 否（基于名） |
+| 显式收窄类型转换 | 支持（需配置开启） | 不支持（仅安全宽化） | 有限 | 支持 |
+| CDC 自动演进 | 内置 `SchemaMergingUtils` | 需外部工具 | 内置（Avro 规则） | 需外部工具 |
+| 分区键演进 | 不支持 | 支持（分区演进） | 不支持 | 不支持 |
 
-### 设计理念
+Paimon 的差异点：Iceberg 把全部元数据塞进一个 `metadata.json`，任何修改都竞争同一文件；Paimon 每个 schema 版本独立成文件，只有同一个 `id` 的两次并发写才冲突，冲突面更小。但 Iceberg 有分区演进，Paimon 没有。
 
-**为什么这样设计**：
+**一次 ALTER TABLE 的全生命周期（串起全文各章）**：以 `ADD COLUMN coupon STRING` 为例——
 
-1. **为什么选择文件即元数据？**
-   - **权衡**：放弃了 Metastore 的强一致性，换取了零外部依赖
-   - **好处**：部署简单、无单点故障、天然支持对象存储
-   - **代价**：并发性能不如数据库方案（但 Schema 变更频率低，可接受）
-
-2. **为什么选择字段 ID 而非字段名？**
-   - **权衡**：增加了元数据复杂度（需维护 highestFieldId），但支持了列重命名
-   - **好处**：列重命名不需要重写数据，旧数据文件仍能正确读取
-   - **业界共识**：Iceberg、Hudi 3.0 都采用了字段 ID 方案
-
-3. **为什么选择读时演进而非写时演进？**
-   - **权衡**：读取性能略有下降（需索引映射和类型转换），但写入无需等待数据重写
-   - **好处**：Schema 变更秒级完成，不阻塞写入，适合实时场景
-   - **适用场景**：数据湖的读多写少特性，读时开销可通过缓存和向量化优化
-
-4. **为什么选择乐观锁而非悲观锁？**
-   - **权衡**：高并发时可能重试多次，但避免了锁服务的复杂性
-   - **好处**：无需 ZooKeeper 等外部锁服务，降低运维成本
-   - **冲突概率分析**：Schema 变更通常每天几次，冲突概率 < 1%
-
-**架构演进**：
 ```
-v0.7 (早期版本)
-  └── Schema 格式版本 1，不支持嵌套列演进
-
-v0.8 (增强版本)
-  └── Schema 格式版本 2，支持 ROW 类型嵌套演进
-
-v1.5 (当前版本)
-  └── Schema 格式版本 3
-      ├── 支持 ARRAY/MAP/MULTISET 嵌套演进
-      ├── 支持 Schema Rollback
-      ├── 支持 CDC 自动演进
-      └── 支持删除向量 (Deletion Vectors)
+1. 引擎层转换    Flink TableChange / Spark TableChange → Paimon SchemaChange（§12）
+2. Catalog 调度  AbstractCatalog.alterTable → FileSystemCatalog.alterTableImpl
+                 可选 CatalogLock 包一层悲观锁减少无效重试（§4）
+3. 乐观锁循环    SchemaManager.commitChanges（:252）while(true)：读 latest → 应用变更 → 提交（§4）
+4. 应用变更      generateTableSchema（:282）在 fields 副本上逐个 apply，校验约束，
+                 AddColumn 强制 nullable、分配 highestFieldId+1（§5/§6）
+5. 提交校验      commit（:1083）→ validateTableSchema + validateFallbackBranch（§7）
+                 → tryToWriteAtomic 写 schema-{old.id+1}；文件已存在则 false→重试（§4）
+6. 后续读取      旧文件不含 coupon：SchemaEvolutionUtil 按字段 ID 映射，coupon 列返回 null（§8）
+                 新文件写入时才真正带 coupon 列；旧文件直到 compaction 才物理对齐
 ```
 
-**业界对比**：
-- **Iceberg 的优势**：分区演进能力强，支持修改分区策略无需重写数据
-- **Paimon 的优势**：CDC 自动演进内置，Schema 独立文件并发性更好，类型转换规则更灵活（支持显式转换）
-- **设计哲学差异**：Iceberg 追求元数据的强一致性（单个 metadata.json），Paimon 追求去中心化（独立 Schema 文件）
+这条链贯穿全文：改得快（秒级写 JSON）、读得对（ID 映射 + 类型转换）、并发安全（rename CAS）、长尾代价可控（读时映射 + 旧文件惰性对齐）。
+
+### 1.2 核心概念速查表
+
+| 概念 | 一句话定义 | 关键源码 |
+|------|-----------|---------|
+| **Schema** | 用户接口层表结构：字段 + 分区键 + 主键 + 选项，不含版本信息 | `Schema.java`（paimon-api） |
+| **TableSchema** | 存储层完整表结构：额外含 `id`/`highestFieldId`/`version`/`timeMillis`，可序列化为 JSON | `TableSchema.java:50`（版本常量） |
+| **字段 ID** | 全局唯一、创建时分配、永不复用的列标识；读取按 ID 而非名匹配 | `DataField.id()` |
+| **highestFieldId** | 历史分配过的最大字段 ID，删列后不回退，保证新列 ID 不撞已删列 | `TableSchema.java:62` |
+| **SchemaChange** | 12 种变更的多态接口，`@JsonTypeInfo` 多态序列化（供 REST Catalog 传输） | `SchemaChange.java:85` |
+| **SchemaManager** | schema 版本文件的读写与乐观锁并发控制器 | `SchemaManager.java`（paimon-core） |
+| **commitChanges** | 乐观锁主循环：读 latest → generateTableSchema → commit，失败重试 | `SchemaManager.java:252` |
+| **generateTableSchema** | 在旧 schema 副本上应用变更列表、做约束校验、产出新 TableSchema | `SchemaManager.java:282` |
+| **SchemaEvolutionUtil** | 读路径核心：按字段 ID 建索引映射 + 类型转换链 | `SchemaEvolutionUtil.java:80` |
+| **SchemaMergingUtils** | CDC 自动演进：把目标 RowType 合并进当前 schema，分配新 ID | `SchemaMergingUtils.java:45` |
+| **DataTypeCasts** | 类型转换静态规则（Implicit/Explicit/Compatible 三级） | `DataTypeCasts.java:192` |
+
+> **路径修正**：`Schema`/`TableSchema`/`SchemaChange`/`DataTypeCasts`/`CoreOptions` 均在 **`paimon-api`** 模块（旧稿把分析范围写成"paimon-common"含混，已修正——`SchemaManager`/`SchemaEvolutionUtil`/`SchemaMergingUtils`/`SchemaValidation`/`NestedSchemaUtils` 才在 paimon-core）。
+> **跨文档核对**：14 文档曾提到 `canConvert` 返回三态 `ConvertAction`（CONVERT/IGNORE/EXCEPTION）。本次核对当前源码 `DataTypeCasts` **不存在该 API**，类型转换判定走 `supportsCast(source, target, allowExplicit)`（布尔）+ `supportsCompatibleCast`（CDC 合并用）。14 的该描述疑为旧版本或其他来源，本文以现源码为准（§13）。
+
+### 1.3 高频生产陷阱
+
+**陷阱 1：误以为重命名/删除列会重写数据。** 重命名只改 `DataField.name`、不动 `id`（`SchemaManager.java:381` RenameColumn）；删列只是把该 ID 从 fields 移除，旧文件里那一列**仍占着空间**，读时被忽略、写时不再产生，只有 compaction 重写后才物理消失。把"DROP COLUMN 大字段"当成"立刻回收存储"会落空。
+
+**陷阱 2：新增列必须 nullable。** `AddColumn` 强制 `dataType().isNullable()`（`SchemaManager.java:341`）。原因：旧文件无此列、读出只能填 null，NOT NULL 会让旧数据违约。想加非空列只能新建表或先加 nullable 再回填。
+
+**陷阱 3：nullable → NOT NULL 默认被禁。** `alter-column-null-to-not-null.disabled` 默认 `true`（`CoreOptions.java:2108`）。旧文件若已有 null，强转 NOT NULL 读时违约。确认旧数据无 null 后才设 `false` 开启。
+
+**陷阱 4：改类型只过了 DataTypeCasts、没有 CastExecutor 就会失败。** 类型变更要同时满足 `DataTypeCasts.supportsCast(...)` 且 `CastExecutors.resolve(...) != null`（`SchemaManager.java` UpdateColumnType 分支）。理论可转但缺运行时转换器（如某些 STRING↔BYTES）会被拦下，报 "cannot be converted ... without loosing information"。
+
+**陷阱 5：收窄类型（BIGINT→INT）默认禁止，开了会静默溢出。** `disable-explicit-type-casting` 默认 `false`（即默认禁显式收窄；`CoreOptions.java:2116`）。设 `true` 之后做 BIGINT→INT，超 INT 范围的旧值在读时溢出成错误值，不报错——这是数据正确性陷阱，开启前务必确认值域。
+
+**陷阱 6：在非空表上删主键、改 bucket。** `DropPrimaryKey` 仅空表允许（`SchemaManager.java:559` "Cannot drop primary keys on a non-empty table."）；`bucket` 不能从 -1 改、也不能改成 -1（`:1202`/`:1205`），动态桶与固定桶是不同写入模式，已有数据无法自动迁移。
+
+**陷阱 7：关 deletion-vectors 不做 full-compaction 会数据重复。** `deletion-vectors.enabled` 默认不可改（受 `deletion-vectors.modifiable` 控制，默认 `false`，`CoreOptions.java:1870`）。直接关 DV 会让被 DV 标删的行重新可见。DV 机制详见 **04-DeletionVectors与文件索引**。
+
+**陷阱 8：频繁单字段变更放大读时映射开销。** 每个数据文件按其写入时的 `schemaId` 与当前 schema 比对、构建 `IndexCastMapping`；schema 版本越多、文件越杂，映射构建越频繁。建议批量变更后 `CALL sys.compact` 统一文件 schema 版本，让多数文件走恒等映射（零开销）。
 
 ---
 
-Apache Paimon 的 Schema 演进机制是其作为 Lakehouse 存储格式的核心能力之一。在数据湖场景下，表结构的变更是一个高频操作——上游数据源的字段变更、业务需求的调整、数据类型的优化都需要对表结构进行修改。Paimon 设计了一套 **基于文件系统的乐观锁并发控制 + 基于字段 ID 的读时演进** 方案，在不依赖外部元数据服务的前提下，实现了安全、高效的 Schema 演进。
+## 2. 数据模型：Schema / TableSchema / 字段 ID
 
-**核心设计哲学**：
+### 2.1 Schema 与 TableSchema 的分层
 
-1. **文件即元数据**：Schema 以 JSON 文件形式直接存储在表目录的 `schema/` 子目录下，不依赖外部数据库，天然支持对象存储
-2. **版本化管理**：每次 Schema 变更都生成一个新的版本文件（`schema-0`, `schema-1`, ...），历史版本可追溯
-3. **字段 ID 驱动**：通过全局递增的字段 ID（而非字段名）来关联新旧 Schema 中的列，保证列重命名后数据仍然正确关联
-4. **读时演进**：旧数据文件不需要重写，在读取时通过 `SchemaEvolutionUtil` 动态适配当前 Schema
-5. **乐观锁并发**：利用文件系统 rename 的原子性实现乐观并发控制，避免分布式锁的复杂性
+**① 要解决什么问题**　用户建表只想声明"有哪些列、谁是分区键/主键、加什么选项"，不该被迫去填 schema 版本号、字段 ID 这些系统内部账本；而系统又必须把这些账本持久化才能做版本管理和读时演进。两类需求用两个类隔离。
 
-**为什么选择这种设计？** 因为 Paimon 定位为无服务器依赖的 Lake Format，如果依赖 Metastore 做 Schema 管理，就会引入额外的运维成本和单点故障风险。基于文件的方案虽然在并发性能上不如数据库方案，但在数据湖场景下 Schema 变更的频率远低于数据写入，这个权衡是合理的。
+| 类名 | 模块 | 角色 | 含什么 / 不含什么 |
+|------|------|------|------|
+| `Schema` | paimon-api | **用户接口层** | 字段 + 分区键 + 主键 + 选项；**不含** `id`/`highestFieldId`/`version` |
+| `TableSchema` | paimon-api | **存储层完整元数据** | 在 Schema 基础上 + `id`、`highestFieldId`、`version`、`timeMillis`、推导出的 `bucketKeys`/`numBucket`；可序列化为 JSON 落盘 |
 
----
+**② 设计原理与取舍**　`TableSchema` 的字段都是不可变的（`fields` 用 `Collections.unmodifiableList` 包装），任何变更都得**构造一个全新 TableSchema** 而非原地改——这是乐观锁与原子提交的基础（旧对象永远不被污染）。三个关键字段各司其职：
 
-## 2. 核心数据模型
+- `version`（`TableSchema.java:55`）：schema JSON **格式**版本，`PAIMON_07_VERSION=1`/`PAIMON_08_VERSION=2`/`CURRENT_VERSION=3`（`:50-52`）。让新版 Paimon 能读旧格式 schema。注意它和下面的 `id` 是两回事。
+- `id`（`:57`）：schema **版本号**，从 0 单调递增，新版 = 旧版 + 1。乐观锁靠它、Snapshot 靠它定位写入时的 schema。
+- `highestFieldId`（`:62`）：字段 ID 的水位线，见 §2.2。
 
-### 2.1 Schema 与 TableSchema 的区别
+> **易混点（已修正）**：旧稿把格式 `version` 和版本 `id` 混在一段讲。二者独立：一张表生命周期里 `id` 从 0 涨到几百，而 `version` 长期固定为 3，只有 Paimon 大版本升级才会动。
 
-Paimon 中有两个容易混淆的 Schema 类：
+### 2.2 字段 ID 与 highestFieldId 不变式
 
-| 类名 | 所在模块 | 角色 | 特点 |
-|------|---------|------|------|
-| `Schema` | paimon-api | **用户接口层**的表结构定义 | 不含 schemaId、highestFieldId；用于建表和 API 交互 |
-| `TableSchema` | paimon-api | **存储层**的完整表结构 | 包含 schemaId、highestFieldId、version、timeMillis；可序列化为 JSON 文件 |
+**① 要解决什么问题**　如果靠**列名**关联新旧 schema，那"重命名列"就等于"删一列 + 加一列"，旧数据全废。Paimon 给每列一个**全局唯一、创建时分配、永不复用**的整数 ID，读取一律按 ID 匹配——重命名只改名不改 ID，旧文件照样认得。
 
-**为什么需要两个类？** `Schema` 是面向用户的简洁接口，只需要声明字段、分区键、主键和选项即可。`TableSchema` 是系统内部使用的完整元数据，包含了版本管理所需的全部信息。这种分层设计遵循了接口隔离原则——用户不需要关心内部的 schemaId 分配和字段 ID 管理。
+**② 设计原理与取舍**　关键不变式：**新列的 ID 必须比历史上分配过的任何 ID 都大，即便那列早被删了**。所以 `highestFieldId` 必须独立存储、删列不回退，而**不能**从当前 fields 的最大 ID 现推。反例：
 
-**源码位置**：
-- `Schema`: `paimon-api/src/main/java/org/apache/paimon/schema/Schema.java`
-- `TableSchema`: `paimon-api/src/main/java/org/apache/paimon/schema/TableSchema.java`
-
-### 2.2 TableSchema 字段详解
-
-```java
-// TableSchema.java
-public class TableSchema implements Serializable {
-    public static final int PAIMON_07_VERSION = 1;
-    public static final int PAIMON_08_VERSION = 2;
-    public static final int CURRENT_VERSION = 3;
-
-    private final int version;             // Schema 格式版本号（当前为3）
-    private final long id;                 // Schema 版本ID，从0递增
-    private final List<DataField> fields;  // 字段列表（不可变）
-    private final int highestFieldId;      // 历史最大字段ID
-    private final List<String> partitionKeys;  // 分区键名列表
-    private final List<String> primaryKeys;    // 主键名列表
-    private final List<String> bucketKeys;     // Bucket键（计算得出）
-    private final int numBucket;               // Bucket数量（从选项计算）
-    private final Map<String, String> options; // 表选项
-    private final @Nullable String comment;    // 表注释
-    private final long timeMillis;             // Schema创建时间戳
-}
+```
+初始 fields [1->a, 2->b, 3->c]，highestFieldId=3
+删除列 c    fields [1->a, 2->b]，highestFieldId 仍=3（不回退）
+若从 fields 现推 → 得 2 → 新列拿到 ID 3 → 与旧文件里 c(ID=3) 撞车 → 读 c 的旧数据被错认成新列
 ```
 
-**各字段的设计原因**：
-
-| 字段 | 为什么需要 | 好处 |
-|------|-----------|------|
-| `version` | 标识 Schema JSON 格式的版本 | 支持跨版本升级，新版本 Paimon 可以读取旧版本 Schema |
-| `id` | Schema 的全局单调递增版本号 | 实现乐观锁（新版本 = 旧版本 + 1）；Snapshot 通过 schemaId 引用写入时的 Schema |
-| `highestFieldId` | 追踪历史分配过的最大字段 ID | 即使删除列后，新增列的 ID 也不会与已删除列冲突，保证数据文件中的字段 ID 全局唯一 |
-| `fields` | 使用 `Collections.unmodifiableList` 包装 | 不可变性保证了线程安全，任何修改都必须创建新的 TableSchema |
-| `bucketKeys` | 从 primaryKeys 或 options 中的 `bucket-key` 推导 | 避免重复计算，构造时即完成验证 |
-| `timeMillis` | 使用 `System.currentTimeMillis()` 记录 | 支持按时间查询 Schema 历史，方便调试和审计 |
-
-**特别注意 `highestFieldId`**：当执行 `AddColumn` 时，新字段的 ID 从 `highestFieldId + 1` 开始分配。如果字段是复合类型（如 ROW），其内部子字段也需要分配 ID，因此 `highestFieldId` 可能跳跃增长。这是通过 `ReassignFieldId.reassign()` 实现的——该方法递归遍历 DataType 树，为每个需要 ID 的节点分配新 ID，并更新 `AtomicInteger highestFieldId`。
+复合类型（ROW/ARRAY/MAP）的**子字段也各占一个 ID**，所以加一个嵌套列时 `highestFieldId` 会跳跃增长。分配逻辑统一走 `ReassignFieldId.reassign(dataType, highestFieldId)`：递归遍历类型树，给每个需要 ID 的节点发号并推高水位线（`SchemaManager.java:346`、`SchemaMergingUtils.java:231`）。
 
 ### 2.3 Schema 文件存储结构
 
-```
-table_root/
-  schema/
-    schema-0       # 初始 Schema (JSON)
-    schema-1       # 第一次变更后的 Schema
-    schema-2       # 第二次变更后的 Schema
-    ...
-```
-
-**对于分支 (Branch) 的情况**：
+每个版本一个独立 JSON 文件，命名 `schema-{id}`，内容即 `TableSchema.toString()`：
 
 ```
-table_root/
-  branch/
-    branch-feature1/
-      schema/
-        schema-0   # 分支的独立 Schema 版本
+table_root/schema/
+    schema-0   schema-1   schema-2 ...        # 主分支
+table_root/branch/branch-<name>/schema/
+    schema-0 ...                              # 分支有独立 schema 序列
 ```
 
-Schema 文件以 JSON 格式存储，内容就是 `TableSchema.toString()` 的输出。命名格式为 `schema-{id}`，其中 id 与 `TableSchema.id` 对应。
+**为什么 JSON 而非二进制？** schema 文件通常几 KB，序列化不是瓶颈；可读性才是关键——运维能直接 `cat schema-5` 看结构、排障。`latest()` 只需在该目录找最大 id 文件，版本比较退化成数值比较。
 
-**为什么选择 JSON 文件而非二进制格式？** 可读性是首要考虑——运维人员可以直接查看和理解 Schema 文件内容，便于问题诊断。JSON 的反序列化性能在 Schema 场景下不是瓶颈（Schema 文件通常只有几 KB）。
+**④ 风险/陷阱**　手动 `rm schema-3` 而保留 `schema-4` 会造成版本断层：`latest()` 仍返回 schema-4，但被 schema-3 引用的快照再也读不出。清理历史版本必须走 `SchemaManager.rollbackTo`（§11），它带引用安全检查。
+
+**⑤ 收益与代价**　收益：零外部依赖、对象存储友好、可审计。代价：schema 版本文件只增不自动减，频繁变更会堆积小文件，需定期 rollback 清理。
 
 ---
 
-## 3. SchemaChange 的 12 种变更类型
+## 3. SchemaChange：12 种变更类型
 
-`SchemaChange` 是 Paimon Schema 演进的核心抽象，定义在 `paimon-api` 模块中，以 `interface` + 内部 `final class` 的方式实现多态。
+**① 要解决什么问题**　ALTER TABLE 的语义五花八门（加列、改类型、改注释、设选项……），既要类型安全地表达，又要能通过 REST Catalog 走 HTTP 传输。Paimon 用一个 `SchemaChange` 接口 + 12 个 `final class` 实现，配合 Jackson 多态序列化解决。
 
-**源码位置**: `paimon-api/src/main/java/org/apache/paimon/schema/SchemaChange.java`
+**源码位置**：`paimon-api/.../schema/SchemaChange.java`（接口 `:85`）。
 
-### 3.1 表级别变更
+### 3.1 三类变更与完整清单
 
-#### 1. SetOption — 设置表选项
+12 种变更分三类。下表是核对源码后的完整清单（行号已核对）：
 
-```java
-final class SetOption implements SchemaChange {
-    private final String key;
-    private final String value;
-}
-```
+| # | 类型 | 类别 | 行号 | 作用 | 核心约束 |
+|---|------|------|------|------|----------|
+| 1 | `SetOption` | 表级 | `:175` | 设置/改表选项 | 已有快照时触发 `checkAlterTableOption`，挡不可变选项 |
+| 2 | `RemoveOption` | 表级 | `:224` | 重置选项为默认 | 不可变选项、`bucket` 不允许 reset |
+| 3 | `UpdateComment` | 表级 | `:261` | 改/删表注释 | `comment=null` 即删除（省一个类） |
+| 4 | `AddColumn` | 列级 | `:300` | 加列（支持嵌套路径 + Move） | **必须 nullable**（`:341`） |
+| 5 | `RenameColumn` | 列级 | `:381` | 改列名（支持嵌套） | 禁分区键、禁 BLOB 列（`:913`） |
+| 6 | `DropColumn` | 列级 | `:435` | 删列（支持嵌套） | 禁分区键/主键；不能删光所有列（`:446`） |
+| 7 | `UpdateColumnType` | 列级 | `:474` | 改列类型（支持嵌套） | 禁分区键/主键；过 `supportsCast`+`CastExecutors` 双关；`keepNullability` 开关 |
+| 8 | `UpdateColumnPosition` | 列级 | `:537` | 改列逻辑位置（Move） | 仅展示顺序，不动物理存储 |
+| 9 | `UpdateColumnNullability` | 列级 | `:662` | 改可空性（支持嵌套） | null→NOT NULL 默认禁；主键不能转 nullable |
+| 10 | `UpdateColumnComment` | 列级 | `:716` | 改列注释（支持嵌套） | 纯元数据 |
+| 11 | `UpdateColumnDefaultValue` | 列级 | `:769` | 改列默认值（支持嵌套） | `validateDefaultValue` 校验与类型兼容 |
+| 12 | `DropPrimaryKey` | 约束级 | `:821` | 删主键约束 | **仅空表允许**（`:559`） |
 
-**用途**: 设置或修改表的配置选项（如 `write-buffer-size`、`merge-engine` 等）。
-**约束**: 如果表已有 Snapshot，会触发 `checkAlterTableOption` 检查不可变选项（如 `bucket-key`、`merge-engine`）。
-**好处**: 运行时调优无需重建表，极大降低了运维成本。
+> **修正**：旧稿正文按"SetOption=1 … RenameColumn=5"等手工编号叙述，与源码声明顺序（上表行号顺序）不完全一致；这里按源码实际声明顺序重排并核对行号。`UpdateColumnDefaultValue` 旧稿编号为 10，实际声明在 `UpdateColumnNullability`/`Comment` 之后（`:769`）。
 
-#### 2. RemoveOption — 删除表选项
+几个关键约束的"为什么"（其余在 §6 集中讲）：
 
-```java
-final class RemoveOption implements SchemaChange {
-    private final String key;
-}
-```
+- **AddColumn 强制 nullable**：旧文件无此列、读出填 null，NOT NULL 会让旧数据违约。这是读时演进正确性的地基。
+- **RenameColumn 只改名不改 ID**：所以重命名零数据成本；但禁止重命名分区键（分区目录路径含列名，如 `dt=2024-01-01`，改名会让旧分区路径对不上）。
+- **DropColumn 不真删数据**：只把该 ID 移出 fields，旧文件那一列读时被忽略、写时不再产生；BLOB 列允许删但禁止重命名。
 
-**用途**: 移除表的某个配置选项，恢复为默认值。
-**约束**: 不可变选项不允许 reset；`bucket` 选项不允许 reset。
+### 3.2 Move 位置指定与 JSON 多态
 
-#### 3. UpdateComment — 更新表注释
+`Move`（`SchemaChange.java:575`）支持四种位置策略，由 `MoveType` 枚举（`:577-582`）定义：`FIRST` / `AFTER` / `BEFORE` / `LAST`，工厂方法 `first/after/before/last`（`:584-598`）。注意：**Flink 与 Spark 引擎实际只透传 FIRST/AFTER**（§12.3），BEFORE/LAST 是 Paimon 内核能力但引擎入口未暴露。
 
-```java
-final class UpdateComment implements SchemaChange {
-    private final @Nullable String comment;  // null 表示删除注释
-}
-```
-
-**用途**: 修改或删除表的注释说明。
-**设计巧妙之处**: `comment` 为 `null` 时表示删除注释，避免了额外定义一个 `RemoveComment` 类型。
-
-### 3.2 列级别变更
-
-#### 4. AddColumn — 添加列
-
-```java
-final class AddColumn implements SchemaChange {
-    private final String[] fieldNames;  // 支持嵌套路径
-    private final DataType dataType;
-    private final String description;
-    private final Move move;            // 列位置指定
-}
-```
-
-**关键约束**: 新增列**必须是 nullable** 的（第 341 行 `checkArgument(addColumn.dataType().isNullable())`）。
-**为什么必须 nullable？** 因为已有的数据文件中不包含新列的数据，读取时会填充 null。如果允许 NOT NULL，那么旧数据读出来就会违反约束。这是保证读时演进正确性的基础性约束。
-**嵌套支持**: `fieldNames` 是数组，支持通过路径（如 `["address", "city"]`）向嵌套 ROW 类型中添加字段。
-
-#### 5. RenameColumn — 重命名列
-
-```java
-final class RenameColumn implements SchemaChange {
-    private final String[] fieldNames;  // 支持嵌套路径
-    private final String newName;
-}
-```
-
-**约束**: 不能重命名分区键；不能重命名 BLOB 类型列。
-**为什么不能重命名分区键？** 分区键的名称直接影响目录结构和分区过滤逻辑，重命名会导致分区路径不匹配。
-
-#### 6. DropColumn — 删除列
-
-```java
-final class DropColumn implements SchemaChange {
-    private final String[] fieldNames;  // 支持嵌套路径
-}
-```
-
-**约束**: 不能删除分区键或主键；不能删除所有字段（至少保留一个）。
-**为什么允许删除列？** 因为 Paimon 基于字段 ID 做索引映射，删除列后读取旧数据文件时，该列对应的 ID 会映射到 `NULL_FIELD_INDEX = -1`，返回 null 值。新写入的数据文件则不再包含该列。
-
-#### 7. UpdateColumnType — 更新列类型
-
-```java
-final class UpdateColumnType implements SchemaChange {
-    private final String[] fieldNames;
-    private final DataType newDataType;
-    private final boolean keepNullability;  // 是否保持原有可空性
-}
-```
-
-**约束**: 不能更新分区键和主键的类型；必须通过 `DataTypeCasts.supportsCast()` 检查并通过 `CastExecutors.resolve()` 确认有对应的转换器。
-**`keepNullability` 的作用**: Spark 的 `UpdateColumnType` 会自动将类型的 nullability 设置为 true（因为 Spark 的类型系统默认 nullable），但实际上用户可能只想改类型不改 nullability。设置 `keepNullability = true` 可以保持原列的可空性不变。
-
-#### 8. UpdateColumnNullability — 更新列可空性
-
-```java
-final class UpdateColumnNullability implements SchemaChange {
-    private final String[] fieldNames;
-    private final boolean newNullability;
-}
-```
-
-**约束**: 默认禁止将 nullable 改为 NOT NULL（通过 `alter-column-null-to-not-null.disabled` 选项控制）；主键列不能改为 nullable。
-**为什么默认禁止 null 转 NOT NULL？** 如果旧数据文件中已经存在 null 值，将列改为 NOT NULL 后读取这些数据会违反约束。这是一个有破坏性的操作，需要用户明确开启。
-
-#### 9. UpdateColumnComment — 更新列注释
-
-```java
-final class UpdateColumnComment implements SchemaChange {
-    private final String[] fieldNames;
-    private final String newDescription;
-}
-```
-
-**说明**: 纯元数据操作，不影响数据文件的读写。
-
-#### 10. UpdateColumnDefaultValue — 更新列默认值
-
-```java
-final class UpdateColumnDefaultValue implements SchemaChange {
-    private final String[] fieldNames;
-    private final String newDefaultValue;
-}
-```
-
-**约束**: 通过 `validateDefaultValue(field.type(), update.newDefaultValue())` 验证默认值与列类型的兼容性。
-**作用**: 当写入数据缺少某列的值时，使用默认值填充。
-
-#### 11. UpdateColumnPosition — 更新列位置
-
-```java
-final class UpdateColumnPosition implements SchemaChange {
-    private final Move move;
-}
-```
-
-**说明**: 仅影响逻辑展示顺序，不影响数据文件的物理存储。因为读取时依靠字段 ID 而非位置。
-
-### 3.3 约束级别变更
-
-#### 12. DropPrimaryKey — 删除主键
-
-```java
-final class DropPrimaryKey implements SchemaChange {
-    // 无字段，仅标识操作类型
-}
-```
-
-**关键约束**: **只有在表没有任何 Snapshot（即空表）时才允许删除主键**（第 557-559 行）。
-**为什么有这个限制？** 主键直接决定了数据的存储结构（KeyValue 还是 AppendOnly）。已有数据如果是按主键组织的 LSM 树，删除主键后无法正确读取。
-
-### 3.4 Move 位置指定机制
-
-`Move` 类支持四种位置指定策略：
-
-```java
-class Move implements Serializable {
-    public enum MoveType {
-        FIRST,   // 移到最前
-        AFTER,   // 移到某列之后
-        BEFORE,  // 移到某列之前
-        LAST     // 移到最后
-    }
-    
-    private final String fieldName;
-    private final String referenceFieldName;  // AFTER/BEFORE 时需要
-    private final MoveType type;
-}
-```
-
-**好处**: 提供了灵活的列排序能力，用户可以精确控制列的逻辑展示顺序。
-
-### 3.5 JSON 多态序列化
-
-SchemaChange 使用 Jackson 的 `@JsonTypeInfo` + `@JsonSubTypes` 实现多态序列化：
-
-```java
-@JsonTypeInfo(
-    use = JsonTypeInfo.Id.NAME,
-    include = JsonTypeInfo.As.PROPERTY,
-    property = SchemaChange.Actions.FIELD_ACTION
-)
-@JsonSubTypes({
-    @JsonSubTypes.Type(value = SetOption.class, name = "setOption"),
-    @JsonSubTypes.Type(value = AddColumn.class, name = "addColumn"),
-    // ... 共12种
-})
-public interface SchemaChange extends Serializable { ... }
-```
-
-**为什么需要 JSON 序列化？** 因为 Paimon 支持 REST Catalog，Schema 变更请求需要通过 HTTP API 传输。通过 `action` 属性区分不同类型的变更，实现了类型安全的反序列化。
+多态序列化用 Jackson 的 `@JsonTypeInfo(use=NAME, include=PROPERTY, property=action)` + `@JsonSubTypes`（`SchemaChange.java:48-82`）按 `action` 字段名区分 12 个子类型。**为什么需要它？** REST Catalog 的 ALTER 请求要把 SchemaChange 序列化成 JSON 经 HTTP 传输，反序列化时靠 `action` 还原成正确的子类。
 
 ---
 
-## 4. SchemaManager 乐观锁并发控制
+## 4. SchemaManager：乐观锁并发控制
 
-### 解决什么问题
+**① 要解决什么问题**　多个 Flink/Spark 作业可能并发 ALTER 同一张表（典型：CDC 作业自动加列 + 人工改类型），而对象存储上没有可靠的分布式锁原语。如何保证：并发提交只有一个成功、失败者能感知并重试、schema 文件写入原子（不会写一半崩溃留下坏 JSON）？
 
-**核心业务问题**：
-1. **多作业并发修改 Schema**：多个 Flink 作业同时执行 ALTER TABLE，如何保证只有一个成功？
-2. **分布式环境无锁服务**：对象存储（S3、OSS）环境下没有 ZooKeeper 等分布式锁，如何实现并发控制？
-3. **Schema 版本一致性**：如何保证读取到的 Schema 版本是最新的，不会出现脏读？
-4. **原子性提交**：如何保证 Schema 文件写入的原子性，避免写入一半时崩溃导致损坏？
+**源码位置**：`paimon-core/.../schema/SchemaManager.java`。
 
-**没有这个设计的后果**：
-- 并发修改导致 Schema 版本冲突，后提交的覆盖先提交的，丢失变更
-- Schema 文件写入一半时进程崩溃，产生不完整的 JSON 文件，导致表无法读取
-- 依赖外部锁服务（如 ZooKeeper），增加部署复杂度和故障点
-- 高并发场景下锁竞争激烈，Schema 变更性能下降
+**② 设计原理与取舍**　答案是**乐观锁 + 文件 rename 的 CAS 语义**，不引入任何外部锁服务。
 
-**实际场景**：
-```java
-// 场景1: 两个 Flink 作业同时新增不同的列
-// 作业A: ALTER TABLE t ADD COLUMN col_a STRING;
-// 作业B: ALTER TABLE t ADD COLUMN col_b STRING;
-// 期望: 两个列都成功添加
-// 实际: 乐观锁保证一个成功后，另一个重新读取最新 Schema 再添加
+| 方案 | 优点 | 缺点 | Paimon 取舍 |
+|------|------|------|------------|
+| 悲观锁（ZK/DB 锁） | 无重试、强一致 | 外部依赖、单点、运维成本 | 不作为必选 |
+| **乐观锁 + rename CAS** | 零依赖、对象存储友好 | 冲突时重试 | **默认**：schema 变更低频，冲突概率极低 |
+| 乐观锁 + 可选 CatalogLock | 高并发下减少无效重试 | 多一个可选组件 | **增强**：配了 Hive/JDBC 锁时叠加 |
 
-// 场景2: CDC 同步作业自动演进 Schema 的同时，人工执行 ALTER TABLE
-// CDC: 自动添加 MySQL 新增的字段
-// 人工: 修改某个字段的类型
-// 乐观锁保证两个操作串行化，不会互相覆盖
-```
+核心机制：新 schema 文件名固定为 `schema-{oldId+1}`（`SchemaManager.java:579`）。`tryToWriteAtomic` 先写临时隐藏文件再 `rename` 到目标名；**若目标已存在（说明别人先提交了同一 id）则 rename 失败返回 false**——这就是天然的 CAS。失败方回到循环头重读 `latest()` 再算一遍。
 
-### 有什么坑
+一句话哲学：**把"谁赢"这件事下放给文件系统的 rename 原子性，应用层只管 while(true) 重试。**
 
-**误区陷阱**：
-1. **误以为乐观锁会导致变更丢失**：实际上失败的一方会重试，最终两个变更都会生效
-2. **误以为 rename 在所有文件系统上都是原子的**：S3 的 rename 是 copy+delete，原子性较弱
-3. **误以为高并发场景下乐观锁性能很差**：实际上 Schema 变更频率低，冲突概率极小
-4. **误以为可以手动删除 schema 文件**：删除中间版本会导致 Schema 历史不连续
+**③ 关键源码**
 
-**错误配置**：
-```java
-// 错误1: 在 S3 上依赖 rename 的强原子性
-// S3 的 rename 实际是 copy+delete，可能出现目标文件已存在但源文件未删除的情况
-// 解决: 使用支持原子 rename 的文件系统（HDFS、本地文件系统）或配置 CatalogLock
-
-// 错误2: 手动删除 schema 文件导致版本断层
-// 删除 schema-3 后，schema-4 仍然存在
-// 问题: latest() 返回 schema-4，但无法回溯到 schema-2
-// 解决: 使用 SchemaManager.rollbackTo() 方法安全删除
-```
-
-**生产环境注意事项**：
-1. **对象存储的 rename 语义**：S3、OSS 的 rename 不是真正的原子操作，建议配置 CatalogLock 增强
-2. **重试次数无上限**：`while(true)` 循环可能在极端情况下导致无限重试，需监控重试次数
-3. **临时文件清理**：`tryToWriteAtomic` 失败时会留下临时文件（.文件名），需定期清理
-4. **Schema 文件数量膨胀**：频繁变更会产生大量 schema-{id} 文件，占用 inode 和列表性能
-
-**性能陷阱**：
-```java
-// 陷阱1: 高并发场景下的重试风暴
-// 10个作业同时修改 Schema，9个会失败重试
-// 每次重试都需要读取最新 Schema、应用变更、验证、写入
-// 建议: 配置 CatalogLock 减少无效重试
-
-// 陷阱2: 大 Schema 的序列化开销
-// 包含1000个字段的表，每次变更都需要序列化整个 TableSchema 为 JSON
-// 建议: 避免单表字段过多，考虑拆分表
-```
-
-### 核心概念解释
-
-**术语定义**：
-1. **乐观锁 (Optimistic Locking)**：
-   - 假设冲突很少发生，不加锁直接执行，提交时检查是否有冲突
-   - 冲突时回滚重试，而非阻塞等待
-   - 适用于读多写少、冲突概率低的场景
-
-2. **CAS (Compare And Swap)**：
-   - 比较当前值是否等于预期值，相等则更新为新值
-   - Paimon 的实现：检查 schema-{id} 文件是否存在，不存在则创建
-   - 文件系统的 rename 操作天然提供 CAS 语义
-
-3. **tryToWriteAtomic**：
-   - 先写临时文件（.schema-{id}.随机数）
-   - 再 rename 到目标文件（schema-{id}）
-   - rename 失败说明目标文件已存在（并发冲突）
-
-4. **CatalogLock**：
-   - 可选的外部锁机制（如 Hive Metastore 的锁）
-   - 在乐观锁之前加一层悲观锁，减少无效重试
-   - 双重保护：外部锁失效时，乐观锁仍能保证正确性
-
-5. **Schema 版本号 (schemaId)**：
-   - 从 0 开始的单调递增整数
-   - 新版本 = 旧版本 + 1
-   - 通过版本号实现乐观锁的冲突检测
-
-**概念关系**：
-```
-并发控制层次:
-  ┌─────────────────────────────────┐
-  │ CatalogLock (可选)               │  减少冲突，提升性能
-  │   ├── Hive Metastore Lock       │
-  │   ├── ZooKeeper Lock            │
-  │   └── 其他外部锁                 │
-  └─────────────────────────────────┘
-              ↓
-  ┌─────────────────────────────────┐
-  │ 乐观锁 (必选)                    │  保证正确性
-  │   └── 文件 rename CAS           │
-  └─────────────────────────────────┘
-```
-
-**与其他系统对比**：
-| 系统 | 并发控制机制 | 原子性保证 | 外部依赖 |
-|------|------------|-----------|---------|
-| Paimon | 文件 rename 乐观锁 | rename 原子性 | 无（可选 CatalogLock） |
-| Iceberg | metadata.json 乐观锁 | rename 原子性 | 无（可选 Lock） |
-| Hudi | Timeline 乐观锁 | rename 原子性 | 无 |
-| Delta Lake | _delta_log 乐观锁 | 文件追加原子性 | 无 |
-| Hive | Metastore 悲观锁 | 数据库事务 | MySQL/PostgreSQL |
-
-### 设计理念
-
-**为什么这样设计**：
-
-1. **为什么选择乐观锁而非悲观锁？**
-   - **权衡**：高并发时可能重试，但避免了锁服务的复杂性和单点故障
-   - **好处**：零外部依赖，部署简单，适合对象存储环境
-   - **数据支撑**：Schema 变更频率通常 < 10次/天，冲突概率 < 1%
-
-2. **为什么使用 while(true) 无限重试？**
-   - **权衡**：极端情况下可能长时间重试，但保证了最终一致性
-   - **好处**：简化了错误处理逻辑，用户无需关心重试次数
-   - **实际情况**：绝大多数场景下 1-2 次重试即可成功
-
-3. **为什么需要 CatalogLock 双重保护？**
-   - **权衡**：增加了可选依赖，但提升了高并发场景的性能
-   - **好处**：外部锁减少无效重试，乐观锁保证正确性兜底
-   - **设计模式**：防御性编程，不依赖外部锁的可靠性
-
-4. **为什么 Schema ID 必须连续递增？**
-   - **权衡**：限制了分布式 ID 生成的灵活性，但简化了版本管理
-   - **好处**：latest() 只需找最大 ID，版本比较只需数值比较
-   - **实现简单**：通过 CAS 保证唯一性，无需分布式 ID 生成器
-
-**架构演进**：
-```
-早期版本:
-  └── 纯乐观锁，无外部锁支持
-
-当前版本:
-  ├── 乐观锁（基础保障）
-  └── CatalogLock（可选增强）
-      ├── HiveCatalogLock
-      ├── JdbcCatalogLock
-      └── 自定义 CatalogLockFactory
-```
-
-**业界对比**：
-- **Iceberg**：同样使用乐观锁 + 可选外部锁，但所有元数据在单个 metadata.json 中，冲突概率更高
-- **Hudi**：Timeline 机制天然串行化，冲突概率低，但灵活性不如独立 Schema 文件
-- **Delta Lake**：_delta_log 追加写入，冲突概率最低，但 Schema 变更需要写入完整的 AddFile 操作
-
----
-
-`SchemaManager` 是 Schema 演进的核心管理器，负责 Schema 的创建、变更、版本管理和并发控制。
-
-**源码位置**: `paimon-core/src/main/java/org/apache/paimon/schema/SchemaManager.java`
-
-### 4.1 乐观锁实现原理
-
-Paimon 的 Schema 并发控制采用**乐观锁 + CAS（Compare And Swap）**模式，其核心原理是：
-
-1. 读取当前最新的 Schema 版本（例如 `schema-5`）
-2. 基于当前版本生成新版本（`schema-6`）
-3. 尝试原子性地写入新版本文件
-4. 如果写入失败（说明有其他并发修改），回到步骤 1 重试
-
-这个机制不依赖任何分布式锁服务，利用的是文件系统 `rename` 操作的原子性。
-
-**为什么选择乐观锁？**
-- Schema 变更是低频操作（通常每天几次），冲突概率很低
-- 不需要额外的锁服务，降低了部署复杂度
-- 在对象存储（S3、OSS）环境下，没有可靠的分布式锁原语，文件原子 rename 是最佳选择
-
-### 4.2 createTable 的乐观锁循环
+并发主循环（建表与变更同构，都是"读 latest → 生成新 schema → commit → 失败重试"）：
 
 ```java
-// SchemaManager.java 第 185-209 行
-public TableSchema createTable(Schema schema, boolean externalTable) throws Exception {
-    while (true) {
-        Optional<TableSchema> latest = latest();
-        if (latest.isPresent()) {
-            // 表已存在的处理
-            if (externalTable) {
-                checkSchemaForExternalTable(latestSchema.toSchema(), schema);
-                return latestSchema;
-            } else {
-                throw new IllegalStateException("Schema in filesystem exists, creation is not allowed.");
-            }
-        }
-        
-        TableSchema newSchema = TableSchema.create(0, schema);  // 初始ID为0
-        FileStoreTableFactory.create(fileIO, tableRoot, newSchema).store();  // 验证
-        boolean success = commit(newSchema);
-        if (success) {
-            return newSchema;
-        }
-        // 失败则重试——可能有并发创建
-    }
-}
-```
-
-**关键细节**：
-- 初始 Schema 的 ID 固定为 0
-- 建表前通过 `FileStoreTableFactory.create(...).store()` 验证配置的有效性
-- `while(true)` 循环保证了在并发建表场景下只有一个成功
-
-### 4.3 commitChanges 的乐观锁循环
-
-```java
-// SchemaManager.java 第 252-280 行
+// SchemaManager.java:252  commitChanges
 public TableSchema commitChanges(List<SchemaChange> changes) {
-    SnapshotManager snapshotManager = new SnapshotManager(fileIO, tableRoot, branch, null, null);
     LazyField<Boolean> hasSnapshots = new LazyField<>(() -> snapshotManager.latestSnapshot() != null);
-    
     while (true) {
         TableSchema oldTableSchema = latest().orElseThrow(...);
-        TableSchema newTableSchema = generateTableSchema(
-            oldTableSchema, changes, hasSnapshots, lazyIdentifier);
-        try {
-            boolean success = commit(newTableSchema);
-            if (success) {
-                return newTableSchema;
-            }
-        } catch (Exception e) {
-            throw new RuntimeException(e);
+        TableSchema newTableSchema = generateTableSchema(oldTableSchema, changes, hasSnapshots, ...);
+        if (commit(newTableSchema)) {          // 成功即返回
+            return newTableSchema;
         }
-        // commit失败说明有并发修改，重新读取最新Schema再试
+        // 失败=有人抢先写了同 id 文件，循环重读 latest 再算
     }
 }
 ```
 
-**乐观锁的核心在于 `commit` 方法**：
+提交即"校验 + 原子写"，乐观锁的成败完全压在最后一行 `tryToWriteAtomic` 上：
 
 ```java
-// SchemaManager.java 第 1083-1088 行
+// SchemaManager.java:1083  commit
 public boolean commit(TableSchema newSchema) throws Exception {
-    SchemaValidation.validateTableSchema(newSchema);
+    SchemaValidation.validateTableSchema(newSchema);        // §7 全面校验
     SchemaValidation.validateFallbackBranch(this, newSchema);
-    Path schemaPath = toSchemaPath(newSchema.id());
+    Path schemaPath = toSchemaPath(newSchema.id());         // schema-{id}
     return fileIO.tryToWriteAtomic(schemaPath, newSchema.toString());
 }
 ```
 
-新 Schema 的 ID = 旧 Schema 的 ID + 1（第 579 行 `oldTableSchema.id() + 1`）。如果并发修改已经创建了 `schema-{id}` 文件，`tryToWriteAtomic` 会 rename 失败返回 false，触发重试。
+原子写本体（`FileIO.java:330`）：写临时文件 → `rename` → 失败清理临时文件。`rename` 的原子性 + "目标已存在则失败"共同提供 CAS。`hasSnapshots` 用 `LazyField` 包裹，只有真正需要判断"表是否空表"（如 DropPrimaryKey）时才触发一次快照扫描，避免每次变更都扫快照。
 
-### 4.4 tryToWriteAtomic 原子写入
+CatalogLock 双重保护（可选）：`FileSystemCatalog.alterTableImpl` 用 `runWithLock(identifier, () -> schemaManager.commitChanges(changes))` 包一层。配了 Hive/JDBC 锁时，外层悲观锁先串行化、减少内层乐观锁的无效重试；没配则退化为 `Lock.empty()`，纯靠乐观锁兜底。
 
-```java
-// FileIO.java 第 330-343 行
-default boolean tryToWriteAtomic(Path path, String content) throws IOException {
-    Path tmp = path.createTempPath();  // 创建临时隐藏文件路径
-    boolean success = false;
-    try {
-        writeFile(tmp, content, false);  // 先写临时文件
-        success = rename(tmp, path);     // 原子 rename
-    } finally {
-        if (!success) {
-            deleteQuietly(tmp);          // 失败时清理临时文件
-        }
-    }
-    return success;
-}
-```
+**④ 风险/陷阱/边界**
 
-**为什么使用 rename 而非直接写？**
-1. **原子性**: 大多数文件系统的 rename 操作是原子的（特别是同目录下的 rename）
-2. **唯一性**: 如果目标文件已存在，rename 操作会失败，天然实现了 CAS 语义
-3. **完整性**: 避免了写入中途崩溃导致的不完整文件
+- **对象存储 rename 非真原子**：S3/OSS 的 rename 实为 copy+delete，原子性弱于 HDFS/本地 FS。高并发下建议叠加 CatalogLock，或用支持原子 rename 的 FileIO 实现。
+- **`while(true)` 无重试上限**：正常 1-2 次即成功，但极端高并发可能长时间空转。应监控 schema 变更耗时/失败率。
+- **临时文件残留**：`tryToWriteAtomic` 失败会 `deleteQuietly` 清理，但进程硬崩可能留下隐藏临时文件，需运维兜底清理。
+- **大宽表序列化成本**：每次变更都把整个 TableSchema 序列化为 JSON，千列表会有可观开销，建议控制单表字段数。
 
-**在对象存储上的行为**: S3 等对象存储的 rename 实际上是 copy + delete，但 Paimon 利用了 "如果目标已存在则失败" 的语义来实现并发控制。不同的 FileIO 实现（HadoopFileIO、S3FileIO 等）可能有不同的原子性保证。
-
-### 4.5 CatalogLock 双重保护
-
-在 `FileSystemCatalog` 中，Schema 变更还可以使用 CatalogLock 进行额外保护：
-
-```java
-// FileSystemCatalog.java 第 167-180 行
-protected void alterTableImpl(Identifier identifier, List<SchemaChange> changes) {
-    SchemaManager schemaManager = schemaManager(identifier);
-    try {
-        runWithLock(identifier, () -> schemaManager.commitChanges(changes));
-    } catch (...) { ... }
-}
-
-public <T> T runWithLock(Identifier identifier, Callable<T> callable) throws Exception {
-    Optional<CatalogLockFactory> lockFactory = lockFactory();
-    try (Lock lock = lockFactory
-            .map(factory -> factory.createLock(lockContext().orElse(null)))
-            .map(l -> Lock.fromCatalog(l, identifier))
-            .orElseGet(Lock::empty)) {
-        return lock.runWithLock(callable);
-    }
-}
-```
-
-**为什么需要双重保护？**
-- 乐观锁（文件 rename）是基础保障，任何环境下都可用
-- CatalogLock 是可选的增强，当配置了 Hive Metastore 等外部锁服务时，可以减少无效的乐观重试
-- 两层保护叠加，即使外部锁失效，乐观锁仍能保证正确性
+**⑤ 收益与代价**　收益：零外部依赖、任何支持 rename 的 FS 都能用、并发面小（只有同 id 才冲突）。代价：高冲突场景下重试浪费、依赖 FS rename 语义的强弱、schema 文件只增不减。
 
 ---
 
-## 5. generateTableSchema 核心流程
+## 5. generateTableSchema：变更如何被应用
 
-`generateTableSchema` 是 Schema 变更的核心处理方法，它接收旧 Schema 和变更列表，生成新的 TableSchema。
+`generateTableSchema`（`SchemaManager.java:282`）接收旧 schema 和变更列表，产出新 TableSchema。它是 §4 乐观锁循环里"算一遍"的那一步。
 
-**源码位置**: `SchemaManager.java` 第 282-586 行
+### 5.1 整体流程与原子性
 
-### 5.1 整体流程概览
+**① 要解决什么问题**　一次 ALTER 可能携带多条变更（如 `ADD COLUMN a, ADD COLUMN b`），要么全成、要么全不落盘，中途校验失败不能留下半成品。
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                generateTableSchema                       │
-├─────────────────────────────────────────────────────────┤
-│ 1. 复制旧 Schema 的 options、fields、primaryKeys          │
-│ 2. 读取配置开关（disableNullToNotNull 等）                  │
-│ 3. 遍历 changes 列表，逐个应用变更                         │
-│ 4. 构造新的 Schema（处理主键重命名、选项重命名）             │
-│ 5. 创建新 TableSchema（id = old.id + 1）                  │
-└─────────────────────────────────────────────────────────┘
-```
+**② 设计原理**　所有变更都在**旧 schema 的内存副本**（`newFields` 是 ArrayList 拷贝、`newOptions` 是 Map 拷贝）上逐个 apply，原始 schema 全程不动。任一变更校验抛异常就直接中断、整个 `generateTableSchema` 失败，副本被丢弃——天然原子。全部成功后才 `new TableSchema(oldId+1, ...)`（`:579`）。
 
-**关键设计**: 所有变更操作都在内存中的 `newFields`（ArrayList 副本）上执行，**不修改原始 Schema**。只有在所有变更都成功应用后，才创建新的 TableSchema。这保证了变更的原子性——要么全部成功，要么完全回滚。
+流程：① 拷贝旧 options/fields/primaryKeys → ② 读三个配置开关 → ③ 遍历 changes 逐个 apply + 校验 → ④ 处理主键/选项随列重命名的级联 → ⑤ 构造 `id=old.id+1` 的新 TableSchema。
 
-初始化阶段读取的三个关键配置开关：
+初始化读取的三个开关（默认值已核对 `CoreOptions.java`）：
 
-| 配置项 | 默认值 | 作用 |
-|-------|--------|------|
-| `alter-column-null-to-not-null.disabled` | `true` | 是否禁止将 nullable 改为 NOT NULL |
-| `disable-explicit-type-casting` | `false` | 是否禁止显式类型转换（收窄转换） |
-| `add-column-before-partition` | `false` | 新增列是否自动放在分区列之前 |
+| 配置项 | 默认 | 行号 | 作用 |
+|--------|------|------|------|
+| `alter-column-null-to-not-null.disabled` | `true` | `:2108` | 禁止 nullable→NOT NULL |
+| `disable-explicit-type-casting` | `false` | `:2116` | 为 true 时禁显式收窄转换 |
+| `add-column-before-partition` | `false` | `:2124` | 新增列自动插到分区列之前（仅分区表生效） |
 
-### 5.2 AddColumn 处理流程
+### 5.2 AddColumn / RenameColumn / DropColumn / UpdateColumnType
 
-AddColumn 的处理最为复杂，因为需要支持嵌套路径和多种位置指定：
+四种核心列变更的处理要点（行号已核对，逻辑见 `SchemaManager.java` 对应分支）：
 
-```
-AddColumn 处理流程:
-1. 校验新列必须是 nullable
-2. 分配新的字段 ID (highestFieldId + 1)
-3. 如果数据类型是复合类型，递归分配内部字段 ID (ReassignFieldId)
-4. 通过 NestedColumnModifier 定位目标位置:
-   a. 如果指定了 Move，按 Move 策略插入
-   b. 如果配置了 addColumnBeforePartition，插入到分区列之前
-   c. 否则追加到末尾
-5. 校验列名不重复
-```
+| 变更 | 关键步骤 | 易错点 |
+|------|----------|--------|
+| **AddColumn** | 校验 nullable（`:341`）→ `ReassignFieldId.reassign` 分配 ID（含嵌套子字段，`:346`）→ 按 Move / `addColumnBeforePartition`（`:389`）/ 末尾 定位 → 查重名 | 必须 nullable；嵌套类型加列会跳号 |
+| **RenameColumn** | 禁分区键、禁 BLOB（`assertNotRenamingBlobColumn` `:913`）→ 定位 → 只改 name 保留 id/类型/默认值 → 替换 | 只改名不改 ID，旧文件零成本 |
+| **DropColumn** | `dropColumnValidation` 禁分区键/主键（`:874`）→ 定位 → 移除 → 校验不能删光（`:446`） | 嵌套列删除不校验分区/主键（`:874` 处 `if (length>1) return`，因嵌套列不可能是分区/主键） |
+| **UpdateColumnType** | 禁分区键/主键类型 → `getRootType` 钻取到目标类型 → 处理 `keepNullability` → 双关校验（`supportsCast`+`CastExecutors.resolve`）→ 嵌套则 `getArrayMapTypeWithTargetTypeRoot` 重建类型树 | 双关缺一即失败；ARRAY/MAP 内改类型走重建 |
 
-**分区列前插入的特殊逻辑**（第 389-399 行）：
+**`addColumnBeforePartition` 插入逻辑**（`:389` 起，已核对）：找到第一个分区列的下标，把新列插在它前面，否则追加末尾。动机：大数据场景分区列常在表尾，新列追加末尾会混进分区列之间不利阅读。
+
+**UpdateColumnType 的"钻取 + 重建"**：改 `ARRAY<MAP<STRING, ARRAY<INT>>>` 里的 INT→BIGINT 时，`updateFieldNames=[v, element, value, element]`，`getRootType` 递归向下钻到 INT，`getArrayMapTypeWithTargetTypeRoot` 再递归向上重建出 `ARRAY<MAP<STRING, ARRAY<BIGINT>>>`。
+
+### 5.3 嵌套列修改机制 NestedColumnModifier
+
+**① 要解决什么问题**　AddColumn/Rename/Drop/UpdateType 都可能作用在 ROW 内层、甚至 ARRAY/MAP 包裹的 ROW 内层。需要一套统一的"按路径定位到目标层级、改完逐层重建外层类型"的机制，而不是每种变更各写一遍递归。
+
+**② 设计原理**　`NestedColumnModifier`（`SchemaManager.java:926`）是抽象内部类，模板方法：`updateIntermediateColumn` 递归下钻定位，到达最后一级调用子类实现的 `updateLastColumn`（各变更子类填具体改法）。
+
+难点在 **ARRAY/MAP 没有 DataField 结构**：Flink 里 ARRAY 元素用虚拟字段名 `element`、MAP 值用 `value` 引用。`extractRowDataFields`（`:985`）按类型根决定"吃掉"几层路径：
 
 ```java
-if (addColumnBeforePartition && !partitionKeys.isEmpty() 
-    && addColumn.fieldNames().length == 1) {
-    int insertIndex = newFields.size();
-    for (int i = 0; i < newFields.size(); i++) {
-        if (partitionKeys.contains(newFields.get(i).name())) {
-            insertIndex = i;
-            break;
-        }
-    }
-    newFields.add(insertIndex, dataField);
-}
+// SchemaManager.java:985  返回值=本类型消耗的路径深度
+case ROW:   nestedFields.addAll(((RowType) type).getFields()); return 1;
+case ARRAY: return extractRowDataFields(((ArrayType) type).getElementType(), nestedFields) + 1;
+case MAP:   return extractRowDataFields(((MapType) type).getValueType(), nestedFields) + 1;
+default:    return 1;
 ```
 
-**为什么有 `addColumnBeforePartition` 选项？** 在很多大数据场景中，分区键通常放在表的最后几列。新增列如果总是追加到末尾，会混在分区列之后，不利于阅读。这个选项让新列自动插入到分区列之前，保持列的逻辑分组。
+例如改 `ARRAY<ROW<a INT>>` 里的 `a`，路径是 `[col, element, a]`，但 ARRAY 本身没 DataField，`extractRowDataFields` 会跳过 ARRAY 层直达内部 ROW 再取出字段。
 
-### 5.3 RenameColumn 处理流程
+### 5.4 选项重命名级联更新
 
-```
-RenameColumn 处理流程:
-1. 校验不能重命名分区键
-2. 校验不能重命名 BLOB 类型列
-3. 通过 NestedColumnModifier 定位目标字段
-4. 校验旧列名存在，新列名不存在
-5. 创建新的 DataField（保持原 ID、类型、描述、默认值，只改名称）
-6. 替换字段列表中的对应位置
-```
+**① 要解决什么问题**　很多表选项的 key 或 value 里**嵌着列名**（`bucket-key=col_a`、`fields.col_a.aggregate-function=sum`、`sequence.field=col_a`）。只改列名不改这些引用，相关功能（分桶、聚合、序列字段）会因找不到列而失效。
 
-**关键点**: 重命名只改变 `DataField.name`，不改变 `DataField.id`。这意味着旧数据文件仍然可以通过 ID 与新 Schema 关联，不需要重写数据。
+**② 设计**　`applyRenameColumnsToOptions`（`SchemaManager.java:745`）在重命名时同步改三类选项：① 固定 key、value 含列名（`bucket-key`、`sequence.field`）；② key 含列名（`fields.{name}.*`）；③ key 和 value 都含列名（`fields.{names}.sequence-group`、`nested-key`）。这保证重命名是"完整操作"，用户无需手工同步选项。主键若被重命名也会在 `:575` 处级联更新主键名列表。
 
-### 5.4 DropColumn 处理流程
-
-```
-DropColumn 处理流程:
-1. dropColumnValidation 校验:
-   - 不能删除分区键
-   - 不能删除主键
-2. 通过 NestedColumnModifier 定位目标字段
-3. 校验字段存在
-4. 从 newFields 列表中移除
-5. 校验至少保留一个字段
-```
-
-**为什么嵌套列删除不校验分区键和主键？**（第 876-878 行 `if (change.fieldNames().length > 1) return`）因为分区键和主键只能是顶层列，嵌套列不可能是分区键或主键。
-
-### 5.5 UpdateColumnType 处理流程
-
-```
-UpdateColumnType 处理流程:
-1. 校验不能更新分区键类型
-2. 校验不能更新主键类型
-3. 获取字段在嵌套深度处的根类型 (getRootType)
-4. 处理 keepNullability:
-   - true: 保持原可空性
-   - false: 使用新类型的可空性，但需要通过 assertNullabilityChange 校验
-5. 校验类型转换可行性:
-   - DataTypeCasts.supportsCast() 检查转换规则
-   - CastExecutors.resolve() 确认存在对应的运行时转换器
-6. 如果是嵌套在 ARRAY/MAP 中的类型，通过 getArrayMapTypeWithTargetTypeRoot 递归重建类型树
-```
-
-**`getRootType` 和 `getArrayMapTypeWithTargetTypeRoot` 的配合**：
-
-```java
-// 例如: ARRAY<MAP<STRING, ARRAY<INT>>>
-// 要把 INT 改为 BIGINT
-// updateFieldNames = [v, element, value, element]
-// maxDepth = 4
-
-// getRootType 递归"向下钻取"到 INT
-// getArrayMapTypeWithTargetTypeRoot 递归"向上重建" ARRAY<MAP<STRING, ARRAY<BIGINT>>>
-```
-
-**为什么不能更新分区键和主键的类型？**
-- 分区键类型改变会导致分区路径计算方式变化，旧分区数据无法正确读取
-- 主键类型改变会导致 LSM 树的排序和查找逻辑不一致
-
-### 5.6 嵌套列修改机制 (NestedColumnModifier)
-
-`NestedColumnModifier` 是一个抽象内部类，通过模板方法模式处理嵌套列的定位和修改：
-
-```java
-private abstract static class NestedColumnModifier {
-    private final String[] updateFieldNames;  // 嵌套路径
-    
-    // 核心方法：递归定位到目标层级
-    private void updateIntermediateColumn(
-        List<DataField> newFields, List<DataField> previousFields, 
-        int depth, int prevDepth) {
-        if (depth == updateFieldNames.length - 1) {
-            updateLastColumn(depth, newFields, updateFieldNames[depth]);
-            return;
-        }
-        // 递归向下：
-        // 1. 找到当前层级对应的字段
-        // 2. extractRowDataFields 提取子字段列表
-        // 3. 递归进入下一层级
-        // 4. 用修改后的子字段列表重建当前字段
-    }
-    
-    // 子类实现具体的修改逻辑
-    protected abstract void updateLastColumn(
-        int depth, List<DataField> newFields, String fieldName);
-}
-```
-
-**`extractRowDataFields` 方法的深度处理**：
-
-```java
-private int extractRowDataFields(DataType type, List<DataField> nestedFields) {
-    switch (type.getTypeRoot()) {
-        case ROW:    nestedFields.addAll(((RowType) type).getFields()); return 1;
-        case ARRAY:  return extractRowDataFields(((ArrayType) type).getElementType(), nestedFields) + 1;
-        case MAP:    return extractRowDataFields(((MapType) type).getValueType(), nestedFields) + 1;
-        default:     return 1;
-    }
-}
-```
-
-**为什么 ARRAY 和 MAP 需要额外的深度处理？** 在 Flink 中，ARRAY 类型的元素通过虚拟字段名 `element` 引用，MAP 类型的值通过虚拟字段名 `value` 引用。例如，修改 `ARRAY<ROW<a INT>>` 中的 `a` 字段，updateFieldNames 会是 `[col, element, a]`。但 ARRAY 本身没有 DataField 结构，所以需要跳过 ARRAY/MAP 层级，直接到达内部的 ROW 类型。
-
-### 5.7 选项重命名级联更新
-
-当重命名列时，相关的表选项也需要同步更新。`applyRenameColumnsToOptions` 方法处理了三类选项：
-
-**Case 1: 固定 key，value 含字段名**
-
-```java
-// bucket-key, sequence.field
-String bucketKeysStr = options.get(BUCKET_KEY.key());
-// "col_a,col_b" -> "col_a_new,col_b" (如果 col_a 被重命名为 col_a_new)
-```
-
-**Case 2: key 含字段名，value 不含**
-
-```java
-// fields.{fieldName}.aggregate-function, fields.{fieldName}.ignore-retract 等
-// "fields.col_a.aggregate-function" -> "fields.col_a_new.aggregate-function"
-```
-
-**Case 3: key 和 value 都含字段名**
-
-```java
-// fields.{fieldNames}.sequence-group = {fieldNames}
-// fields.{fieldNames}.nested-key = {fieldNames}
-```
-
-**为什么需要级联更新选项？** 如果只重命名了列但不更新选项中的列名引用，相关功能（如聚合函数、序列字段）会因为找不到对应列而失效。这种级联更新保证了重命名操作的完整性。
+**⑤ 收益与代价**　收益：单条 ALTER 内多变更原子、嵌套与级联自动处理、用户心智负担低。代价：嵌套深时递归定位有 CPU 成本（深层嵌套类型上频繁改类型应避免）。
 
 ---
 
 ## 6. 列操作约束体系
 
-### 6.1 分区键约束
+**① 要解决什么问题**　读时演进的正确性建立在一组"不能碰"的红线上：碰了分区键名会让旧分区路径失效、碰了主键类型会让 LSM 排序错乱、把 nullable 强转 NOT NULL 会让旧 null 违约。约束就是把这些会破坏正确性的变更在 `generateTableSchema` 阶段提前拦下。
 
-| 操作 | 是否允许 | 源码位置 | 原因 |
-|------|---------|---------|------|
-| 重命名分区键 | **禁止** | `assertNotUpdatingPartitionKeys` L887-898 | 分区路径依赖列名 |
-| 删除分区键 | **禁止** | `dropColumnValidation` L874-885 | 破坏分区结构 |
-| 更新分区键类型 | **禁止** | `assertNotUpdatingPartitionKeys` L887-898 | 分区路径计算方式变化 |
-| 更新分区键可空性 | 允许 | - | 不影响分区路径 |
-| 更新分区键注释 | 允许 | - | 纯元数据操作 |
+### 6.1 分区键 / 主键约束
 
-### 6.2 主键约束
+| 操作 | 普通列 | 分区键 | 主键 | 源码/原因 |
+|------|--------|--------|------|-----------|
+| 重命名 | 允许 | **禁** | 允许 | 分区路径含列名（`dt=…`），`assertNotUpdatingPartitionKeys` |
+| 删除 | 允许 | **禁** | **禁** | `dropColumnValidation`（`:874`）："Cannot drop partition key or primary key"（`:883`） |
+| 更新类型 | 允许 | **禁** | **禁** | 分区路径计算变 / LSM 排序依赖类型；`assertNotUpdatingPartitionKeys`（`:887`）、`assertNotUpdatingPrimaryKeys`（`:900`） |
+| 改为 nullable | 允许 | 允许 | **禁** | 主键不允许 null |
+| 删除主键约束 | — | — | **仅空表** | `DropPrimaryKey` 改变存储结构，非空表禁（`:559`） |
 
-| 操作 | 是否允许 | 源码位置 | 原因 |
-|------|---------|---------|------|
-| 更新主键类型 | **禁止** | `assertNotUpdatingPrimaryKeys` L900-911 | LSM 树排序依赖类型 |
-| 删除主键列 | **禁止** | `dropColumnValidation` L874-885 | 破坏数据唯一性约束 |
-| 主键改为 nullable | **禁止** | L496-497 | 主键不允许 null 值 |
-| 删除主键约束 | **仅空表允许** | L557-559 | 改变存储结构 |
+> **修正**：旧稿 DropPrimaryKey 报错文案写作 "Cannot drop primary key when the table contains snapshots"；源码实际抛 **"Cannot drop primary keys on a non-empty table."**（`SchemaManager.java:559`）。
 
-### 6.3 类型转换约束
+### 6.2 类型转换与可空性约束
 
-类型转换需要同时满足两个条件：
-
-1. **DataTypeCasts.supportsCast(source, target, allowExplicit)** — 静态规则检查
-2. **CastExecutors.resolve(source, target) != null** — 运行时转换器存在
+**类型转换双关**：UpdateColumnType 必须同时满足两条，缺一即拒：
 
 ```java
+// 静态规则 + 运行时转换器，二者皆备才放行
 checkState(
-    DataTypeCasts.supportsCast(sourceRootType, targetRootType, !disableExplicitTypeCasting)
-    && CastExecutors.resolve(sourceRootType, targetRootType) != null,
-    "Column type %s[%s] cannot be converted to %s without loosing information."
-);
+    DataTypeCasts.supportsCast(srcRoot, tgtRoot, !disableExplicitTypeCasting)
+        && CastExecutors.resolve(srcRoot, tgtRoot) != null,
+    "Column type %s[%s] cannot be converted to %s without loosing information.");
 ```
 
-**为什么需要两重检查？** `DataTypeCasts` 定义的是类型系统层面的转换规则（如 INT -> BIGINT），而 `CastExecutors` 提供的是实际的运行时转换实现。理论上可转换但缺少实现的情况需要被拦截。
+`DataTypeCasts` 管"类型系统层面允不允许"（如 INT→BIGINT），`CastExecutors.resolve` 管"运行时有没有实现"。理论可转但缺实现的（某些 STRING↔BYTES）会被第二关挡住。规则细节见 §13。
 
-### 6.4 可空性约束
+**可空性变更**（`assertNullabilityChange` `SchemaManager.java:640`）：
 
-```java
-// SchemaManager.java L640-653
-private static void assertNullabilityChange(
-    boolean oldNullability, boolean newNullability,
-    String fieldName, boolean disableNullToNotNull) {
-    if (disableNullToNotNull && oldNullability && !newNullability) {
-        throw new UnsupportedOperationException(
-            "Cannot update column type from nullable to non nullable for " + fieldName + "...");
-    }
-}
-```
+| 方向 | 是否允许 | 说明 |
+|------|----------|------|
+| NOT NULL → NULL | 允许 | 安全宽化 |
+| NULL → NOT NULL | **默认禁** | 旧文件若有 null 会违约；设 `alter-column-null-to-not-null.disabled=false` 才开 |
+| 同向（无变化） | 允许 | — |
 
-可空性变更规则：
-- NULL -> NOT NULL: 默认**禁止**，需要设置 `alter-column-null-to-not-null.disabled = false` 开启
-- NOT NULL -> NULL: **允许**（安全的宽化操作）
-- NULL -> NULL 或 NOT NULL -> NOT NULL: **允许**（无变化）
+### 6.3 不可变选项与 bucket / DV 约束
 
-### 6.5 不可变选项约束
-
-通过 `@Immutable` 注解标记的 CoreOptions 不允许在表有数据后修改：
-
-```java
-// CoreOptions.java L4108-4122
-public static final Set<String> IMMUTABLE_OPTIONS =
-    Arrays.stream(CoreOptions.class.getFields())
-        .filter(f -> ConfigOption.class.isAssignableFrom(f.getType())
-                  && f.getAnnotation(Immutable.class) != null)
-        .map(f -> ((ConfigOption<?>) f.get(CoreOptions.class)).key())
-        .collect(Collectors.toSet());
-```
-
-**`checkAlterTableOption` 方法**（L1187-1266）检查的特殊规则：
+部分 `CoreOptions` 标了 `@Immutable`，表一旦有数据就不允许改。`IMMUTABLE_OPTIONS` 通过反射收集所有带 `@Immutable` 注解的 ConfigOption（`CoreOptions.java`）。`checkAlterTableOption`（`SchemaManager.java:1187`）在已有快照时拦截：
 
 | 选项 | 约束 | 原因 |
 |------|------|------|
-| `bucket` | 不允许从 -1 改变；不允许改为 -1 | 动态 bucket 和固定 bucket 是不同的写入模式 |
-| `deletion-vectors.enabled` | 默认禁止改变 | 可能导致数据重复，需先做 full-compaction |
-| `ignore-delete` | 不允许从 true 改为 false | 已丢弃的删除消息无法恢复 |
-| `ignore-update-before` | 不允许从 true 改为 false | 已丢弃的 update-before 消息无法恢复 |
-| `clustering-columns` | 当 `pk-clustering-override` 启用时禁止修改 | 与主键聚簇冲突 |
+| `bucket` | 不能从 -1 改、不能改成 -1（`:1202`/`:1205`） | 动态桶与固定桶是不同写入模式，已有数据无法迁移；reset 也禁 |
+| `deletion-vectors.enabled` | 默认不可改（受 `deletion-vectors.modifiable` 控制，默认 false，`CoreOptions.java:1870`） | 直接关 DV 会让被标删行重新可见 → 数据重复 |
+| `ignore-delete` | 不能 true→false | 已丢弃的 delete 消息无法恢复 |
+| `ignore-update-before` | 不能 true→false | 已丢弃的 update-before 无法恢复 |
 
-### 6.6 删除向量约束
+DV 相关机制详见 **04-DeletionVectors与文件索引**；bucket 模式详见 **01/16**。
 
-```java
-if (DELETION_VECTORS_ENABLED.key().equals(key)) {
-    boolean dvModifiable = Boolean.parseBoolean(
-        options.getOrDefault(DELETION_VECTORS_MODIFIABLE.key(), ...));
-    if (!dvModifiable) {
-        // 禁止修改
-    }
-}
-```
-
-**为什么修改删除向量模式需要谨慎？** 如果在没有做 full-compaction 的情况下关闭删除向量，原来被删除向量标记为删除的行会重新变为可见，导致数据重复。
-
-### 6.7 Bucket 约束
-
-```java
-// checkAlterTableOption L1194-1207
-if (CoreOptions.BUCKET.key().equals(key)) {
-    int oldBucket = oldValue == null ? CoreOptions.BUCKET.defaultValue() : Integer.parseInt(oldValue);
-    int newBucket = Integer.parseInt(newValue);
-    if (oldBucket == -1) throw "Cannot change bucket when it is -1.";
-    if (newBucket == -1) throw "Cannot change bucket to -1.";
-}
-
-// checkResetTableOption L1274-1276
-if (CoreOptions.BUCKET.key().equals(key)) {
-    throw "Cannot reset bucket.";
-}
-```
-
-**为什么 bucket=-1（动态 bucket）不能和固定 bucket 互转？** 动态 bucket 模式使用完全不同的数据分布策略（基于 hash 动态分配），已有数据的 bucket 分配无法自动迁移。
-
-### 6.8 完整约束汇总表
+### 6.4 完整约束汇总表
 
 ```
-┌─────────────────┬──────────┬──────────┬──────────┬──────────┬──────────┐
-│      操作        │ 普通列   │ 分区键   │ 主键     │ BLOB列   │ 嵌套列   │
-├─────────────────┼──────────┼──────────┼──────────┼──────────┼──────────┤
-│ AddColumn       │ √(NULL)  │ -        │ -        │ √(NULL)  │ √(NULL)  │
-│ RenameColumn    │ √        │ ✗        │ √        │ ✗        │ √        │
-│ DropColumn      │ √        │ ✗        │ ✗        │ √        │ √        │
-│ UpdateType      │ √(1)(2)  │ ✗        │ ✗        │ -        │ √(1)(2)  │
-│ UpdateNullable  │ √(3)     │ √(3)     │ ✗(→NULL) │ √(3)     │ √(3)     │
-│ UpdateComment   │ √        │ √        │ √        │ √        │ √        │
-│ UpdateDefault   │ √        │ √        │ √        │ √        │ √        │
-│ UpdatePosition  │ √        │ √        │ √        │ √        │ -        │
-│ DropPrimaryKey  │ -        │ -        │ 仅空表    │ -        │ -        │
-└─────────────────┴──────────┴──────────┴──────────┴──────────┴──────────┘
+操作 \ 列类别     普通列    分区键    主键      BLOB列    嵌套列
+AddColumn        √(NULL)   -         -         √(NULL)   √(NULL)
+RenameColumn     √         ✗         √         ✗         √
+DropColumn       √         ✗         ✗         √         √
+UpdateType       √(双关)   ✗         ✗         -         √(双关)
+UpdateNullable   √(†)      √(†)      ✗(→NULL)  √(†)      √(†)
+UpdateComment    √         √         √         √         √
+UpdateDefault    √         √         √         √         √
+UpdatePosition   √         √         √         √         -
+DropPrimaryKey   -         -         仅空表    -         -
 
-(1) 需通过 DataTypeCasts 转换检查
-(2) 需存在对应的 CastExecutor
-(3) NULL→NOT NULL 默认禁止，可配置开启
-√(NULL) = 只允许 nullable 类型
+√(NULL) = 仅允许 nullable 类型
+双关     = 过 DataTypeCasts.supportsCast + CastExecutors.resolve
+(†)      = NULL→NOT NULL 默认禁，可配置开启
 ```
 
 ---
 
-## 7. SchemaValidation 全面验证
+## 7. SchemaValidation：提交前的全面验证
 
-**源码位置**: `paimon-core/src/main/java/org/apache/paimon/schema/SchemaValidation.java`
+**① 要解决什么问题**　§6 的约束防住"变更本身合不合法"，但还有一类问题是"整张新 schema 作为整体合不合法"：主键是否都是原始类型、聚合函数配的列存不存在、列名是否撞了系统保留字、fallback 分支 schema 是否兼容。这些在 `commit` 写盘前由 `SchemaValidation` 统一兜底。
 
-### 7.1 建表时验证
+**源码位置**：`paimon-core/.../schema/SchemaValidation.java`。`validateTableSchema` 在每次 `commit`（`SchemaManager.java:1084`）被调用——**无论建表还是变更都过这一关**，所以它是 schema 正确性的最后防线。
 
-`validateTableSchema` 方法在每次 Schema 提交前被调用（`SchemaManager.commit` 第 1084 行），执行以下验证：
+**③ 关键校验项**（`validateTableSchema` 覆盖，节选要点）：
 
-1. **主键、分区键、upsert-key 只能包含原始类型**（不允许 Map、Array、Row、Multiset）
-2. **upsert-key 和 primary-key 不能同时定义**
-3. **Bucket 配置验证**
-4. **启动模式验证**（scan-mode 与 scan-timestamp、scan-snapshot-id 的一致性）
-5. **fields 前缀选项验证**（聚合函数配置的有效性）
-6. **序列字段验证**
-7. **合并函数验证**
-8. **Changelog 生产者与主键的一致性**
-9. **快照保留配置的合理性**（min <= max）
-10. **文件格式与列类型的兼容性**
-11. **列名不能是系统保留字段**（`_KEY_`、`_VALUE_STATS` 等）
-12. **列名不能以 `_KEY_` 前缀开头**
-13. **删除向量配置验证**
-14. **向量字段类型验证**（必须是 VECTOR 类型）
-15. **Row Tracking 验证**
-16. **增量聚簇验证**
-17. **Chain Table 验证**
+- 主键、分区键、upsert-key **只能是原始类型**（不许 Map/Array/Row/Multiset）；upsert-key 与 primary-key 不能并存；
+- bucket 配置、启动模式（`scan-mode` 与 `scan-timestamp`/`scan-snapshot-id` 的一致性）；
+- `fields.*` 前缀选项有效性、序列字段、合并函数、changelog-producer 与主键的一致性；
+- 快照保留 `min <= max`、文件格式与列类型兼容；
+- **列名不能是系统保留字**（`_KEY_`、`_VALUE_STATS` 等）、不能以 `_KEY_` 前缀开头；
+- 删除向量配置、向量字段类型、Row Tracking、增量聚簇、Chain Table 等专项校验。
 
-### 7.2 变更时验证
+**Fallback Branch 校验**（`validateFallbackBranch`）：① `scan.fallback-branch` 与 `scan.primary-branch` 不能同设；② **fallback 分支的字段名必须是当前 schema 字段名的超集**。原因：fallback 机制在主分支读不到数据时回退备用分支，备用分支若缺字段，回退读取会出错。
 
-在 `generateTableSchema` 执行过程中，对每种变更类型有针对性的验证（参见第 6 节的约束体系）。
-
-### 7.3 Fallback Branch 验证
-
-```java
-// SchemaValidation.java L289-310
-public static void validateFallbackBranch(SchemaManager schemaManager, TableSchema schema) {
-    // 1. scan.fallback-branch 和 scan.primary-branch 不能同时设置
-    // 2. Fallback 分支的 Schema 字段名必须是当前 Schema 字段名的超集
-}
-```
-
-**为什么要校验 Fallback Branch 的 Schema？** Fallback Branch 机制允许从主分支读不到数据时回退到备用分支。如果备用分支的 Schema 缺少主分支的字段，回退读取时会出错。
+**④ 边界**　`validateTableSchema` 是"整体校验"、`generateTableSchema` 里的约束是"逐变更校验"，二者互补：前者可能因某条历史变更累积出的非法组合而失败，即使每条变更单看都合法。
 
 ---
 
-## 8. Schema Evolution 在读路径的影响
+## 8. 读路径上的 Schema Evolution
 
-### 解决什么问题
+**① 要解决什么问题**　这是整个 Schema 演进的"兑现"环节：表加了列/改了类型/重命名后，那些**用旧 schema 写下、再也不重写**的数据文件，怎么按当前 schema 正确读出来？要解决四件事——旧文件无新列（补 null）、列重命名（认 ID 不认名）、类型变了（运行时转换）、查询谓词怎么下推到旧文件。
 
-**核心业务问题**：
-1. **旧数据文件如何适配新 Schema**：表新增了列，如何读取不包含该列的旧数据文件？
-2. **列重命名后数据关联**：列从 `old_name` 改为 `new_name`，如何正确读取旧文件中的数据？
-3. **类型变更的运行时转换**：列从 INT 改为 BIGINT，如何在读取时自动转换？
-4. **查询谓词的 Schema 适配**：`WHERE new_column = 1` 如何下推到不包含 `new_column` 的旧文件？
+**源码位置**：`paimon-core/.../schema/SchemaEvolutionUtil.java`。核心思想是**读时演进（schema-on-read）**：旧文件原样不动，读时按字段 ID 动态构建"位置映射 + 类型转换"。
 
-**没有这个设计的后果**：
-- 每次 Schema 变更都需要重写全部历史数据（PB 级数据重写耗时数天）
-- 列重命名后旧数据无法读取，导致数据丢失
-- 类型变更后读取旧数据时类型不匹配，查询报错
-- 查询性能下降（无法利用旧文件的统计信息做谓词下推）
+**② 设计原理与取舍**
 
-**实际场景**：
-```sql
--- 初始 Schema (schema-0): id INT, name STRING, age INT
-INSERT INTO t VALUES (1, 'Alice', 25);  -- 写入 file-1.parquet
+| 方案 | 写时演进（重写旧文件对齐） | **读时演进（Paimon）** |
+|------|--------------------------|----------------------|
+| schema 变更耗时 | 与数据量正相关（PB 级要数天） | 秒级（只写 schema JSON） |
+| 写入阻塞 | 变更期间阻塞 | 不阻塞 |
+| 读取开销 | 零（已对齐） | 索引映射 + 类型转换（恒等时退化为零） |
+| 旧空间回收 | 立即 | 惰性（compaction 时） |
 
--- 变更1: 新增列 (schema-1)
-ALTER TABLE t ADD COLUMN city STRING;
-INSERT INTO t VALUES (2, 'Bob', 30, 'Beijing');  -- 写入 file-2.parquet
-
--- 变更2: 修改类型 (schema-2)
-ALTER TABLE t MODIFY COLUMN age BIGINT;
-
--- 查询: SELECT id, name, age, city FROM t WHERE age > 20;
--- file-1: 需要映射 [id, name, age, null(city)]，age 从 INT 转为 BIGINT
--- file-2: 需要映射 [id, name, age, city]，age 已是 BIGINT 无需转换
-```
-
-### 有什么坑
-
-**误区陷阱**：
-1. **误以为读时演进没有性能开销**：实际上索引映射和类型转换都有 CPU 开销
-2. **误以为所有类型变更都能自动转换**：只有通过 `DataTypeCasts` 检查的转换才支持
-3. **误以为删除列后数据会立即释放**：旧文件仍包含该列数据，只是读取时被忽略
-4. **误以为谓词下推对所有文件都有效**：新增列的过滤条件无法下推到旧文件
-
-**错误配置**：
-```java
-// 错误1: 修改类型后未提供 CastExecutor
-ALTER TABLE t MODIFY COLUMN data BYTES;  // 从 STRING 改为 BYTES
-// 报错: No CastExecutor found for STRING -> BYTES
-// 原因: DataTypeCasts 允许转换，但 CastExecutors 未实现
-
-// 错误2: 期望删除列后立即释放存储
-ALTER TABLE t DROP COLUMN large_blob;
-// 实际: 旧文件仍占用空间，需要 compaction 才能真正删除
-// 解决: 执行 CALL sys.compact('db.t')
-```
-
-**生产环境注意事项**：
-1. **类型转换的性能开销**：INT -> BIGINT 转换在大规模查询时会消耗 CPU，建议批量变更后做 compaction
-2. **索引映射的内存开销**：每个数据文件都需要构建 `IndexCastMapping`，文件数多时占用内存
-3. **嵌套类型的 Cast 链深度**：`ROW<ARRAY<MAP<STRING, INT>>>` 的类型转换需要递归构建，性能开销大
-4. **谓词下推失效**：新增列的过滤条件无法利用旧文件的统计信息，导致全表扫描
-
-**性能陷阱**：
-```java
-// 陷阱1: 频繁 Schema 变更导致读取性能下降
-// 每次查询都需要为每个文件构建 IndexCastMapping
-// 建议: 批量变更后执行 compaction，统一 Schema 版本
-
-// 陷阱2: 深层嵌套类型的类型转换
-// ROW<ARRAY<MAP<STRING, INT>>> 中 INT -> BIGINT
-// 需要递归构建 MapCastExecutor -> ArrayCastExecutor -> CastExecutor
-// 建议: 避免在深层嵌套类型上频繁修改类型
-
-// 陷阱3: 大量删除列后的读取开销
-// 表原有100个列，删除了90个，只保留10个
-// 读取旧文件时仍需解析100个列，然后丢弃90个
-// 建议: 执行 compaction 重写数据文件
-```
-
-### 核心概念解释
-
-**术语定义**：
-1. **索引映射 (Index Mapping)**：
-   - 将当前 Schema 的字段索引映射到数据文件 Schema 的字段索引
-   - 基于字段 ID 而非字段名进行匹配
-   - 不存在的字段映射到 `NULL_FIELD_INDEX = -1`
-
-2. **IndexCastMapping**：
-   - 包含索引映射和类型转换两部分
-   - `int[] indexMapping`：字段位置映射
-   - `CastFieldGetter[] castMapping`：字段类型转换器
-
-3. **CastExecutor**：
-   - 运行时类型转换器，将源类型值转换为目标类型值
-   - 例如：`IntToBigIntCastExecutor` 将 int 转为 long
-   - 支持嵌套类型的递归转换（RowCastExecutor、ArrayCastExecutor）
-
-4. **谓词退化 (Predicate Devolution)**：
-   - 将基于当前 Schema 的过滤条件"退化"到数据文件 Schema
-   - 字段名、字段索引、字面量类型都需要适配
-   - 新增列的过滤条件可能被丢弃（无法下推）
-
-5. **恒等映射优化 (Identity Mapping Optimization)**：
-   - 当索引映射是 `[0, 1, 2, ...]` 时返回 `null`
-   - 避免不必要的内存分配和间接访问
-   - 读路径上的重要性能优化
-
-**概念关系**：
-```
-读取流程:
-  查询请求 (当前 Schema)
-      ↓
-  SchemaEvolutionUtil.createIndexCastMapping()
-      ├── createIndexMapping()  → int[] indexMapping
-      └── createCastFieldGetterMapping()  → CastFieldGetter[] castMapping
-      ↓
-  IndexCastMapping
-      ├── getIndexMapping()  → 字段位置重排
-      └── getCastMapping()   → 字段类型转换
-      ↓
-  ProjectedRow (字段重排) + CastedRow (类型转换)
-      ↓
-  最终结果行
-```
-
-**与其他系统对比**：
-| 系统 | 字段匹配方式 | 类型转换 | 谓词下推适配 |
-|------|------------|---------|------------|
-| Paimon | 字段 ID | CastExecutor | devolveFilters |
-| Iceberg | 字段 ID | 内置转换器 | 谓词重写 |
-| Hudi | 字段名 | Avro Schema Evolution | 有限支持 |
-| Delta Lake | 字段名 | Spark 类型转换 | 有限支持 |
-
-### 设计理念
-
-**为什么这样设计**：
-
-1. **为什么基于字段 ID 而非字段名？**
-   - **权衡**：增加了元数据复杂度（需维护字段 ID），但支持列重命名
-   - **好处**：列重命名不影响数据读取，旧文件仍能正确关联
-   - **业界共识**：Iceberg、Hudi 3.0 都采用字段 ID 方案
-
-2. **为什么选择读时演进而非写时演进？**
-   - **权衡**：读取性能略有下降（索引映射 + 类型转换），但写入无需等待
-   - **好处**：Schema 变更秒级完成，不阻塞写入，适合实时场景
-   - **数据支撑**：读时开销 < 5%（根据 Iceberg 论文），可接受
-
-3. **为什么需要恒等映射优化？**
-   - **权衡**：增加了判断逻辑，但节省了内存和间接访问开销
-   - **好处**：无 Schema 变更的表（大多数情况）零开销
-   - **实际效果**：避免了每个文件分配 `int[]` 数组
-
-4. **为什么谓词退化时可以丢弃新增列的过滤条件？**
-   - **权衡**：可能导致读取更多数据（无法提前过滤），但保证了正确性
-   - **好处**：简化了实现，避免了复杂的谓词重写逻辑
-   - **实际影响**：新增列通常没有统计信息，下推效果有限
-
-**架构演进**：
-```
-早期版本:
-  └── 仅支持顶层字段的索引映射
-
-当前版本:
-  ├── 支持嵌套类型的递归映射
-  ├── 支持复杂类型转换（ROW、ARRAY、MAP）
-  ├── 支持谓词退化
-  └── 恒等映射优化
-```
-
-**业界对比**：
-- **Iceberg**：同样基于字段 ID，但类型转换规则更严格（只允许安全宽化）
-- **Hudi**：基于字段名，列重命名需要重写数据，但实现更简单
-- **Delta Lake**：基于字段名 + 位置，灵活性较差
-
----
-
-Schema Evolution 的核心思想是**读时演进**：旧数据文件保持不变，在读取时动态适配当前 Schema。
-
-**源码位置**: `paimon-core/src/main/java/org/apache/paimon/schema/SchemaEvolutionUtil.java`
+Paimon 选读时演进，把成本从"变更时一次性巨额"挪到"读取时分摊的小额"，且用**恒等映射优化**让没演进的文件零开销。一句话：**演进的代价不该由写入承担，而该由真正读到旧文件的查询按需分摊。**
 
 ### 8.1 基于字段 ID 的索引映射
 
-这是 Schema Evolution 在读路径上最关键的机制：
+**③ 关键源码**　`createIndexMapping`（`SchemaEvolutionUtil.java:80`）把"当前表字段下标"映射到"数据文件字段下标"，按字段 ID 匹配：
 
 ```java
-// SchemaEvolutionUtil.java L80-104
-public static int[] createIndexMapping(
-    List<DataField> tableFields,   // 当前表的 Schema 字段
-    List<DataField> dataFields) {  // 数据文件写入时的 Schema 字段
-    
-    int[] indexMapping = new int[tableFields.size()];
-    Map<Integer, Integer> fieldIdToIndex = new HashMap<>();
-    for (int i = 0; i < dataFields.size(); i++) {
-        fieldIdToIndex.put(dataFields.get(i).id(), i);  // 按字段ID建索引
-    }
-    
-    for (int i = 0; i < tableFields.size(); i++) {
-        int fieldId = tableFields.get(i).id();
-        Integer dataFieldIndex = fieldIdToIndex.get(fieldId);
-        if (dataFieldIndex != null) {
-            indexMapping[i] = dataFieldIndex;
-        } else {
-            indexMapping[i] = NULL_FIELD_INDEX;  // -1: 数据文件中不存在此字段
-        }
-    }
-    
-    // 优化：如果映射是恒等映射（0,1,2,...），返回 null 表示不需要映射
-    for (int i = 0; i < indexMapping.length; i++) {
-        if (indexMapping[i] != i) return indexMapping;
-    }
-    return null;
+// SchemaEvolutionUtil.java:80  节选
+for (DataField f : dataFields) fieldIdToIndex.put(f.id(), index++);  // 文件字段: id→下标
+for (int i = 0; i < tableFields.size(); i++) {
+    Integer di = fieldIdToIndex.get(tableFields.get(i).id());
+    indexMapping[i] = (di != null) ? di : NULL_FIELD_INDEX;          // -1 = 文件里没有此列
 }
+// 若结果是 [0,1,2,...] 恒等映射，返回 null（不需要重排）
 ```
 
-**示例**：
+`NULL_FIELD_INDEX = -1`（`:60`）。映射结果示例：
 
-| 场景 | 当前表 Schema | 数据文件 Schema | 索引映射 |
-|------|-------------|----------------|---------|
-| 无变化 | `1->a, 2->b, 3->c` | `1->a, 2->b, 3->c` | `null`（恒等） |
-| 添加了列 | `1->a, 2->b, 3->c, 4->d` | `1->a, 2->b, 3->c` | `[0, 1, 2, -1]` |
-| 删除了列 | `1->a, 3->c` | `1->a, 2->b, 3->c` | `[0, 2]` |
-| 重命名了列 | `1->x, 2->b, 3->c` | `1->a, 2->b, 3->c` | `null`（ID未变，恒等） |
-| 重排了列 | `3->c, 1->a, 2->b` | `1->a, 2->b, 3->c` | `[2, 0, 1]` |
+| 场景 | 当前表（id→列） | 数据文件（id→列） | 映射 |
+|------|----------------|------------------|------|
+| 无变化 | `1→a,2→b,3→c` | `1→a,2→b,3→c` | `null`（恒等） |
+| 加了列 d | `1→a,2→b,3→c,4→d` | `1→a,2→b,3→c` | `[0,1,2,-1]` |
+| 删了列 b | `1→a,3→c` | `1→a,2→b,3→c` | `[0,2]` |
+| 重命名 a→x | `1→x,2→b,3→c` | `1→a,2→b,3→c` | `null`（ID 没变，恒等！） |
+| 重排 | `3→c,1→a,2→b` | `1→a,2→b,3→c` | `[2,0,1]` |
 
-**为什么基于字段 ID 而非字段名？** 如果使用字段名，列重命名后就无法关联旧数据。字段 ID 是全局唯一且稳定的，只在添加列时分配，永不复用。这是 Paimon、Iceberg 等现代 Lake Format 的共同设计选择。
+**为什么基于 ID**：第 4 行重命名场景一眼说明——列名变了但 ID 没变，映射仍是恒等，旧数据零成本读出。这正是字段 ID 方案的价值兑现点。**恒等映射优化**（返回 null）让绝大多数"没演进过"的文件免去 `int[]` 分配和间接寻址，是读路径的关键省钱处。
 
-**恒等映射优化**: 当索引映射是 `[0, 1, 2, ...]` 时返回 `null`，避免不必要的内存分配和间接访问。这是读路径上的重要性能优化。
+### 8.2 IndexCastMapping 与类型转换链
 
-### 8.2 IndexCastMapping 机制
-
-除了位置映射，还需要处理类型变更（如 INT -> BIGINT）：
+位置映射只解决"列在哪"，类型变更（INT→BIGINT）还要"值怎么转"。`createIndexCastMapping`（`:107`）把二者打包：
 
 ```java
-// SchemaEvolutionUtil.java L107-125
-public static IndexCastMapping createIndexCastMapping(
-    List<DataField> tableFields, List<DataField> dataFields) {
-    int[] indexMapping = createIndexMapping(tableFields, dataFields);
-    CastFieldGetter[] castMapping = 
-        createCastFieldGetterMapping(tableFields, dataFields, indexMapping);
-    return new IndexCastMapping() { ... };
-}
+// SchemaEvolutionUtil.java:107
+int[] indexMapping = createIndexMapping(tableFields, dataFields);
+CastFieldGetter[] castMapping = createCastFieldGetterMapping(tableFields, dataFields, indexMapping);
 ```
 
-`CastFieldGetter` 数组中每个元素包含：
-- **FieldGetter**: 从数据行中获取字段值的方法
-- **CastExecutor**: 将旧类型值转换为新类型值的执行器
+`CastFieldGetter` = `FieldGetter`（怎么从行取值）+ `CastExecutor`（怎么把旧类型值转新类型值）。若所有字段类型都匹配，`castMapping` 返回 null，跳过运行时转换开销——又一处恒等优化。
 
-如果没有类型变更（所有字段类型都匹配），`castMapping` 返回 `null`，避免运行时的类型转换开销。
+### 8.3 谓词退化与嵌套 Cast 链
 
-### 8.3 谓词下推的 Schema 适配
+**谓词退化**（`devolveFilters` `:140`）：查询谓词基于**当前** schema，但要下推到按**旧** schema 写的文件。处理：按字段 ID 找到旧文件里的列；新增列（旧文件没有）的谓词按 `keepNewFieldFilter` 决定保留/丢弃；字面量值从新类型转回旧类型；用旧文件的下标/名/类型重建谓词。为什么转字面量：旧文件里 age 还是 INT，而当前 schema 已是 BIGINT，谓词里的 BIGINT 字面量要转成 INT 才能和旧文件统计/值正确比较。新增列谓词常因旧文件无统计而下推无效，丢弃它换取实现简洁（代价是多读些数据，正确性不受影响）。
 
-当表的 Schema 发生变化后，查询时的过滤条件需要"退化"到数据文件写入时的 Schema 版本：
+**嵌套 Cast 链**（`createCastExecutor` `:252`）：ROW/ARRAY/MAP 递归构建转换器——同类型 ROW 递归处理内部字段、ARRAY 处理元素、MAP 处理 value。**MAP 的 key 类型不允许变**（查找依赖 key 一致）。ROW 的转换分两步：`ProjectedRow`（字段重排）+ `CastedRow`（类型转换）。
 
-```java
-// SchemaEvolutionUtil.java L140-187
-public static List<Predicate> devolveFilters(
-    List<DataField> tableFields,    // 当前表 Schema
-    List<DataField> dataFields,     // 数据文件 Schema
-    List<Predicate> filters,
-    boolean keepNewFieldFilter) {
-    // 对每个过滤谓词：
-    // 1. 通过字段 ID 找到数据文件中对应的字段
-    // 2. 如果字段不存在（新增列）：
-    //    - keepNewFieldFilter=true: 保留谓词（需后续处理）
-    //    - keepNewFieldFilter=false: 丢弃谓词
-    // 3. 将字面量值从新类型转换为旧类型
-    // 4. 用数据文件中的字段索引、名称、类型重建谓词
-}
-```
+### 8.4 schemaId：数据文件与快照的锚点
 
-**为什么需要"退化"过滤器？** 数据文件中的列可能类型不同（如旧文件中是 INT，新 Schema 中已改为 BIGINT），过滤条件中的字面量需要转换为数据文件中的类型才能正确比较。
+读时演进能跑起来，靠两处记录了"按哪个 schema 写的"：
 
-### 8.4 嵌套类型的 Cast 链
+- **DataFileMeta**：每个数据文件元数据带 `_SCHEMA_ID` 字段（`DataFileMeta` 字段定义）。读文件时据此 `SchemaManager.schema(id)` 加载写入时的 schema，才能与当前 schema 比对建映射。
+- **Snapshot**：每个快照带 `schemaId`（`Snapshot.java`）。作用：确定该快照的整体 schema 上下文、时间旅行查询取对应时点 schema、Schema Rollback 时判断哪些 schema 版本被引用（§11）。
 
-对于嵌套类型（ROW、ARRAY、MAP），Schema Evolution 需要递归构建 Cast 链：
+时间旅行/版本管理详见 **17-时间旅行与版本管理**。
 
-```java
-// SchemaEvolutionUtil.java L252-268
-private static CastExecutor<?, ?> createCastExecutor(DataType inputType, DataType targetType) {
-    if (targetType.equalsIgnoreNullable(inputType)) {
-        return CastExecutors.identityCastExecutor();  // 无需转换
-    } else if (inputType instanceof RowType && targetType instanceof RowType) {
-        return createRowCastExecutor(...);  // 递归处理 ROW 内部字段
-    } else if (inputType instanceof ArrayType && targetType instanceof ArrayType) {
-        return createArrayCastExecutor(...);  // 处理数组元素类型变更
-    } else if (inputType instanceof MapType && targetType instanceof MapType) {
-        return createMapCastExecutor(...);  // 处理 Map 值类型变更
-    } else {
-        return CastExecutors.resolve(inputType, targetType);  // 原始类型转换
-    }
-}
-```
-
-**ROW 类型的 Cast 链**包括两步：
-1. **ProjectedRow**: 处理字段位置映射（新增/删除/重排）
-2. **CastedRow**: 处理字段类型转换
-
-**MAP 类型的约束**: Key 类型不允许变更（第 304-308 行），因为 Map 的 key 需要保持一致才能正确查找。
-
-### 8.5 DataFileMeta 中的 schemaId
-
-每个数据文件都记录了写入时的 Schema 版本：
-
-```java
-// DataFileMeta.SCHEMA 第 75 行
-new DataField(9, "_SCHEMA_ID", new BigIntType(false))
-```
-
-**为什么数据文件需要记录 schemaId？** 读取数据文件时，需要知道该文件是按哪个 Schema 版本写入的，才能正确构建索引映射和类型转换链。通过 `DataFileMeta.schemaId()` 可以从 `SchemaManager` 中加载对应版本的 Schema。
-
-### 8.6 Snapshot 与 Schema 的关系
-
-每个 Snapshot 也记录了提交时的 Schema 版本：
-
-```java
-// Snapshot.java 第 80 行
-@JsonProperty(FIELD_SCHEMA_ID)
-protected final long schemaId;
-```
-
-**Snapshot.schemaId 的作用**：
-1. 确定该快照数据的整体 Schema 上下文
-2. Schema Rollback 时检查哪些 Schema 版本被快照引用
-3. 时间旅行查询时使用对应时间点的 Schema
+**⑤ 收益与代价**　收益：变更秒级、不阻塞写、列重命名零成本、恒等优化让无演进文件零开销。代价：读到"演进过且类型变了"的旧文件时有映射 + 转换 CPU 开销；schema 版本/文件越杂开销越分散，靠 compaction 收敛。
 
 ---
 
-## 9. CDC 自动 Schema 演进 (SchemaMergingUtils)
+## 9. CDC 自动 Schema 演进（SchemaMergingUtils）
 
-### 解决什么问题
+**① 要解决什么问题**　CDC 同步时上游（MySQL/Kafka）表结构会变：新增字段、类型宽化、多源 Topic schema 不一致。需要 Paimon **自动**把目标 schema 合并进当前 schema，而不是写入失败、等人工 ALTER。
 
-**核心业务问题**：
-1. **上游数据源 Schema 自动同步**：MySQL 表新增字段后，Paimon 表如何自动感知并更新？
-2. **多源数据合并**：从多个 Kafka Topic 读取数据，Schema 不完全一致，如何合并？
-3. **类型兼容性判断**：上游 INT 类型，下游 BIGINT 类型，是否可以自动合并？
-4. **字段 ID 自动分配**：新增字段如何分配 ID，避免与已删除字段冲突？
+> 本节只讲**演进引擎本身**（合并算法、ID 分配、委托机制）。CDC 同步作业怎么调用它、整库同步链路、字段过滤等**应用层**内容是 **14-局部列更新与CDC数据集成** 的主场，详见之。
 
-**没有这个设计的后果**：
-- CDC 同步时上游表结构变更，Paimon 写入失败，需要人工干预
-- 多源数据合并时 Schema 不一致，导致数据丢失或类型错误
-- 字段 ID 分配冲突，导致数据读取时列错位
-- 需要外部工具（如 Flink CDC）手动检测 Schema 差异并生成 ALTER TABLE 语句
+**源码位置**：`paimon-core/.../schema/SchemaMergingUtils.java`。
 
-**实际场景**：
-```sql
--- 场景1: MySQL 表新增字段
--- MySQL: ALTER TABLE users ADD COLUMN phone VARCHAR(20);
--- Paimon CDC 同步作业自动检测到变更，执行:
--- ALTER TABLE paimon.users ADD COLUMN phone STRING;
+**② 设计原理与取舍**　CDC 自动演进和手动 ALTER 最终都落到 schema 版本文件，但走两条不同入口：手动 ALTER 走 `SchemaChange` 列表 + `generateTableSchema`；CDC 走 `mergeSchemas`（把整个目标 RowType 合并）。两者通过**委托模式**（§9.4）可以收敛到同一条 `alterTable` 路径，复用全部校验。
 
--- 场景2: 多个 Kafka Topic 合并
--- Topic A: {id: INT, name: STRING, age: INT}
--- Topic B: {id: INT, name: STRING, city: STRING}
--- 合并后: {id: INT, name: STRING, age: INT, city: STRING}
+两个保守策略是安全性的关键取舍：① **合并时保持当前 schema 的 nullability**（不被目标覆盖）——CDC 源的 nullability 常不准，强转 NOT NULL 危险；② **新字段强制 nullable**（`field.copy(true)`）——旧数据无此列只能填 null，与 AddColumn 约束一致。
 
--- 场景3: 类型自动宽化
--- 上游: amount INT
--- 下游: amount BIGINT
--- 自动合并为 BIGINT（兼容 INT）
-```
+### 9.1 mergeSchemas 与递归合并算法
 
-### 有什么坑
+`mergeSchemas`（`SchemaMergingUtils.java:45`）：当前 schema 不变则原样返回；否则递归合并产出 `id+1` 的新 TableSchema。递归核心 `merge`（`:71` 起）：
 
-**误区陷阱**：
-1. **误以为所有类型都能自动合并**：只有兼容类型（如 INT -> BIGINT）才能合并
-2. **误以为 nullability 会自动合并**：实际上保持当前 Schema 的 nullability，新字段强制 nullable
-3. **误以为字段顺序会保持**：新字段追加到末尾，不保证与上游顺序一致
-4. **误以为 Decimal 的 scale 可以不同**：scale 必须相同才能合并
-
-**错误配置**：
 ```java
-// 错误1: 期望 Decimal(10,2) 和 Decimal(10,3) 自动合并
-// 上游: amount DECIMAL(10,2)
-// 下游: amount DECIMAL(10,3)
-// 报错: Cannot merge decimal types with different scales
-// 原因: scale 不同代表不同的精度语义
-
-// 错误2: 期望 STRING 和 INT 自动合并
-// 上游: id STRING
-// 下游: id INT
-// 报错: Cannot merge incompatible types
-// 原因: 不在兼容类型列表中
-
-// 错误3: 期望删除字段后自动同步
-// 上游: 删除了 old_column
-// 下游: old_column 仍然存在
-// 原因: SchemaMergingUtils 只处理新增和类型变更，不处理删除
+// SchemaMergingUtils.java:98  比较时统一忽略 nullability
+DataType base = base0.copy(true);
+DataType update = update0.copy(true);
+// 相等→返回 base（保留原 nullability）
+// 都是 RowType→已有字段递归 merge；base 独有保留；update 独有追加(分配新 ID + 强制 nullable, :140-141)
+// MapType→分别 merge key/value；ArrayType/MultisetType→merge 元素
+// DecimalType→scale 必须相同，precision 取大
+// 可转换原始类型→非显式转换要求新类型属性(length/precision) >= 旧
+// 否则报错
 ```
 
-**生产环境注意事项**：
-1. **allowExplicitCast 参数**：设为 true 允许收窄转换（如 BIGINT -> INT），有数据丢失风险
-2. **highestFieldId 递增**：频繁合并会导致 highestFieldId 快速增长，影响元数据大小
-3. **委托模式 vs 直接模式**：Hive Catalog 需要使用委托模式，否则 Metastore 不同步
-4. **合并频率控制**：高频合并会产生大量 Schema 版本，建议批量合并
+**为什么 Decimal 合并要求 scale 相同**：不同 scale 是不同的小数位语义（如金额 `DECIMAL(10,2)` vs `(10,3)`），自动合并会改变数据含义。
 
-**性能陷阱**：
-```java
-// 陷阱1: 每条数据都触发 Schema 合并检查
-// 在 Flink CDC 中，每个 RowData 都调用 mergeSchema()
-// 建议: 缓存上次合并的 Schema，只在检测到差异时才合并
+### 9.2 新字段 ID 分配
 
-// 陷阱2: 大 Schema 的递归合并开销
-// 包含100个字段的 ROW 类型，每次合并都需要递归比较
-// 建议: 避免过深的嵌套结构
+`assignIdForNewField`（`SchemaMergingUtils.java:231`）：先 `ReassignFieldId.reassign` 处理嵌套子字段 ID，再给字段本身发号。顺序保证 `highestFieldId` 在分配后反映所有已发 ID，不与历史删除列冲突（同 §2.2 不变式）。
 
-// 陷阱3: 委托模式的 Catalog 调用开销
-// 每次合并都调用 Catalog.alterTable()，涉及网络请求
-// 建议: 批量收集变更，一次性提交
-```
+### 9.3 diffSchemaChanges 差异检测
 
-### 核心概念解释
+`diffSchemaChanges`（`:245`）比对新旧 schema 产出 `SchemaChange` 列表：新增列→`addColumn`；类型变了且都是 ROW→递归 `diffFields`；否则→`updateColumnType(keepNullability=true)`。它服务于委托模式（§9.4）。
 
-**术语定义**：
-1. **Schema 合并 (Schema Merging)**：
-   - 将两个 Schema 合并为一个兼容的 Schema
-   - 保留两个 Schema 的所有字段（并集）
-   - 类型冲突时选择更宽的类型
+### 9.4 SchemaModification 委托机制
 
-2. **兼容类型 (Compatible Types)**：
-   - 可以安全合并的类型对（如 INT 和 BIGINT）
-   - 通过 `DataTypeCasts.supportsCompatibleCast()` 判断
-   - 比隐式转换更严格（同一类型族内）
+`SchemaManager.mergeSchema`（`SchemaManager.java:719`）两种模式：
 
-3. **类型宽化 (Type Widening)**：
-   - 选择两个类型中更宽的类型作为合并结果
-   - 例如：INT + BIGINT → BIGINT
-   - 例如：CHAR(10) + CHAR(20) → CHAR(20)
+- **直接模式**（`schemaModification == null`）：`commit(update)` 直接写 schema 文件，用于 FileSystemCatalog。
+- **委托模式**：`diffSchemaChanges` 生成变更列表，回调 `schemaModification.alterSchema(changes)` 交给 Catalog 走统一 `alterTable`。用于需要同步外部 Metastore 的场景（如 Hive Catalog 要同步更新 HMS）。
 
-4. **字段 ID 分配 (Field ID Assignment)**：
-   - 新字段从 `highestFieldId + 1` 开始分配
-   - 嵌套类型的子字段递归分配
-   - 通过 `ReassignFieldId.reassign()` 实现
+**④ 风险/陷阱**
 
-5. **委托模式 (Delegation Mode)**：
-   - 生成 SchemaChange 列表交给 Catalog 处理
-   - 适用于需要同步外部 Metastore 的场景
-   - 通过 `SchemaModification.alterSchema()` 回调
-
-**概念关系**：
-```
-合并流程:
-  当前 Schema (base)
-      +
-  目标 Schema (update)
-      ↓
-  mergeSchemas() 递归合并
-      ├── 已有字段: 递归合并类型
-      ├── base 独有字段: 保留
-      └── update 独有字段: 追加（分配新 ID，强制 nullable）
-      ↓
-  新 Schema (id = base.id + 1)
-      ↓
-  委托模式: diffSchemaChanges() → SchemaChange 列表 → Catalog.alterTable()
-  直接模式: SchemaManager.commit()
-```
-
-**与其他系统对比**：
-| 系统 | 自动演进 | 类型合并规则 | 字段 ID 分配 |
-|------|---------|------------|------------|
-| Paimon | 内置 SchemaMergingUtils | Compatible + Implicit | highestFieldId 递增 |
-| Iceberg | 需外部工具 | 仅宽化 | last-column-id 递增 |
-| Hudi | 内置 Schema Evolution | Avro 规则 | 无字段 ID |
-| Delta Lake | 需外部工具 | Spark 规则 | 无字段 ID |
-
-### 设计理念
-
-**为什么这样设计**：
-
-1. **为什么保持 base 的 nullability？**
-   - **权衡**：可能与上游 Schema 的 nullability 不一致，但更安全
-   - **好处**：避免将 nullable 改为 NOT NULL 导致旧数据违反约束
-   - **保守策略**：CDC 数据源的 nullability 信息可能不准确
-
-2. **为什么新字段强制 nullable？**
-   - **权衡**：与上游 Schema 可能不一致，但保证了读时演进的正确性
-   - **好处**：旧数据文件中不存在新字段，只能返回 null
-   - **一致性**：与 AddColumn 的约束保持一致
-
-3. **为什么 Decimal 的 scale 必须相同？**
-   - **权衡**：限制了合并的灵活性，但避免了精度语义错误
-   - **好处**：DECIMAL(10,2) 和 DECIMAL(10,3) 代表不同的小数位数，自动合并可能导致数据错误
-   - **实际案例**：金额字段的小数位数不能随意改变
-
-4. **为什么需要委托模式？**
-   - **权衡**：增加了实现复杂度，但支持了外部 Metastore 同步
-   - **好处**：Hive Catalog 需要同步更新 Hive Metastore，直接模式无法满足
-   - **扩展性**：支持自定义 SchemaModification 实现
-
-**架构演进**：
-```
-早期版本:
-  └── 仅支持顶层字段的合并
-
-当前版本:
-  ├── 支持嵌套类型的递归合并（ROW、ARRAY、MAP）
-  ├── 支持委托模式
-  ├── 支持 diffSchemaChanges 差异检测
-  └── 支持 allowExplicitCast 参数
-```
-
-**业界对比**：
-- **Iceberg**：需要外部工具（如 Flink CDC）手动检测差异并生成 ALTER TABLE
-- **Hudi**：内置 Avro Schema Evolution，但基于字段名，不支持列重命名
-- **Delta Lake**：需要外部工具，且基于字段名
+- `allowExplicitCast=true` 允许收窄合并（BIGINT→INT），有数据丢失风险，慎开。
+- 高频合并会快速推高 `highestFieldId` 并产生大量 schema 版本，建议批量。
+- 委托模式每次合并触发一次 Catalog 调用（可能含网络），高频场景应聚合后再提交。
+- `SchemaMergingUtils` **只处理新增和类型变更，不处理删除**——上游删字段不会被自动同步掉。
 
 ---
 
-Paimon 支持从 CDC 数据源（MySQL、Kafka 等）同步数据时自动演进表 Schema。当上游数据源的表结构发生变化时，Paimon 会自动检测差异并更新 Schema。
+## 10. 嵌套列演进（NestedSchemaUtils）
 
-**源码位置**: `paimon-core/src/main/java/org/apache/paimon/schema/SchemaMergingUtils.java`
+**① 要解决什么问题**　Flink 的 `ALTER TABLE MODIFY COLUMN` 可能把一个 ROW/ARRAY/MAP 列整体换成新类型。Paimon 不能粗暴整列替换（会丢字段 ID、破坏嵌套读时演进），而要把"新旧嵌套类型的差异"拆解成一串细粒度 `SchemaChange`。`NestedSchemaUtils.generateNestedColumnUpdates`（`NestedSchemaUtils.java:55`）干这件事。
 
-### 9.1 mergeSchema 整体流程
+**② 设计与源码**　按类型根分派（`:62`/`:64`/`:66`）：
 
-```java
-// SchemaMergingUtils.java L42-66
-public static TableSchema mergeSchemas(
-    TableSchema currentTableSchema, RowType targetType, boolean allowExplicitCast) {
-    RowType currentType = currentTableSchema.logicalRowType();
-    if (currentType.equals(targetType)) {
-        return currentTableSchema;  // 无变化，直接返回
-    }
-    
-    AtomicInteger highestFieldId = new AtomicInteger(currentTableSchema.highestFieldId());
-    RowType newRowType = mergeSchemas(currentType, targetType, highestFieldId, allowExplicitCast);
-    
-    if (newRowType.equals(currentType)) {
-        return currentTableSchema;  // 只有 nullability 变化，忽略
-    }
-    
-    return new TableSchema(
-        currentTableSchema.id() + 1,
-        newRowType.getFields(),
-        highestFieldId.get(),
-        currentTableSchema.partitionKeys(),
-        currentTableSchema.primaryKeys(),
-        currentTableSchema.options(),
-        currentTableSchema.comment());
-}
-```
+- **ROW**（`handleRowTypeUpdate` `:78`）：校验新类型也是 ROW、已有字段相对顺序不变、无字段被删；对新增子字段生成 `AddColumn`、对类型变化的子字段递归 `generateNestedColumnUpdates`、处理可空性变化。
+- **ARRAY**（`handleArrayTypeUpdate` `:164`）：路径追加虚拟名 `element`，递归处理元素类型。
+- **MAP**（`handleMapTypeUpdate` `:188`）：**key 类型必须不变**（断言），路径追加 `value` 递归处理 value 类型。
+- **MULTISET**（`:222`）/ **原始类型**（`handlePrimitiveTypeUpdate` `:247`，最终生成 `updateColumnType`）/ **可空性**（`handleNullabilityChange` `:260`）。
 
-**关键设计决策**：
-- 合并时**保持当前 Schema 的 nullability**（不被目标类型的 nullability 覆盖）
-- 新增字段使用目标类型但强制设为 nullable（`field.copy(true)`）
-- Schema ID 自增 1
-
-### 9.2 递归类型合并算法
-
-`merge` 方法实现了一个递归的类型合并算法：
-
-```
-merge(base, update):
-  1. 忽略 nullability 比较（都设为 true）
-  2. 如果相等，返回 base（保持原 nullability）
-  3. 如果都是 RowType:
-     a. 对已有字段：递归 merge 类型
-     b. 保留 base 中存在但 update 中不存在的字段
-     c. 追加 update 中存在但 base 中不存在的字段（分配新 ID，强制 nullable）
-  4. 如果都是 MapType: 分别 merge key 和 value
-  5. 如果都是 ArrayType: merge 元素类型
-  6. 如果都是 MultisetType: merge 元素类型
-  7. 如果都是 DecimalType:
-     a. scale 必须相同
-     b. precision 取较大值
-  8. 如果是可转换的原始类型:
-     a. 比较 length/precision 属性
-     b. 非显式转换时要求新类型的属性 >= 旧类型
-  9. 否则报错
-```
-
-**为什么 Decimal 合并要求 scale 相同？** 不同 scale 的 Decimal 代表不同的精度含义（如价格的小数位数），自动合并不同 scale 可能导致数据语义错误。
-
-**为什么新字段强制 nullable？** CDC 场景下，旧数据中不存在新字段，读取时只能返回 null。这与 AddColumn 的约束一致。
-
-### 9.3 新字段 ID 分配
-
-```java
-// SchemaMergingUtils.java L228-236
-private static DataField assignIdForNewField(DataField field, AtomicInteger highestFieldId) {
-    DataType dataType = ReassignFieldId.reassign(field.type(), highestFieldId);
-    return new DataField(
-        highestFieldId.incrementAndGet(),
-        field.name(),
-        dataType,
-        field.description(),
-        field.defaultValue());
-}
-```
-
-**注意**: `ReassignFieldId.reassign` 先处理嵌套类型内部的 ID 分配（如 ROW 类型的子字段），然后再给字段本身分配 ID。这保证了 `highestFieldId` 在分配后反映了所有已分配的 ID。
-
-### 9.4 diffSchemaChanges 差异检测
-
-`diffSchemaChanges` 方法用于比较新旧 Schema 的差异，生成 SchemaChange 列表：
-
-```java
-// SchemaMergingUtils.java L242-282
-public static List<SchemaChange> diffSchemaChanges(
-    TableSchema oldSchema, TableSchema newSchema) {
-    List<SchemaChange> changes = new ArrayList<>();
-    diffFields(
-        oldSchema.logicalRowType().getFields(),
-        newSchema.logicalRowType().getFields(),
-        new String[0],
-        changes);
-    return changes;
-}
-
-private static void diffFields(
-    List<DataField> oldFields, List<DataField> newFields,
-    String[] parentNames, List<SchemaChange> changes) {
-    for (DataField newField : newFields) {
-        DataField oldField = oldFieldMap.get(newField.name());
-        if (oldField == null) {
-            // 新增列
-            changes.add(SchemaChange.addColumn(fieldNames, newField.type(), ...));
-        } else if (!oldField.type().equals(newField.type())) {
-            if (oldField.type() instanceof RowType && newField.type() instanceof RowType) {
-                diffFields(...);  // 递归比较嵌套 ROW
-            } else {
-                changes.add(SchemaChange.updateColumnType(fieldNames, newField.type(), true));
-            }
-        }
-    }
-}
-```
-
-**为什么需要 diffSchemaChanges？** 在 `SchemaModification` 委托模式下（见 9.5），CDC 不直接修改 Schema 文件，而是生成 SchemaChange 列表交给 Catalog 处理。这样可以走统一的 `alterTable` 流程，复用所有验证逻辑。
-
-### 9.5 SchemaModification 委托机制
-
-```java
-// SchemaManager.java L719-743
-public boolean mergeSchema(
-    RowType rowType, boolean allowExplicitCast,
-    @Nullable SchemaModification schemaModification) {
-    TableSchema current = latest().orElseThrow(...);
-    TableSchema update = SchemaMergingUtils.mergeSchemas(current, rowType, allowExplicitCast);
-    if (current.equals(update)) {
-        return false;  // 无变化
-    }
-    
-    if (schemaModification != null) {
-        // 委托模式：生成 SchemaChange 列表交给外部处理
-        List<SchemaChange> changes = SchemaMergingUtils.diffSchemaChanges(current, update);
-        schemaModification.alterSchema(changes);
-        return true;
-    } else {
-        // 直接模式：直接提交新 Schema
-        return commit(update);
-    }
-}
-```
-
-**为什么有两种模式？**
-- **直接模式**: 用于简单的 FileSystemCatalog，直接写 Schema 文件
-- **委托模式**: 用于需要通过 Catalog API 处理 Schema 变更的场景（如 Hive Catalog 需要同步更新 Hive Metastore），通过 `SchemaModification.alterSchema` 回调委托给 Catalog 处理
-
----
-
-## 10. 嵌套列演进 (NestedSchemaUtils)
-
-**源码位置**: `paimon-core/src/main/java/org/apache/paimon/schema/NestedSchemaUtils.java`
-
-### 10.1 ROW 类型嵌套演进
-
-当 Flink 的 `ALTER TABLE MODIFY COLUMN` 涉及 ROW 类型时，`NestedSchemaUtils.generateNestedColumnUpdates` 会：
-
-1. 检查旧 ROW 中字段的相对顺序是否保持
-2. 检查旧 ROW 中的字段是否被删除
-3. 为新增的子字段生成 `AddColumn` 变更
-4. 为类型变化的子字段递归调用 `generateNestedColumnUpdates`
-5. 处理可空性变化
-
-```java
-// NestedSchemaUtils.java L78-76
-private static void handleRowTypeUpdate(
-    List<String> fieldNames, DataType oldType, DataType newType,
-    List<SchemaChange> schemaChanges) {
-    // 验证新类型也是 ROW
-    // 检查已有字段的顺序不变
-    // 检查没有字段被删除
-    // 生成新增字段的 AddColumn
-    // 递归处理类型变化的字段
-}
-```
-
-### 10.2 ARRAY/MAP/MULTISET 类型演进
-
-对于 ARRAY 类型，通过虚拟字段名 `element` 构建嵌套路径：
-
-```java
-private static void handleArrayTypeUpdate(...) {
-    List<String> nestedNames = new ArrayList<>(fieldNames);
-    nestedNames.add("element");
-    generateNestedColumnUpdates(nestedNames, oldElementType, newElementType, schemaChanges);
-}
-```
-
-对于 MAP 类型，只允许修改 value 类型（key 类型通过断言检查不变）：
-
-```java
-private static void handleMapTypeUpdate(...) {
-    // key 类型必须相同
-    List<String> nestedNames = new ArrayList<>(fieldNames);
-    nestedNames.add("value");
-    generateNestedColumnUpdates(nestedNames, oldValueType, newValueType, schemaChanges);
-}
-```
-
-**为什么 MAP key 不允许修改？** MAP 的查找操作依赖 key 类型的一致性。如果 key 类型改变，已有数据中的 MAP 将无法正确查找。
+**为什么 MAP key 不能改**：MAP 查找依赖 key 类型一致，改了 key 类型已有数据的 MAP 无法正确查找。**为什么 ROW 不许删字段/乱序**：嵌套字段同样靠 ID 关联旧数据，这条路径是"增量演进"而非"整列重写"。
 
 ---
 
 ## 11. Schema Rollback 机制
 
-Paimon 提供了 Schema Rollback 能力，允许将 Schema 回滚到历史版本。
+**① 要解决什么问题**　误操作改坏了 schema、或测试后想清掉一堆中间版本——需要安全地把 schema 回退到某个历史版本，且**不能删掉仍被快照/标签/changelog 引用的版本**（否则那些数据再也读不出）。
 
-**源码位置**: `SchemaManager.java` 第 1147-1185 行
+**源码位置**：`SchemaManager.rollbackTo`（`SchemaManager.java:1147`）。
 
-### 11.1 rollbackTo 实现原理
+**② 设计与源码**
 
 ```java
-public void rollbackTo(
-    long targetSchemaId,
-    SnapshotManager snapshotManager,
-    TagManager tagManager,
-    ChangelogManager changelogManager) throws IOException {
-    
-    // 1. 验证目标 Schema 存在
-    checkArgument(schemaExists(targetSchemaId), "Schema %s does not exist.", targetSchemaId);
-    
-    // 2. 收集所有被引用的 schemaId
-    Set<Long> usedSchemaIds = new HashSet<>();
-    snapshotManager.pickOrLatest(snapshot -> {
-        usedSchemaIds.add(snapshot.schemaId());
-        return false;
-    });
-    tagManager.taggedSnapshots().forEach(s -> usedSchemaIds.add(s.schemaId()));
-    changelogManager.changelogs().forEachRemaining(c -> usedSchemaIds.add(c.schemaId()));
-    
-    // 3. 检查是否有被引用的 Schema 比目标新
-    Optional<Long> conflict = usedSchemaIds.stream()
-        .filter(id -> id > targetSchemaId).min(Long::compareTo);
-    if (conflict.isPresent()) {
-        throw new RuntimeException("Cannot rollback...");
-    }
-    
-    // 4. 删除所有比目标新的 Schema 文件
-    List<Long> toBeDeleted = listAllIds().stream()
-        .filter(id -> id > targetSchemaId)
-        .collect(Collectors.toList());
-    toBeDeleted.sort((o1, o2) -> Long.compare(o2, o1));  // 从大到小删除
-    for (Long id : toBeDeleted) {
-        fileIO.delete(toSchemaPath(id), false);
-    }
-}
+// SchemaManager.java:1147  rollbackTo 关键步骤
+checkArgument(schemaExists(targetSchemaId), ...);          // 1. 目标存在
+// 2. 收集所有被引用的 schemaId：快照 + 标签快照 + changelog
+// 3. 若有任何被引用的 id > target → 报错，禁止回滚
+// 4. 列出所有 id > target 的 schema 文件，从大到小删除
+toBeDeleted.sort((a, b) -> Long.compare(b, a));            // 降序
+for (Long id : toBeDeleted) fileIO.delete(toSchemaPath(id), false);
 ```
 
-### 11.2 安全检查机制
+引用安全检查覆盖三类来源：
 
-回滚前会检查三类引用：
+| 来源 | 检查方式 | 为什么 |
+|------|----------|--------|
+| Snapshot | 遍历快照的 `schemaId` | 快照引用的 schema 删了就读不出数据 |
+| Tag | 遍历标记快照的 `schemaId` | Tag 是快照的命名引用 |
+| Changelog | 遍历 changelog 的 `schemaId` | changelog 也按某 schema 写 |
 
-| 引用来源 | 检查方式 | 原因 |
-|---------|---------|------|
-| Snapshot | 遍历所有快照的 schemaId | 快照引用的 Schema 不能被删除，否则无法读取数据 |
-| Tag | 遍历所有标记的快照 | Tag 是快照的命名引用 |
-| Changelog | 遍历所有变更日志 | Changelog 也引用 Schema |
+**③ 关键设计：从大 ID 往小删**。`latest()` 返回最大 id 的 schema，从大到小删除保证删除过程中**任意时刻 `latest()` 都指向一个有效且连续的版本**；若反过来从小往大删，会出现"中间版本没了但最新还在"的断层。
 
-**删除顺序**: 从大 ID 到小 ID 删除，确保在任何中间状态下 `latest()` 方法都能返回一个有效的 Schema。如果从小到大删除，可能出现最新的 Schema 已删除但更旧的还在的不一致状态。
-
-**为什么需要 Schema Rollback？** 常见场景：
-1. 误操作修改了 Schema，需要恢复
-2. 测试环境中 Schema 频繁变更后需要清理
-3. 与 Snapshot Rollback 配合使用
+**④ 边界**　rollback 删的是 schema 版本文件，不回退数据；通常与 Snapshot Rollback 配合使用（详见 **17-时间旅行与版本管理**）。
 
 ---
 
-## 12. Flink ALTER TABLE 实现
+## 12. 引擎适配：Flink / Spark ALTER TABLE
 
-### 12.1 FlinkCatalog.alterTable 两种重载
+**① 要解决什么问题**　Flink 有自己的 `TableChange`、Spark 有自己的 `TableChange`，语义和能力都不完全等同于 Paimon 的 `SchemaChange`。引擎适配层负责"翻译"，并处理各自的特性（Flink 的非物理列、Spark 默认 nullable 的类型系统）。
 
-FlinkCatalog 提供了两个 `alterTable` 方法：
+### 12.1 转换入口
 
-**重载 1: 纯属性修改**（第 686-731 行）
+- **Flink**（`FlinkCatalog.alterTable`）有两个重载：① 纯属性修改——对比新旧 options 生成 `SetOption`/`RemoveOption`；② 完整 ALTER——先处理非物理列（watermark/计算列）变更，再把 Flink `TableChange` 经 `toSchemaChange` 翻译成 Paimon `SchemaChange`，最后 `catalog.alterTable`。
+- **Spark**（`SparkCatalog.alterTable`）更简洁（无非物理列概念）：`Arrays.stream(changes).map(this::toSchemaChange)` 后 `catalog.alterTable`，再 `loadTable` 取最新 schema。
 
-```java
-public void alterTable(ObjectPath tablePath, CatalogBaseTable newTable, boolean ignoreIfNotExists) {
-    // 比较新旧 options，生成 SetOption/RemoveOption 变更
-    for (Map.Entry<String, String> entry : newTable.getOptions().entrySet()) {
-        if (!Objects.equals(value, oldProperties.get(key))) {
-            changes.add(SchemaChange.setOption(key, value));
-        }
-    }
-    oldProperties.keySet().forEach(k -> {
-        if (!newTable.getOptions().containsKey(k)) {
-            changes.add(SchemaChange.removeOption(k));
-        }
-    });
-    catalog.alterTable(toIdentifier(tablePath), changes, ignoreIfNotExists);
-}
-```
+### 12.2 TableChange → SchemaChange 映射（关键差异）
 
-**重载 2: 完整 ALTER TABLE**（第 734-809 行）
+| Flink TableChange | Spark TableChange | → Paimon SchemaChange | 注意 |
+|-------------------|-------------------|----------------------|------|
+| `AddColumn` | `AddColumn` | `addColumn` | Flink 只处理物理列；Spark 校验无默认值 |
+| `DropColumn` | `DeleteColumn` | `dropColumn` | Flink 跳过非物理列 |
+| `ModifyColumnName` | `RenameColumn` | `renameColumn` | — |
+| `ModifyPhysicalColumnType` | `UpdateColumnType` | `updateColumnType` | **keepNullability 差异，见下** |
+| `ModifyColumnPosition` | `UpdateColumnPosition` | `updateColumnPosition` | 均仅 FIRST/AFTER，不支持嵌套路径 |
+| `ModifyColumnComment` | `UpdateColumnComment` | `updateColumnComment` | — |
+| `SetOption`/`ResetOption` | `SetProperty`/`RemoveProperty` | `setOption`/`removeOption` 或 `updateComment` | COMMENT 特殊处理 |
+| `AddWatermark`/`DropWatermark` | （无） | 多个 `setOption`/`removeOption` | Flink 水印存 options |
+| `DropConstraint` | （无） | `dropPrimaryKey` | Flink 仅支持删主键约束 |
+| （无） | `UpdateColumnNullability` | `updateColumnNullability` | Spark 独立处理可空性 |
+| （无） | `UpdateColumnDefaultValue` | `updateColumnDefaultValue` | Spark 3.4+ |
 
-```java
-public void alterTable(ObjectPath tablePath, CatalogBaseTable newTable,
-    List<TableChange> tableChanges, boolean ignoreIfNotExists) {
-    // 1. 处理非物理列（watermark、computed column）变更
-    // 2. 将 Flink 的 TableChange 转换为 Paimon 的 SchemaChange
-    // 3. 调用 catalog.alterTable
-}
-```
+### 12.3 两个关键差异
 
-### 12.2 toSchemaChange 转换逻辑
+**keepNullability：Flink=false，Spark=true。** Flink 的 `ModifyPhysicalColumnType` 携带完整新 DataType（含 nullability），意图是整体替换，故 `keepNullability=false`（经 `handlePrimitiveTypeUpdate` 生成）；Spark 的 `UpdateColumnType` 只传类型、nullability 由独立的 `UpdateColumnNullability` 管，故设 `keepNullability=true` 避免改类型时意外动了可空性。
 
-Flink 的 `TableChange` 到 Paimon 的 `SchemaChange` 的完整映射：
+**非物理列（仅 Flink）。** Flink 的计算列、watermark 等元数据列不落数据文件，而是存进 options（`FlinkCatalogPropertiesUtil.nonPhysicalColumns` 识别）。增删这类列实际是改 options 而非真正的 schema 字段变更。Paimon schema 只认物理列。
 
-| Flink TableChange | Paimon SchemaChange | 特殊处理 |
-|-------------------|--------------------|---------| 
-| `AddColumn` | `SchemaChange.addColumn` | 只处理物理列；转换 Move |
-| `DropColumn` | `SchemaChange.dropColumn` | 跳过非物理列 |
-| `ModifyColumnName` | `SchemaChange.renameColumn` | 跳过非物理列 |
-| `ModifyPhysicalColumnType` | 嵌套更新 | 调用 `NestedSchemaUtils.generateNestedColumnUpdates`，最终生成 `updateColumnType(keepNullability=false)` |
-| `ModifyColumnPosition` | `SchemaChange.updateColumnPosition` | 跳过非物理列；不支持嵌套路径 |
-| `ModifyColumnComment` | `SchemaChange.updateColumnComment` | 跳过非物理列；不支持嵌套路径 |
-| `SetOption` | `SchemaChange.setOption` / `updateComment` | COMMENT_PROP 特殊处理 |
-| `ResetOption` | `SchemaChange.removeOption` / `updateComment(null)` | COMMENT_PROP 特殊处理 |
-| `AddWatermark` | `SchemaChange.setOption` (多个) | 水印存储在 options 中 |
-| `DropWatermark` | `SchemaChange.removeOption` (多个) | 移除水印 options |
-| `DropConstraint` | `SchemaChange.dropPrimaryKey` | 仅支持删除主键约束 |
-| `ModifyRefreshStatus` | `SchemaChange.setOption` | 物化表专属 |
-| `ModifyRefreshHandler` | `SchemaChange.setOption` | 物化表专属 |
-
-### 12.3 非物理列处理
-
-Flink 特有的非物理列（计算列、元数据列）通过 options 存储：
-
-```java
-Map<String, Integer> oldTableNonPhysicalColumnIndex =
-    FlinkCatalogPropertiesUtil.nonPhysicalColumns(
-        table.options(), table.rowType().getFieldNames());
-```
-
-在处理 `AddColumn`、`DropColumn` 等操作时，会检查是否是非物理列，非物理列的变更通过 options 的增删改来实现，而非真正的 Schema 字段变更。
-
-**为什么 Flink 的非物理列存在 options 里？** Paimon 的 Schema 只支持物理列。Flink 的计算列和水印等元数据不需要持久化到数据文件中，存储在 options 是一种轻量级的扩展方式。
+**嵌套列变更入口差异。** Flink 经 `NestedSchemaUtils.generateNestedColumnUpdates`（§10）把整列类型变更拆成细粒度变更；Spark 直接透传嵌套路径给 SchemaChange。
 
 ---
 
-## 13. Spark ALTER TABLE 实现
+## 13. 类型转换规则体系（DataTypeCasts）
 
-### 13.1 SparkCatalog.alterTable
+**① 要解决什么问题**　UpdateColumnType 和 CDC 合并都要回答"源类型能否变成目标类型"。INT→BIGINT 安全、BIGINT→INT 会溢出、STRING→INT 根本不兼容——需要一套统一、可配置的规则，让 Flink/Spark/CDC 行为一致。
 
-```java
-// SparkCatalog.java L342-354
-public Table alterTable(Identifier ident, TableChange... changes) throws NoSuchTableException {
-    List<SchemaChange> schemaChanges =
-        Arrays.stream(changes).map(this::toSchemaChange).collect(Collectors.toList());
-    try {
-        catalog.alterTable(toIdentifier(ident, catalogName), schemaChanges, false);
-        return loadTable(ident);  // 重新加载表以获取最新 Schema
-    } catch (Catalog.TableNotExistException e) {
-        throw new NoSuchTableException(ident);
-    }
-}
+> 类型定义、`DataTypeRoot`/`DataTypeFamily` 体系本身详见 **19-数据类型系统**；本节只讲"转换规则"。
+
+**源码位置**：`paimon-api/.../types/DataTypeCasts.java`。核对：当前源码暴露 `supportsCast(source, target, allowExplicit)`（`:192`，返回布尔）与 `supportsCompatibleCast`（`:209`，CDC 合并用）。**不存在** `canConvert`/`ConvertAction` 三态 API（已修正——见 §1.2 跨文档核对注）。
+
+**② 三级规则与判定**　`CastingRuleBuilder` 为每个目标类型维护三套源类型集合：`implicitSourceTypes` / `explicitSourceTypes` / `compatibleSourceTypes`（`:256-258`）。
+
+| 级别 | 含义 | 使用场景 | 安全性 |
+|------|------|----------|--------|
+| **Implicit 隐式** | 无信息丢失（INT→BIGINT、FLOAT→DOUBLE） | 手动 ALTER 默认、CDC 合并 | 安全 |
+| **Explicit 显式** | 可能丢失（BIGINT→INT、VARCHAR→CHAR） | 手动 ALTER 开关后 | 有风险 |
+| **Compatible 兼容** | 同一"底层数据结构"内（CHAR↔VARCHAR；其余多为自反） | CDC 类型合并判定 | 安全 |
+
+判定逻辑（`supportsCasting` `:221`）：先查"源与目标忽略 nullability 后是否相等"；再查 `implicitCastingRules`；`allowExplicit` 时再查 `explicitCastingRules`；否则 false。**注意首段**（`:225`）：源 nullable、目标 NOT NULL 且非 explicit 时直接拒——这与 §6.2 的可空性约束呼应。
+
+**Compatible 为何比 Implicit 严**：`supportsCompatibleCast`（`:209`）要求"相同底层数据结构"，INT 与 BIGINT 虽同属 NUMERIC 族但一个 4 字节一个 8 字节，**不兼容**；两个 Decimal 仅当 precision 和 scale 都相同才兼容。Implicit 则允许跨此类边界宽化（INT→BIGINT 是 implicit 但非 compatible）。这是 CDC 合并比手动 ALTER 更保守的原因。
+
+**③ 转换矩阵速记**
+
+```
+数值隐式链:  TINYINT → SMALLINT → INT → BIGINT → DECIMAL → FLOAT → DOUBLE
+字符:       CHAR → VARCHAR(隐式);  VARCHAR → CHAR(显式);  多数类型 → CHAR/VARCHAR(显式)
+二进制:     BINARY → VARBINARY(隐式);  VARBINARY → BINARY(显式)
+时间:       同类型内 precision 可升(隐式); TIMESTAMP↔DATE 不支持
+Compatible: CHAR↔VARCHAR、BINARY↔VARBINARY 互兼容; 其余基本自反(TINYINT 只兼容 TINYINT…)
 ```
 
-Spark 的实现比 Flink 简洁，因为 Spark 没有非物理列的概念。
-
-### 13.2 toSchemaChange 转换逻辑
-
-| Spark TableChange | Paimon SchemaChange | 特殊处理 |
-|-------------------|--------------------|---------| 
-| `SetProperty` | `SchemaChange.setOption` / `updateComment` | COMMENT 特殊处理 |
-| `RemoveProperty` | `SchemaChange.removeOption` / `updateComment(null)` | COMMENT 特殊处理 |
-| `AddColumn` | `SchemaChange.addColumn` | 校验无默认值；支持嵌套路径 |
-| `RenameColumn` | `SchemaChange.renameColumn` | 支持嵌套路径 |
-| `DeleteColumn` | `SchemaChange.dropColumn` | 支持嵌套路径 |
-| `UpdateColumnType` | `SchemaChange.updateColumnType` | **keepNullability=true**；支持嵌套路径 |
-| `UpdateColumnNullability` | `SchemaChange.updateColumnNullability` | 支持嵌套路径 |
-| `UpdateColumnComment` | `SchemaChange.updateColumnComment` | 支持嵌套路径 |
-| `UpdateColumnPosition` | `SchemaChange.updateColumnPosition` | 仅支持 FIRST/AFTER；不支持嵌套路径 |
-| `UpdateColumnDefaultValue` | `SchemaChange.updateColumnDefaultValue` | Spark 3.4+；支持嵌套路径 |
-
-### 13.3 Flink 与 Spark 实现差异对比
-
-| 特性 | Flink | Spark |
-|------|-------|-------|
-| 非物理列支持 | 有（watermark、computed column） | 无 |
-| 嵌套列变更入口 | `NestedSchemaUtils.generateNestedColumnUpdates` | 直接传递嵌套路径 |
-| 类型更新 keepNullability | **false**（通过 `handlePrimitiveTypeUpdate` 生成） | **true**（保持原 nullability） |
-| Move 类型 | FIRST, AFTER | FIRST, AFTER |
-| BEFORE/LAST Move | 不支持 | 不支持 |
-| 主键删除 | 通过 DropConstraint | 不支持 |
-| 默认值 | 不支持 | 通过 metadata 传递 |
-| 物化表支持 | 有 | 无 |
-| 水印支持 | 有（通过 options） | 无 |
-| `primary-key` 属性检查 | 无 | `validateAlterProperty` 禁止修改 |
-
-**为什么 Flink 和 Spark 的 keepNullability 不同？** Flink 的 `ModifyPhysicalColumnType` 携带完整的新 DataType（包含 nullability），用户意图是完全替换类型。而 Spark 的 `UpdateColumnType` 只传递新的 DataType，nullability 变更由独立的 `UpdateColumnNullability` 处理。Spark 设置 `keepNullability=true` 避免了类型更新时意外改变可空性。
+**④ 陷阱**　① 显式收窄（开 `disable-explicit-type-casting=false` 后）做 BIGINT→INT，超范围旧值读时静默溢出成错值，不报错——开启前务必确认值域；② Decimal 改 scale、TIMESTAMP↔DATE 这类不支持的转换会被 `supportsCast` 直接拒；③ 过了 `supportsCast` 还要过 `CastExecutors.resolve`（§6.2 双关）。
 
 ---
 
-## 14. 类型转换规则体系 (DataTypeCasts)
+## 14. 与 Iceberg Schema Evolution 对比
 
-### 解决什么问题
+> 横向对比是理解 Paimon 设计取舍的参照系。结论先行：**字段标识两者趋同（都用 ID），并发与存储 Paimon 更去中心化，类型演进 Paimon 更灵活（含显式收窄）但 Iceberg 多了分区演进。**
 
-**核心业务问题**：
-1. **类型变更的安全性判断**：INT 能否改为 BIGINT？STRING 能否改为 INT？
-2. **CDC 场景的类型兼容性**：上游 MySQL 的 TINYINT 对应 Paimon 的什么类型？
-3. **显式转换的风险控制**：BIGINT -> INT 会丢失数据，是否允许？
-4. **嵌套类型的转换规则**：`ARRAY<INT>` 能否改为 `ARRAY<BIGINT>`？
-
-**没有这个设计的后果**：
-- 允许不安全的类型转换（如 BIGINT -> INT），导致数据溢出或丢失
-- 禁止安全的类型转换（如 INT -> BIGINT），限制了 Schema 演进的灵活性
-- CDC 同步时类型不匹配，写入失败
-- 缺乏统一的类型转换规则，不同引擎（Flink、Spark）行为不一致
-
-**实际场景**：
-```sql
--- 场景1: 安全的宽化转换（隐式）
-ALTER TABLE t MODIFY COLUMN age BIGINT;  -- INT -> BIGINT，允许
-ALTER TABLE t MODIFY COLUMN price DOUBLE;  -- FLOAT -> DOUBLE，允许
-
--- 场景2: 有风险的收窄转换（显式，默认禁止）
-ALTER TABLE t MODIFY COLUMN id INT;  -- BIGINT -> INT，默认禁止
--- 需要设置 'disable-explicit-type-casting' = 'false' 才允许
-
--- 场景3: 不兼容的转换（禁止）
-ALTER TABLE t MODIFY COLUMN name INT;  -- STRING -> INT，禁止
--- 报错: Column type STRING cannot be converted to INT
-
--- 场景4: CDC 类型映射
--- MySQL TINYINT -> Paimon TINYINT (隐式兼容)
--- MySQL BIGINT -> Paimon BIGINT (隐式兼容)
-```
-
-### 有什么坑
-
-**误区陷阱**：
-1. **误以为所有数值类型都能互转**：FLOAT -> INT 是显式转换，默认禁止
-2. **误以为 CHAR 和 VARCHAR 可以随意互转**：CHAR -> VARCHAR 隐式，VARCHAR -> CHAR 显式
-3. **误以为 TIMESTAMP 和 DATE 可以互转**：实际上不支持
-4. **误以为 Compatible 规则比 Implicit 规则宽松**：实际上更严格（同类型族内）
-
-**错误配置**：
-```java
-// 错误1: 期望 STRING -> INT 自动转换
-ALTER TABLE t MODIFY COLUMN id INT;  -- 原类型 STRING
-// 报错: Column type STRING cannot be converted to INT
-// 原因: 不在隐式或显式转换规则中
-
-// 错误2: 期望 TIMESTAMP -> DATE 转换
-ALTER TABLE t MODIFY COLUMN dt DATE;  -- 原类型 TIMESTAMP
-// 报错: Column type TIMESTAMP cannot be converted to DATE
-// 原因: 时间类型之间不支持转换（除了 precision 变化）
-
-// 错误3: 开启显式转换后数据溢出
--- 设置 'disable-explicit-type-casting' = 'false'
-ALTER TABLE t MODIFY COLUMN big_value INT;  -- 原类型 BIGINT，值为 10000000000
--- 查询时: 数据溢出，返回错误的值
-```
-
-**生产环境注意事项**：
-1. **显式转换的数据丢失风险**：BIGINT -> INT、DOUBLE -> FLOAT 可能溢出或丢失精度
-2. **Decimal 的 precision 和 scale**：只能增加 precision，scale 必须保持不变
-3. **CHAR/VARCHAR 的长度**：VARCHAR -> CHAR 可能截断数据
-4. **时间类型的 precision**：只能增加 precision（如 TIMESTAMP(3) -> TIMESTAMP(6)）
-
-**性能陷阱**：
-```java
-// 陷阱1: 频繁的类型转换开销
-// 表有1000个文件，每个文件都需要 INT -> BIGINT 转换
-// 大规模查询时 CPU 开销显著
-// 建议: 执行 compaction 统一类型
-
-// 陷阱2: 嵌套类型的递归转换
-// ARRAY<MAP<STRING, ROW<a INT, b INT>>> 中 INT -> BIGINT
-// 需要递归构建多层 CastExecutor
-// 建议: 避免在深层嵌套类型上修改类型
-```
-
-### 核心概念解释
-
-**术语定义**：
-1. **隐式转换 (Implicit Cast)**：
-   - 无信息丢失的安全转换
-   - 例如：INT -> BIGINT、FLOAT -> DOUBLE
-   - 用于 Schema Merge（CDC）和手动 ALTER TABLE
-
-2. **显式转换 (Explicit Cast)**：
-   - 可能丢失信息的转换
-   - 例如：BIGINT -> INT、VARCHAR -> CHAR
-   - 默认禁止，需配置 `disable-explicit-type-casting = false`
-
-3. **兼容转换 (Compatible Cast)**：
-   - 同一类型族内的转换
-   - 例如：CHAR(10) 和 CHAR(20) 兼容
-   - 用于 CDC 场景的类型合并判断
-
-4. **类型族 (Type Family)**：
-   - 一组相关的类型
-   - 例如：数值族（TINYINT、SMALLINT、INT、BIGINT）
-   - 例如：字符族（CHAR、VARCHAR）
-
-5. **CastExecutor**：
-   - 运行时类型转换器
-   - 通过 `CastExecutors.resolve()` 获取
-   - 必须同时满足 `DataTypeCasts.supportsCast()` 和 `CastExecutors.resolve() != null`
-
-**概念关系**：
-```
-转换规则层次:
-  Compatible (最严格)
-      ↓
-  Implicit (安全)
-      ↓
-  Explicit (有风险)
-      ↓
-  不支持
-
-判断流程:
-  DataTypeCasts.supportsCast(source, target, allowExplicit)
-      ├── implicitCastingRules.contains(source -> target) → true
-      ├── allowExplicit && explicitCastingRules.contains(source -> target) → true
-      └── false
-
-  CastExecutors.resolve(source, target)
-      ├── 存在对应的 CastExecutor → 返回实例
-      └── 不存在 → null
-```
-
-**与其他系统对比**：
-| 系统 | 转换规则 | 显式转换 | 嵌套类型 |
-|------|---------|---------|---------|
-| Paimon | 三级规则（Implicit/Explicit/Compatible） | 可配置 | 支持 |
-| Iceberg | 仅宽化转换 | 不支持 | 支持 |
-| Hudi | Avro 规则 | 有限支持 | 支持 |
-| Delta Lake | Spark 规则 | 支持 | 支持 |
-
-### 设计理念
-
-**为什么这样设计**：
-
-1. **为什么需要三级转换规则？**
-   - **权衡**：增加了规则复杂度，但提供了更精细的控制
-   - **好处**：CDC 场景用 Compatible，手动变更用 Implicit，高级用户用 Explicit
-   - **灵活性**：不同场景有不同的安全性要求
-
-2. **为什么默认禁止显式转换？**
-   - **权衡**：限制了灵活性，但避免了数据丢失
-   - **好处**：防止误操作（如 BIGINT -> INT 导致溢出）
-   - **保守策略**：数据安全优先于操作便利性
-
-3. **为什么 Compatible 规则比 Implicit 规则更严格？**
-   - **权衡**：CDC 场景下限制了类型合并的灵活性
-   - **好处**：避免跨类型族的合并（如 INT 和 FLOAT 合并为 DOUBLE）
-   - **语义清晰**：同类型族内的合并更符合直觉
-
-4. **为什么需要同时检查 DataTypeCasts 和 CastExecutors？**
-   - **权衡**：增加了检查步骤，但保证了运行时的正确性
-   - **好处**：理论上可转换但缺少实现的情况会被拦截
-   - **防御性编程**：避免运行时找不到转换器导致崩溃
-
-**架构演进**：
-```
-早期版本:
-  └── 仅支持基本类型的隐式转换
-
-当前版本:
-  ├── 三级转换规则（Implicit/Explicit/Compatible）
-  ├── 支持嵌套类型的递归转换
-  ├── 支持 Decimal 的 precision 变化
-  └── 支持 TIMESTAMP 的 precision 变化
-```
-
-**业界对比**：
-- **Iceberg**：只允许安全的宽化转换，更保守
-- **Hudi**：基于 Avro 规则，支持更多转换，但可能不安全
-- **Delta Lake**：基于 Spark 规则，灵活性高，但依赖 Spark 引擎
-
----
-
-**源码位置**: `paimon-api/src/main/java/org/apache/paimon/types/DataTypeCasts.java`
-
-### 14.1 三级转换规则
-
-DataTypeCasts 定义了三级类型转换规则：
-
-| 级别 | 说明 | 使用场景 | 安全性 |
-|------|------|---------|--------|
-| **Implicit (隐式)** | 无信息丢失的安全转换 | Schema Merge（CDC） | 最安全 |
-| **Explicit (显式)** | 可能丢失信息的转换 | 手动 ALTER TABLE | 中等 |
-| **Compatible (兼容)** | 类型族内的宽化转换 | 类型合并 | 安全 |
-
-```java
-// 方法签名
-public static boolean supportsCast(DataType source, DataType target, boolean allowExplicit) {
-    if (implicitCastingRules contains (source -> target)) return true;
-    if (allowExplicit && explicitCastingRules contains (source -> target)) return true;
-    return false;
-}
-
-public static boolean supportsCompatibleCast(DataType source, DataType target) {
-    return compatibleCastingRules contains (source -> target);
-}
-```
-
-### 14.2 具体类型转换矩阵
-
-**数值类型隐式转换链**：
-
-```
-TINYINT → SMALLINT → INTEGER → BIGINT → DECIMAL → FLOAT → DOUBLE
-                                  ↑
-                              (所有都可隐式转到 DECIMAL)
-```
-
-**字符串类型**：
-
-```
-CHAR → VARCHAR  (隐式)
-VARCHAR → CHAR  (显式)
-几乎所有类型 → CHAR/VARCHAR (显式)
-```
-
-**时间类型**：
-
-```
-TIME → TIME (仅相同)
-TIMESTAMP → TIMESTAMP (隐式，precision 可升)
-TIMESTAMP_LTZ → TIMESTAMP_LTZ (隐式，precision 可升)
-```
-
-**二进制类型**：
-
-```
-BINARY → VARBINARY (隐式)
-VARBINARY → BINARY (显式)
-```
-
-**Compatible 规则**（用于 CDC 合并）：
-
-| 源类型 | 可兼容的目标类型 |
-|-------|---------------|
-| CHAR | CHAR, VARCHAR |
-| VARCHAR | CHAR, VARCHAR |
-| BOOLEAN | BOOLEAN |
-| BINARY | BINARY, VARBINARY |
-| VARBINARY | BINARY, VARBINARY |
-| TINYINT | TINYINT |
-| SMALLINT | SMALLINT |
-| INTEGER | INTEGER |
-| BIGINT | BIGINT |
-| FLOAT | FLOAT |
-| DOUBLE | DOUBLE |
-
-**为什么 Compatible 规则比 Implicit 规则更严格？** Compatible 规则用于判断两个类型是否可以安全地合并为一个公共类型（如 CDC 场景），要求类型必须在同一个"类型族"内。而 Implicit 规则允许跨类型族的宽化（如 INT -> FLOAT）。
-
----
-
-## 15. 与 Iceberg Schema Evolution 对比
-
-### 15.1 架构对比
+### 14.1 架构对比
 
 | 维度 | Paimon | Iceberg |
 |------|--------|---------|
@@ -2418,7 +715,7 @@ VARBINARY → BINARY (显式)
 | 元数据服务依赖 | 可选（可纯文件系统） | 需要 metadata.json（可选 catalog） |
 | Schema 与数据的关联 | DataFileMeta.schemaId + Snapshot.schemaId | Manifest 中 ManifestFile.content.schema_id |
 
-### 15.2 字段标识策略
+### 14.2 字段标识策略
 
 | 维度 | Paimon | Iceberg |
 |------|--------|---------|
@@ -2429,7 +726,7 @@ VARBINARY → BINARY (显式)
 
 **两者在字段标识策略上高度一致**，都选择了基于 ID 的方案。这是现代 Lake Format 的共识。
 
-### 15.3 并发控制对比
+### 14.3 并发控制对比
 
 | 维度 | Paimon | Iceberg |
 |------|--------|---------|
@@ -2440,7 +737,7 @@ VARBINARY → BINARY (显式)
 
 **关键差异**: Paimon 为每个 Schema 版本创建独立文件，并发冲突的概率更低（只有同一个 id 的两次并发写入才冲突）。Iceberg 的所有元数据（包括多个 Schema 版本、Snapshot 信息等）都在一个 metadata.json 中，任何元数据修改都可能冲突。
 
-### 15.4 类型演进能力对比
+### 14.4 类型演进能力对比
 
 | 能力 | Paimon | Iceberg |
 |------|--------|---------|
@@ -2456,7 +753,7 @@ VARBINARY → BINARY (显式)
 | Schema Rollback | 支持 | 通过 metadata rollback 实现 |
 | CDC 自动演进 | 内置 `SchemaMergingUtils` | 需要外部工具（如 Flink CDC） |
 
-### 15.5 优劣势总结
+### 14.5 优劣势总结
 
 **Paimon 的优势**：
 1. **更灵活的类型转换**: 支持显式类型转换（需配置开启），如 BIGINT -> INT
@@ -2474,292 +771,128 @@ VARBINARY → BINARY (显式)
 
 ---
 
-## 16. 设计决策分析
+## 15. 设计决策总结
 
-### 决策 1: 为什么 SchemaChange 定义在 paimon-api 而非 paimon-core？
-
-**决策**: SchemaChange 接口及其 12 种实现类都在 `paimon-api` 模块中。
-
-**原因**: 
-- SchemaChange 是公开 API（标注了 `@Public`），Flink、Spark 等引擎直接依赖它来构建变更请求
-- REST Catalog 需要通过 HTTP 传输 SchemaChange（因此需要 JSON 序列化支持）
-- 如果放在 paimon-core，会导致 paimon-flink 和 paimon-spark 需要额外依赖 paimon-core
-
-**好处**: 保持了模块依赖的单向性（api <- core，api <- flink/spark），符合分层架构原则。
-
-### 决策 2: 为什么 highestFieldId 要独立存储，不从 fields 推算？
-
-**决策**: TableSchema 单独存储 `highestFieldId`，而非从当前 fields 的最大 ID 推算。
-
-**原因**: 字段删除后，如果只看当前 fields 的最大 ID，新分配的 ID 可能与已删除列的 ID 冲突。例如：
-1. 初始 fields: `[1->a, 2->b, 3->c]`，highestFieldId=3
-2. 删除列 c：fields: `[1->a, 2->b]`，highestFieldId=3
-3. 如果从 fields 推算 highestFieldId=2，新增列会得到 ID 3，与已删除的 c 冲突
-
-**好处**: 保证了字段 ID 的全局唯一性，使得旧数据文件中的列 c（ID=3）不会与新列混淆。
-
-### 决策 3: 为什么新增列必须是 nullable？
-
-**决策**: AddColumn 强制要求 `dataType.isNullable() == true`。
-
-**原因**: 已有的数据文件中不包含新列的数据。读取旧数据时，新列的值只能是 null。如果允许 NOT NULL，读取旧数据就会违反约束。
-
-**好处**: 保证了读时演进的正确性，不需要回填旧数据文件。
-
-### 决策 4: 为什么 Schema ID 采用简单递增而非 UUID？
-
-**决策**: Schema ID 使用 `long` 类型的简单递增（`oldTableSchema.id() + 1`）。
-
-**原因**: 
-- 简单递增天然实现了版本顺序
-- 文件名 `schema-{id}` 按名称排序就是时间顺序
-- 通过 rename 的 CAS 语义保证唯一性
-
-**好处**: 
-- 易于理解和调试
-- `latest()` 方法只需要找最大 ID
-- 版本比较只需要数值比较
-
-### 决策 5: 为什么 commit 使用 tryToWriteAtomic 而非分布式锁？
-
-**决策**: Schema 提交通过 `fileIO.tryToWriteAtomic()` 实现，即先写临时文件再 rename。
-
-**原因**: 
-- Paimon 的核心定位是无外部依赖的 Lake Format
-- 对象存储（S3、OSS）没有可靠的分布式锁原语
-- Schema 变更频率低（通常每天几次），乐观锁的冲突概率极低
-
-**好处**: 
-- 零外部依赖
-- 适用于任何支持 rename 的文件系统
-- 通过可选的 CatalogLock 可以在高并发场景下增强
-
-### 决策 6: 为什么 SchemaMergingUtils 合并时忽略 nullability？
-
-**决策**: `merge` 方法在比较类型时忽略 nullability（`base0.copy(true)` 和 `update0.copy(true)`），最终使用 base 的 nullability。
-
-**原因**: 
-- CDC 数据源的 nullability 信息可能不准确
-- 已有数据可能有 null 值，将列改为 NOT NULL 是危险操作
-- 保守策略更安全
-
-**好处**: 避免了 CDC 自动演进时意外改变列的可空性，减少数据不一致的风险。
-
-### 决策 7: 为什么 Schema Rollback 从大到小删除？
-
-**决策**: `rollbackTo` 方法的删除顺序是从最大 ID 开始向下删除。
-
-**原因**: `latest()` 方法返回最大 ID 的 Schema。如果从小 ID 开始删除：
-1. 当前 latest 是 schema-5
-2. 删除 schema-3
-3. 此时 latest 仍是 schema-5（一致）
-4. 但如果同时有读取操作，看到 schema-3 不存在会困惑
-
-从大到小删除时：
-1. 删除 schema-5
-2. 此时 latest 变为 schema-4（一致）
-3. 继续删除 schema-4
-4. 最终 latest 是目标版本
-
-**好处**: 在删除过程中的任何时刻，`latest()` 都返回一个有效且连续的 Schema 版本。
-
-### 决策 8: 为什么重命名列时要级联更新选项？
-
-**决策**: `applyRenameColumnsToOptions` 方法在重命名列时自动更新 bucket-key、sequence.field、聚合函数配置等选项中的列名引用。
-
-**原因**: 如果只重命名了列但不更新引用该列名的选项：
-- `bucket-key = old_name` 会变成无效引用
-- `fields.old_name.aggregate-function = sum` 会失效
-- `sequence.field = old_name` 会找不到序列字段
-
-**好处**: 重命名操作的完整性得到保证，用户不需要手动更新所有相关选项。
+| 决策点 | 选择 | 取舍/代价 | 收益 |
+|--------|------|-----------|------|
+| 元数据存哪 | **文件即元数据**：`schema/schema-{id}` 独立 JSON | 放弃 Metastore 强一致；schema 文件只增不减需 rollback 清理 | 零外部依赖、对象存储友好、可审计 |
+| 并发控制 | **乐观锁 + rename CAS**（可选叠 CatalogLock） | 高冲突场景重试；依赖 FS rename 语义强弱（S3 弱） | 无锁服务、并发面小（仅同 id 冲突） |
+| schema 版本号 | `long` 简单递增（`oldId+1`，`SchemaManager.java:579`） | 不能分布式生成 ID | `latest()` 取最大、版本即数值比较、文件名即时序 |
+| 列标识 | **字段 ID**（全局唯一、永不复用） | 多维护 `highestFieldId` 一项元数据 | 列重命名/重排零数据成本 |
+| highestFieldId | **独立存储、删列不回退** | 一个额外字段 | 新列 ID 不撞已删列，旧文件列不被错认（§2.2） |
+| 演进时机 | **读时演进**（旧文件不重写） | 读到演进过旧文件有映射+转换开销 | 变更秒级、不阻塞写；恒等映射时零开销 |
+| 新增列约束 | **强制 nullable**（`:341`） | 不能直接加非空列 | 旧文件读出填 null 不违约，免回填 |
+| 类型转换校验 | **双关**：`supportsCast` + `CastExecutors.resolve` | 多一次检查 | 拦下"理论可转但无运行时实现"，避免运行时崩 |
+| 显式收窄转换 | **默认禁**（`disable-explicit-type-casting=false`） | 想收窄要显式开 | 默认防 BIGINT→INT 溢出等误操作 |
+| CDC 合并 nullability | **保 base、新字段强制 nullable** | 可能与上游不一致 | CDC 源 nullability 不准时更安全 |
+| Decimal 合并 | **scale 必须相同、precision 取大** | 不同 scale 不能自动合 | 避免小数位语义被悄悄改变 |
+| Rollback 删除序 | **从大 ID 往小删** | — | 删除过程中 `latest()` 始终有效连续（§11） |
+| 重命名级联 | **自动改 options 里的列名引用** | 实现略复杂 | bucket-key/sequence-field/聚合配置不失效 |
+| SchemaChange 归属 | 放 **paimon-api**（非 core） | — | 引擎/REST 直接依赖、保持模块单向依赖 |
 
 ---
 
-## 17. 整体架构图
+## 16. 架构与读路径全景图
+
+**ALTER TABLE 全链路（组件视图）**：
 
 ```mermaid
 graph TB
-    subgraph "用户入口"
-        FLINK["Flink ALTER TABLE"]
-        SPARK["Spark ALTER TABLE"]
-        CDC["CDC Schema Merge"]
-        REST["REST API"]
+    subgraph 用户入口
+        FLINK[Flink ALTER]
+        SPARK[Spark ALTER]
+        CDC[CDC Schema Merge]
+        REST[REST API]
     end
-    
-    subgraph "引擎适配层"
-        FC["FlinkCatalog<br>toSchemaChange()"]
-        SC["SparkCatalog<br>toSchemaChange()"]
-        NSU["NestedSchemaUtils<br>嵌套列变更生成"]
+    subgraph 引擎适配
+        FC[FlinkCatalog.toSchemaChange]
+        SC[SparkCatalog.toSchemaChange]
+        NSU[NestedSchemaUtils 嵌套拆解]
     end
-    
-    subgraph "Catalog 层"
-        AC["AbstractCatalog<br>alterTable()"]
-        FSC["FileSystemCatalog<br>alterTableImpl()"]
-        LOCK["CatalogLock<br>(可选)"]
+    subgraph Catalog
+        AC[AbstractCatalog.alterTable]
+        FSC[FileSystemCatalog.alterTableImpl]
+        LOCK["CatalogLock 可选"]
     end
-    
-    subgraph "核心层"
-        SM["SchemaManager<br>commitChanges()"]
-        GTS["generateTableSchema()<br>变更应用"]
-        NCM["NestedColumnModifier<br>嵌套列定位"]
-        SV["SchemaValidation<br>全面验证"]
-        SMU["SchemaMergingUtils<br>CDC合并"]
+    subgraph 核心
+        SM["SchemaManager.commitChanges :252"]
+        GTS["generateTableSchema :282"]
+        SV[SchemaValidation 校验]
+        SMU["SchemaMergingUtils :45 CDC合并"]
     end
-    
-    subgraph "类型系统"
-        DTC["DataTypeCasts<br>转换规则"]
-        CE["CastExecutors<br>运行时转换"]
+    subgraph 存储
+        FIO["FileIO.tryToWriteAtomic :330"]
+        SF["schema/schema-{id} JSON"]
     end
-    
-    subgraph "存储层"
-        FIO["FileIO<br>tryToWriteAtomic()"]
-        SF["schema/schema-{id}<br>JSON文件"]
-    end
-    
-    subgraph "读路径"
-        SEU["SchemaEvolutionUtil<br>索引映射+类型转换"]
-        PR["ProjectedRow<br>字段重排"]
-        CR["CastedRow<br>类型转换"]
-    end
-    
-    FLINK --> FC
-    SPARK --> SC
-    FC --> NSU
+    FLINK --> FC --> NSU
     FC --> AC
-    SC --> AC
-    CDC --> SMU
-    REST --> AC
-    
-    AC --> FSC
-    FSC --> LOCK
-    LOCK --> SM
-    
+    SPARK --> SC --> AC
+    CDC --> SMU --> SM
+    REST --> AC --> FSC --> LOCK --> SM
     SM --> GTS
-    GTS --> NCM
-    GTS --> DTC
-    GTS --> CE
     SM --> SV
-    SM --> FIO
-    SMU --> SM
-    
-    FIO --> SF
-    
-    SEU --> PR
-    SEU --> CR
-    SEU --> CE
+    SM --> FIO --> SF
 ```
 
-```mermaid
-sequenceDiagram
-    participant User as 用户
-    participant Catalog as Catalog
-    participant SM as SchemaManager
-    participant GTS as generateTableSchema
-    participant SV as SchemaValidation
-    participant FIO as FileIO
-    
-    User->>Catalog: ALTER TABLE ADD COLUMN
-    Catalog->>SM: commitChanges(changes)
-    
-    loop 乐观锁重试
-        SM->>SM: latest() 获取当前Schema
-        SM->>GTS: generateTableSchema(old, changes)
-        GTS->>GTS: 遍历changes逐个应用
-        GTS->>GTS: 约束校验(分区键/主键/类型)
-        GTS-->>SM: 新TableSchema (id=old.id+1)
-        
-        SM->>SV: validateTableSchema(new)
-        SM->>SV: validateFallbackBranch(new)
-        SM->>FIO: tryToWriteAtomic(schema-{id}, json)
-        
-        alt 写入成功
-            FIO-->>SM: true
-            SM-->>Catalog: 新TableSchema
-        else 写入失败(并发冲突)
-            FIO-->>SM: false
-            Note over SM: 重新读取最新Schema再试
-        end
-    end
-    
-    Catalog-->>User: 成功
-```
+**读时演进（数据视图，体现字段 ID 映射 + 类型转换）**：
 
 ```mermaid
 graph LR
-    subgraph "Schema Evolution 读路径"
-        direction TB
-        Q["查询请求<br>SELECT a, b, c FROM t"]
-        TS["当前表Schema<br>1->a INT, 5->b STRING, 3->c BIGINT"]
-        DF1["数据文件1 (schema-0)<br>1->a INT, 2->x FLOAT, 3->c INT"]
-        DF2["数据文件2 (schema-2)<br>1->a INT, 3->c BIGINT"]
-        
-        IM1["索引映射1: [0, -1, 2]<br>b不存在→null"]
-        IM2["索引映射2: [0, -1, 1]<br>b不存在→null"]
-        
-        CM1["类型转换1: c: INT→BIGINT"]
-        CM2["类型转换2: 无需转换"]
-        
-        R["合并结果<br>a:INT, b:null, c:BIGINT"]
-    end
-    
-    Q --> TS
+    TS["当前表Schema<br>1→a INT, 5→b STRING, 3→c BIGINT"]
+    DF1["文件1 schema-0<br>1→a INT, 2→x, 3→c INT"]
+    DF2["文件2 schema-2<br>1→a INT, 3→c BIGINT"]
+    IM1["映射[0,-1,2]<br>b→null; c需转"]
+    IM2["映射[0,-1,1]<br>b→null; c免转"]
+    R["合并结果<br>a:INT, b:null, c:BIGINT"]
     TS --> IM1
     TS --> IM2
-    DF1 --> IM1
-    DF2 --> IM2
-    IM1 --> CM1
-    IM2 --> CM2
-    CM1 --> R
-    CM2 --> R
+    DF1 --> IM1 --> R
+    DF2 --> IM2 --> R
 ```
 
 ---
 
-## 附录 A: 核心源码文件索引
+## 附录：源码索引 / 配置项 / 变更类型速查
+
+**核心源码文件**（行号以 1.5-SNAPSHOT 核对）：
 
 | 文件 | 模块 | 职责 |
 |------|------|------|
-| `SchemaChange.java` | paimon-api | 12种变更类型定义 |
-| `Schema.java` | paimon-api | 用户层表结构定义 |
-| `TableSchema.java` | paimon-api | 存储层完整表结构 |
-| `DataTypeCasts.java` | paimon-api | 三级类型转换规则 |
-| `SchemaManager.java` | paimon-core | 乐观锁并发控制 + 变更应用 |
-| `SchemaValidation.java` | paimon-core | 全面验证逻辑 |
-| `SchemaEvolutionUtil.java` | paimon-core | 读路径索引映射和类型转换 |
-| `SchemaMergingUtils.java` | paimon-core | CDC 自动Schema合并 |
-| `NestedSchemaUtils.java` | paimon-core | 嵌套列变更生成 |
-| `FileIO.java` | paimon-common | tryToWriteAtomic 原子写入 |
-| `FlinkCatalog.java` | paimon-flink | Flink ALTER TABLE 实现 |
-| `SparkCatalog.java` | paimon-spark | Spark ALTER TABLE 实现 |
-| `FileSystemCatalog.java` | paimon-core | 文件系统Catalog的alterTable实现 |
-| `AbstractCatalog.java` | paimon-core | Catalog抽象层的alterTable调度 |
-| `Snapshot.java` | paimon-api | 快照与schemaId的关联 |
-| `DataFileMeta.java` | paimon-core | 数据文件元数据中的schemaId |
+| `SchemaChange.java` | paimon-api | 12 种变更类型（接口 `:85`，子类 `:175`–`:821`） |
+| `Schema.java` / `TableSchema.java` | paimon-api | 用户层 / 存储层表结构（版本常量 `:50`） |
+| `DataTypeCasts.java` | paimon-api | 三级转换规则（`supportsCast :192`） |
+| `CoreOptions.java` | paimon-api | 演进相关配置（`:1870`/`:2108`/`:2116`/`:2124`） |
+| `SchemaManager.java` | paimon-core | 乐观锁 + 变更应用（`commitChanges :252`、`generateTableSchema :282`、`commit :1083`、`rollbackTo :1147`、`mergeSchema :719`） |
+| `SchemaValidation.java` | paimon-core | 提交前全面校验 |
+| `SchemaEvolutionUtil.java` | paimon-core | 读路径映射+转换（`createIndexMapping :80`、`devolveFilters :140`） |
+| `SchemaMergingUtils.java` | paimon-core | CDC 合并（`mergeSchemas :45`、`diffSchemaChanges :245`） |
+| `NestedSchemaUtils.java` | paimon-core | 嵌套列变更拆解（`generateNestedColumnUpdates :55`） |
+| `FileIO.java` | paimon-common | 原子写（`tryToWriteAtomic :330`） |
+| `FlinkCatalog.java` / `SparkCatalog.java` | paimon-flink / paimon-spark | 引擎 ALTER 适配 |
 
-## 附录 B: 关键配置项
+**关键配置项**：
 
-| 配置项 | 默认值 | 说明 |
-|-------|--------|------|
-| `alter-column-null-to-not-null.disabled` | `true` | 禁止将nullable改为NOT NULL |
-| `disable-explicit-type-casting` | `false` | 禁止显式类型转换（收窄） |
-| `add-column-before-partition` | `false` | 新增列放在分区列之前 |
-| `deletion-vectors.modifiable` | `false` | 是否允许修改删除向量开关 |
+| 配置项 | 默认 | 行号 | 说明 |
+|--------|------|------|------|
+| `alter-column-null-to-not-null.disabled` | `true` | `CoreOptions.java:2108` | 禁 nullable→NOT NULL |
+| `disable-explicit-type-casting` | `false` | `:2116` | 为 true 时禁显式收窄 |
+| `add-column-before-partition` | `false` | `:2124` | 新增列插到分区列前（仅分区表） |
+| `deletion-vectors.modifiable` | `false` | `:1870` | 是否允许改 DV 开关 |
 
-## 附录 C: 完整变更类型速查
+**12 种 SchemaChange 速查**（声明顺序）：
 
 ```
-SchemaChange (interface)
-├── SetOption          — 设置表选项
-├── RemoveOption       — 删除表选项
-├── UpdateComment      — 更新表注释
-├── AddColumn          — 添加列 (支持嵌套, 支持Move)
-├── RenameColumn       — 重命名列 (支持嵌套)
-├── DropColumn         — 删除列 (支持嵌套)
-├── UpdateColumnType   — 更新列类型 (支持嵌套, keepNullability)
-├── UpdateColumnNullability — 更新列可空性 (支持嵌套)
-├── UpdateColumnComment    — 更新列注释 (支持嵌套)
-├── UpdateColumnDefaultValue — 更新列默认值 (支持嵌套)
-├── UpdateColumnPosition   — 更新列位置 (Move)
-└── DropPrimaryKey         — 删除主键约束 (仅空表)
+SchemaChange (paimon-api)
+├── SetOption                  设置表选项
+├── RemoveOption               删除表选项（重置默认）
+├── UpdateComment              改/删表注释（null=删）
+├── AddColumn                  加列（嵌套 + Move；强制 nullable）
+├── RenameColumn               改列名（嵌套；禁分区键/BLOB）
+├── DropColumn                 删列（嵌套；禁分区键/主键）
+├── UpdateColumnType           改类型（嵌套；双关校验；keepNullability）
+├── UpdateColumnPosition       改逻辑位置（Move）
+├── UpdateColumnNullability     改可空性（嵌套；null→NOT NULL 默认禁）
+├── UpdateColumnComment        改列注释（嵌套）
+├── UpdateColumnDefaultValue   改默认值（嵌套）
+└── DropPrimaryKey             删主键约束（仅空表）
 ```

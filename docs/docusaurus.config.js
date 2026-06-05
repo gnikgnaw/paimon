@@ -26,7 +26,11 @@ const config = {
 
   i18n: {
     defaultLocale: 'en',
-    locales: ['en'],
+    locales: ['en', 'zh-Hans'],
+    localeConfigs: {
+      en: {label: 'English'},
+      'zh-Hans': {label: '简体中文'},
+    },
   },
 
   customFields: {
@@ -76,7 +80,7 @@ const config = {
       require.resolve('@easyops-cn/docusaurus-search-local'),
       {
         hashed: true,
-        language: ['en'],
+        language: ['en', 'zh'],
         indexBlog: false,
         docsRouteBasePath: '/',
       },
@@ -98,7 +102,7 @@ const config = {
             module: {
               rules: [
                 {
-                  test: /generated\/.*\.html$/,
+                  test: /[\\/]generated[\\/].*\.html$/,
                   type: 'asset/source',
                 },
               ],
@@ -131,6 +135,10 @@ const config = {
               {label: '1.2', href: 'https://paimon.apache.org/docs/1.2'},
               {label: '1.1', href: 'https://paimon.apache.org/docs/1.1'},
             ],
+          },
+          {
+            type: 'localeDropdown',
+            position: 'right',
           },
           {
             href: 'https://github.com/apache/paimon',

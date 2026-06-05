@@ -1,0 +1,217 @@
+---
+title: "表"
+sidebar_position: 5
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# 表 {#tables}
+
+Paimon 支持以下几种表：
+
+1. paimon 表：带或不带主键的 Paimon 数据表。
+2. format-table（格式表）：文件格式表指的是一个包含多个相同格式文件的目录，对该表的操作允许读取或写入这些文件，并与 Hive 表兼容。
+3. object table（对象表）：为指定对象存储（Object Storage）目录中的非结构化数据对象提供元数据索引。
+
+## Paimon 表 {#paimon-table}
+
+### 主键表 {#primary-key-table}
+
+参见 [Paimon with Primary key](../../primary-key-table/overview)。
+
+主键（primary key）由一组列构成，这些列对每条记录都包含唯一的值。Paimon 通过在每个桶（bucket）内对主键进行排序来强制数据有序，从而支持流式更新和流式 changelog 读取。
+
+主键的定义与标准 SQL 类似，它确保在批式查询期间，对于同一个主键只有一条数据条目。
+
+<Tabs groupId="primary-table">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+```sql
+CREATE TABLE my_table (
+    a INT PRIMARY KEY NOT ENFORCED,
+    b STRING
+) WITH (
+    'bucket'='8'
+)
+```
+
+</TabItem>
+
+<TabItem value="spark-sql" label="Spark SQL">
+
+```sql
+CREATE TABLE my_table (
+    a INT,
+    b STRING
+) TBLPROPERTIES (
+    'primary-key' = 'a',
+    'bucket' = '8'
+)
+```
+
+</TabItem>
+
+</Tabs>
+
+### Append 表 {#append-table}
+
+参见 [Append Table](../../append-table/overview)。
+
+如果一张表没有定义主键，那么它就是一张 Append 表（追加表）。与主键表相比，它不具备直接接收 changelog 的能力，无法通过流式 Upsert 直接更新数据，只能从追加数据中接收传入的数据。
+
+不过，它也支持批式 SQL：DELETE、UPDATE 以及 MERGE-INTO。
+
+```sql
+CREATE TABLE my_table (
+    a INT,
+    b STRING
+)
+```
+
+## 格式表（Format Table） {#format-table}
+
+metastore 中的 Hive 表会被映射为 Paimon 的格式表（Format Table），供计算引擎（Spark、Hive、Flink）读取和写入。
+
+格式表指的是一个包含多个相同格式文件的目录，对该表的操作允许读取或写入这些文件，便于检索已有数据以及添加新文件。
+
+分区的文件格式表与标准的 Hive 格式一样。分区会基于目录结构被发现并推断出来。
+
+目前仅支持 `CSV`、`Parquet`、`ORC`、`JSON` 格式。
+
+<Tabs groupId="format-table">
+
+<TabItem value="flink-csv" label="Flink-CSV">
+
+```sql
+CREATE TABLE my_csv_table (
+    a INT,
+    b STRING
+) WITH (
+    'type'='format-table',
+    'file.format'='csv',
+    'csv.field-delimiter'=','
+)
+```
+
+</TabItem>
+
+<TabItem value="spark-csv" label="Spark-CSV">
+
+```sql
+CREATE TABLE my_csv_table (
+    a INT,
+    b STRING
+) USING csv OPTIONS ('csv.field-delimiter' ',')
+```
+
+</TabItem>
+
+<TabItem value="flink-parquet" label="Flink-Parquet">
+
+```sql
+CREATE TABLE my_parquet_table (
+    a INT,
+    b STRING
+) WITH (
+    'type'='format-table',
+    'file.format'='parquet'
+)
+```
+
+</TabItem>
+
+<TabItem value="spark-parquet" label="Spark-Parquet">
+
+```sql
+CREATE TABLE my_parquet_table (
+    a INT,
+    b STRING
+) USING parquet
+```
+
+</TabItem>
+
+<TabItem value="flink-json" label="Flink-JSON">
+
+```sql
+CREATE TABLE my_json_table (
+    a INT,
+    b STRING
+) WITH (
+    'type'='format-table',
+    'file.format'='json'
+)
+```
+
+</TabItem>
+
+<TabItem value="spark-json" label="Spark-JSON">
+
+```sql
+CREATE TABLE my_json_table (
+    a INT,
+    b STRING
+) USING json
+```
+
+</TabItem>
+
+</Tabs>
+
+## 对象表（Object Table） {#object-table}
+
+对象表（Object Table）是针对指定对象存储目录中非结构化数据对象的虚拟表。用户可以：
+
+1. 使用虚拟文件系统（开发中）来读取和写入文件。
+2. 或者使用 SQL 计算引擎将其作为结构化的文件列表来读取。
+
+对象表由 Catalog 管理，也可以拥有访问权限。目前只有 REST Catalog 支持对象表。
+
+创建对象表：
+
+<Tabs groupId="create-object-table">
+
+<TabItem value="flink-sql" label="Flink-SQL">
+
+```sql
+CREATE TABLE `my_object_table` WITH (
+  'type' = 'object-table'
+);
+```
+
+</TabItem>
+
+<TabItem value="spark-sql" label="Spark-SQL">
+
+```sql
+CREATE TABLE `my_object_table` TBLPROPERTIES (
+  'type' = 'object-table'
+);
+```
+
+</TabItem>
+
+</Tabs>
+
+我们推荐使用 [pvfs](./pvfs)，通过 Paimon REST Catalog 的权限系统来访问对象表中的文件。

@@ -1,0 +1,296 @@
+---
+title: "主键表"
+sidebar_position: 3
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# 主键表 {#primary-key-tables}
+
+让我们通过一个简单示例来演示，在 Flink 和 Spark 中使用 Iceberg 连接器查询 Paimon 表。
+在尝试该示例之前，请确保你的计算引擎已经支持 Iceberg。
+如果你尚未配置 Iceberg，请参阅 Iceberg 的文档。
+* Flink：[使用 Flink SQL Client 时的准备工作](https://iceberg.apache.org/docs/latest/flink/#preparation-when-using-flink-sql-client)
+* Spark：[在 Spark 3 中使用 Iceberg](https://iceberg.apache.org/docs/latest/spark-getting-started/#using-iceberg-in-spark-3)
+
+<Tabs groupId="paimon-primary-key-table">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+```sql
+CREATE CATALOG paimon_catalog WITH (
+    'type' = 'paimon',
+    'warehouse' = '<path-to-warehouse>'
+);
+
+CREATE TABLE paimon_catalog.`default`.orders (
+    order_id BIGINT,
+    status STRING,
+    payment DOUBLE,
+    PRIMARY KEY (order_id) NOT ENFORCED
+) WITH (
+    'metadata.iceberg.storage' = 'hadoop-catalog',
+    'compaction.optimization-interval' = '1ms' -- ATTENTION: this option is only for testing, see "timeliness" section below for more information
+);
+
+INSERT INTO paimon_catalog.`default`.orders VALUES (1, 'SUBMITTED', CAST(NULL AS DOUBLE)), (2, 'COMPLETED', 200.0), (3, 'SUBMITTED', CAST(NULL AS DOUBLE));
+
+CREATE CATALOG iceberg_catalog WITH (
+    'type' = 'iceberg',
+    'catalog-type' = 'hadoop',
+    'warehouse' = '<path-to-warehouse>/iceberg',
+    'cache-enabled' = 'false' -- disable iceberg catalog caching to quickly see the result
+);
+
+SELECT * FROM iceberg_catalog.`default`.orders WHERE status = 'COMPLETED';
+/*
++----+----------------------+--------------------------------+--------------------------------+
+| op |             order_id |                         status |                        payment |
++----+----------------------+--------------------------------+--------------------------------+
+| +I |                    2 |                      COMPLETED |                          200.0 |
++----+----------------------+--------------------------------+--------------------------------+
+*/
+
+INSERT INTO paimon_catalog.`default`.orders VALUES (1, 'COMPLETED', 100.0);
+
+SELECT * FROM iceberg_catalog.`default`.orders WHERE status = 'COMPLETED';
+/*
++----+----------------------+--------------------------------+--------------------------------+
+| op |             order_id |                         status |                        payment |
++----+----------------------+--------------------------------+--------------------------------+
+| +I |                    1 |                      COMPLETED |                          100.0 |
+| +I |                    2 |                      COMPLETED |                          200.0 |
++----+----------------------+--------------------------------+--------------------------------+
+*/
+```
+
+</TabItem>
+
+<TabItem value="spark-sql" label="Spark SQL">
+
+使用以下命令行启动 `spark-sql`。
+
+```bash
+spark-sql --jars <path-to-paimon-jar> \
+    --conf spark.sql.catalog.paimon_catalog=org.apache.paimon.spark.SparkCatalog \
+    --conf spark.sql.catalog.paimon_catalog.warehouse=<path-to-warehouse> \
+    --packages org.apache.iceberg:iceberg-spark-runtime-<iceberg-version> \
+    --conf spark.sql.catalog.iceberg_catalog=org.apache.iceberg.spark.SparkCatalog \
+    --conf spark.sql.catalog.iceberg_catalog.type=hadoop \
+    --conf spark.sql.catalog.iceberg_catalog.warehouse=<path-to-warehouse>/iceberg \
+    --conf spark.sql.catalog.iceberg_catalog.cache-enabled=false \ # disable iceberg catalog caching to quickly see the result
+    --conf spark.sql.extensions=org.apache.paimon.spark.extensions.PaimonSparkSessionExtensions,org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+```
+
+运行以下 Spark SQL 来创建 Paimon 表、插入/更新数据，并使用 Iceberg Catalog 进行查询。
+
+```sql
+CREATE TABLE paimon_catalog.`default`.orders (
+    order_id BIGINT,
+    status STRING,
+    payment DOUBLE
+) TBLPROPERTIES (
+    'primary-key' = 'order_id',
+    'metadata.iceberg.storage' = 'hadoop-catalog',
+    'compaction.optimization-interval' = '1ms' -- ATTENTION: this option is only for testing, see "timeliness" section below for more information
+);
+
+INSERT INTO paimon_catalog.`default`.orders VALUES (1, 'SUBMITTED', CAST(NULL AS DOUBLE)), (2, 'COMPLETED', 200.0), (3, 'SUBMITTED', CAST(NULL AS DOUBLE));
+
+SELECT * FROM iceberg_catalog.`default`.orders WHERE status = 'COMPLETED';
+/*
+2       COMPLETED       200.0
+*/
+
+INSERT INTO paimon_catalog.`default`.orders VALUES (1, 'COMPLETED', 100.0);
+
+SELECT * FROM iceberg_catalog.`default`.orders WHERE status = 'COMPLETED';
+/*
+2       COMPLETED       200.0
+1       COMPLETED       100.0
+*/
+```
+
+</TabItem>
+
+</Tabs>
+
+Paimon 主键表将数据文件组织为 LSM 树，因此在查询之前必须先在内存中合并数据文件。
+然而，Iceberg 读取器无法合并数据文件，所以它们只能查询 LSM 树最高层（level）上的数据文件。
+最高层上的数据文件由全量 Compaction 过程产生。
+因此 **总而言之，对于主键表，Iceberg 读取器只能查询全量 Compaction 之后的数据**。
+
+默认情况下，Paimon 不保证执行全量 Compaction 的频率。
+你可以配置以下表配置项，使 Paimon 在若干次提交之后被强制执行全量 Compaction。
+
+<table className="table table-bordered">
+    <thead>
+    <tr>
+      <th className="text-left" style={{width: "20%"}}>配置项</th>
+      <th className="text-left" style={{width: "5%"}}>默认值</th>
+      <th className="text-left" style={{width: "10%"}}>类型</th>
+      <th className="text-left" style={{width: "60%"}}>描述</th>
+    </tr>
+    </thead>
+    <tbody>
+    <tr>
+      <td><h5>compaction.optimization-interval</h5></td>
+      <td style={{wordWrap: "break-word"}}>(none)</td>
+      <td>Duration</td>
+      <td>每隔一段时间间隔会持续触发全量 Compaction。作业启动后的第一次 Compaction 始终为全量 Compaction。</td>
+    </tr>
+    <tr>
+      <td><h5>full-compaction.delta-commits</h5></td>
+      <td style={{wordWrap: "break-word"}}>(none)</td>
+      <td>Integer</td>
+      <td>在若干次增量提交后会持续触发全量 Compaction。仅在 Flink 中实现。</td>
+    </tr>
+    </tbody>
+</table>
+
+请注意，全量 Compaction 是一个消耗资源的过程，因此该表配置项的取值不宜过小。
+我们建议每小时执行一到两次全量 Compaction。
+
+## 删除向量支持 {#deletion-vector-support}
+
+Paimon 中的[删除向量（Deletion Vector）](../concepts/spec/tableindex#deletion-vectors)用于存储每个文件的已删除记录。
+在删除向量模式下，Paimon 读取器可以在读取阶段直接过滤掉不必要的记录，而无需合并数据。
+幸运的是，Iceberg 已在[第 3 版（Version 3）](https://iceberg.apache.org/spec/?h=deletion#version-3)中支持了[删除向量](https://iceberg.apache.org/spec/?h=deletion#deletion-vectors)。
+这意味着如果 Iceberg 读取器能够识别 Paimon 的删除向量，它将能够读取 Paimon 的所有数据，即使不具备合并数据文件的能力。
+通过将 Paimon 的删除向量同步到 Iceberg，Iceberg 读取器和 Paimon 读取器可以实现真正的实时同步。
+
+
+如果满足以下条件，将会为 Iceberg 构建关于 Paimon 删除向量的元数据。
+* '`deletion-vectors.enabled`' 和 '`deletion-vectors.bitmap64`' 应设置为 true。因为只有 Paimon 中 64 位位图实现的删除向量才与 Iceberg 兼容。
+* '`metadata.iceberg.format-version`'（默认值为 2）应设置为 3。因为 Iceberg 只在 V3 中支持删除向量。
+* Iceberg 的版本应为 1.8.0+。
+* JDK 版本应为 11+。Iceberg 自 1.7.0 版本起已停止支持 JDK 8。
+
+下面是一个示例：
+<Tabs groupId="deletion-vector-table">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+```sql
+-- flink version: 1.20.1
+
+CREATE CATALOG paimon_catalog WITH (
+    'type' = 'paimon',
+    'warehouse' = '<path-to-warehouse>'
+);
+
+-- Create a paimon table with primary key and enable deletion vector
+CREATE TABLE paimon_catalog.`default`.T
+(
+    pt  INT
+    ,k  INT
+    ,v  INT
+    ,PRIMARY KEY (pt, k) NOT ENFORCED
+)PARTITIONED BY (pt)
+WITH (
+    'metadata.iceberg.storage' = 'hadoop-catalog'
+    ,'metadata.iceberg.format-version' = '3'
+    ,'deletion-vectors.enabled' = 'true'
+    ,'deletion-vectors.bitmap64' = 'true'
+);
+
+INSERT INTO paimon_catalog.`default`.T
+VALUES (1, 9, 90), (1, 10, 100), (1, 11, 110), (2, 20, 200)
+;
+
+-- iceberg version: 1.8.1
+CREATE CATALOG iceberg_catalog WITH (
+    'type' = 'iceberg',
+    'catalog-type' = 'hadoop',
+    'warehouse' = '<path-to-warehouse>/iceberg',
+    'cache-enabled' = 'false' -- disable iceberg catalog caching to quickly see the result
+);
+
+SELECT * FROM iceberg_catalog.`default`.T;
+/*
++------------+------------+------------+
+|         pt |          k |          v |
++------------+------------+------------+
+|          2 |         20 |        200 |
+|          1 |          9 |         90 |
+|          1 |         10 |        100 |
+|          1 |         11 |        110 |
++------------+------------+------------+
+*/
+
+-- insert some data again, this will generate deletion vectors
+INSERT INTO paimon_catalog.`default`.T
+VALUES (1, 10, 101), (2, 20, 201), (1, 12, 121)
+;
+
+-- select deletion-vector index in paimon
+SELECT * FROM paimon_catalog.`default`.`T$table_indexes` WHERE index_type='DELETION_VECTORS';
+/*
++------------+-----------+-------------------+------------------------   -----+------------+------------+--------------------------------+
+|  partition |    bucket |        index_type |                      file_name |  file_size |  row_count |                      dv_ranges |
++------------+-----------+-------------------+------------------------   -----+------------+------------+--------------------------------+
+|        {1} |         0 |  DELETION_VECTORS | index-4ae44c5d-2fc6-40b0-9ff0~ |         43 |          1 | [(data-968fdf3a-2f44-41df-89b~ |
++------------+-----------+-------------------+------------------------   -----+------------+------------+--------------------------------+
+*/
+
+-- select in iceberg, the updates was successfully read by iceberg
+SELECT * FROM iceberg_catalog.`default`.T;
+/*
++------------+------------+------------+
+|         pt |          k |          v |
++------------+------------+------------+
+|          1 |          9 |         90 |
+|          1 |         11 |        110 |
+|          2 |         20 |        201 |
+|          1 |         10 |        101 |
+|          1 |         12 |        121 |
++------------+------------+------------+
+*/
+
+```
+
+</TabItem>
+
+</Tabs>
+
+:::info
+
+note1：如有必要，请将删除向量的实现升级为 64 位位图。
+
+:::
+
+如果你的 Paimon 表已经处于删除向量模式，但删除向量使用的是 32 位位图。
+那么当你希望将删除向量元数据同步到 Iceberg 时，需要将删除向量的实现升级为 64 位位图。
+你可以按照以下步骤升级到 64 位删除向量：
+1. 停止 Paimon 表的所有写入作业。
+2. 对你的 Paimon 表执行一次[全量 Compaction](../maintenance/dedicated-compaction#dedicated-compaction-job)。
+3. 运行 `ALTER TABLE tableName SET ('deletion-vectors.bitmap64' = 'true')` 以升级到 64 位删除向量。
+4. 重启你的写入作业。如果满足上述所有条件，删除向量元数据将被同步到 Iceberg。
+
+:::info
+
+note2：如有必要，请将 Iceberg 的格式版本升级为 3。
+
+:::
+你可以通过设置 `'metadata.iceberg.format-version' = '3'` 将 Iceberg 的格式版本从 2 升级到 3。
+这将不使用基础元数据而重新创建 Iceberg 元数据。

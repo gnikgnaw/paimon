@@ -1,0 +1,436 @@
+---
+title: "独立 Compaction"
+sidebar_position: 4
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+import ConfigTable from '@site/src/components/ConfigTable';
+import sortCompactHtml from '@site/generated/sort-compact.html';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# 独立 Compaction {#dedicated-compaction}
+
+Paimon 的快照管理支持多个写入端（writer）同时写入。
+
+:::info
+
+对于类 S3 的对象存储，其 `'RENAME'` 操作不具备原子语义。我们需要为 Catalog 配置 Hive metastore 并启用 `'lock.enabled'` 配置项。
+
+:::
+
+默认情况下，Paimon 支持并发写入不同的分区。推荐的一种模式是：流式作业将记录写入 Paimon 的最新分区，同时批式作业（overwrite）将记录写入历史分区。
+
+![](/img/multiple-writers.png)
+
+到目前为止，一切都运行良好；但如果你需要多个写入端将记录写入同一个分区，情况就会稍微复杂一些。例如，你不想使用 `UNION ALL`，而是用多个流式作业将记录写入一个 `'partial-update'` 表。这种情况请参考下面的 `'独立 Compaction 作业'`。
+
+## 独立 Compaction 作业 {#dedicated-compaction-job}
+
+默认情况下，Paimon 的写入端会在写入记录的过程中按需执行 Compaction。这对大多数使用场景来说已经足够。
+
+Compaction 会将一些数据文件标记为「已删除」（并不是真正删除，详见 [快照过期](./manage-snapshots#expire-snapshots)）。如果多个写入端标记了同一个文件，在提交变更时就会发生冲突。Paimon 会自动解决该冲突，但这可能导致作业重启。
+
+为避免这些缺点，用户也可以选择在写入端跳过 Compaction，并运行一个仅用于 Compaction 的独立作业。由于 Compaction 仅由该独立作业执行，写入端便可以持续不间断地写入记录，并且永远不会发生冲突。
+
+要在写入端跳过 Compaction，请将下面的表属性设置为 `true`。
+
+<table className="table table-bordered">
+    <thead>
+    <tr>
+      <th className="text-left" style={{width: "20%"}}>配置项</th>
+      <th className="text-left" style={{width: "5%"}}>是否必填</th>
+      <th className="text-left" style={{width: "5%"}}>默认值</th>
+      <th className="text-left" style={{width: "10%"}}>类型</th>
+      <th className="text-left" style={{width: "60%"}}>说明</th>
+    </tr>
+    </thead>
+    <tbody>
+    <tr>
+      <td><h5>write-only</h5></td>
+      <td>否</td>
+      <td style={{wordWrap: "break-word"}}>false</td>
+      <td>Boolean</td>
+      <td>如果设置为 true，将跳过 Compaction 和快照过期。该配置项与独立 Compaction 作业配合使用。</td>
+    </tr>
+    </tbody>
+</table>
+
+要运行一个独立的 Compaction 作业，请按照以下说明操作。
+
+<Tabs groupId="dedicated-compaction-job">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+执行以下 SQL：
+
+```sql
+CALL sys.compact(
+  `table` => 'default.T', 
+  partitions => 'p=0', 
+  options => 'sink.parallelism=4',
+  `where` => 'dt>10 and h<20'
+);
+```
+
+</TabItem>
+
+<TabItem value="flink-action-jar" label="Flink Action Jar">
+
+执行以下命令，为该表提交一个 Compaction 作业。
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    compact \
+    --warehouse <warehouse-path> \
+    --database <database-name> \
+    --table <table-name> \
+    [--partition <partition-name>] \
+    [--compact_strategy <minor / full>] \
+    [--table_conf <table_conf>] \
+    [--catalog_conf <paimon-catalog-conf> [--catalog_conf <paimon-catalog-conf> ...]]
+```
+
+示例：Compaction 一张表
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    compact \
+    --warehouse s3:///path/to/warehouse \
+    --database test_db \
+    --table test_table \
+    --partition dt=20221126,hh=08 \
+    --partition dt=20221127,hh=09 \
+    --table_conf sink.parallelism=10 \
+    --compact_strategy minor \
+    --catalog_conf s3.endpoint=https://****.com \
+    --catalog_conf s3.access-key=***** \
+    --catalog_conf s3.secret-key=*****
+```
+* `--compact_strategy` 决定如何挑选待合并的文件，默认值由运行时执行模式决定：流式模式使用 `minor` 策略，批式模式使用 `full` 策略。
+  * `full`：仅支持批式模式。所有文件都会被选中进行合并。
+  * `minor`：根据指定条件挑选需要合并的文件集合。
+
+你可以使用 `-D execution.runtime-mode=batch` 或 `-yD execution.runtime-mode=batch`（用于 ON-YARN 场景）来控制批式或流式模式。如果你提交的是批式作业，当前表的所有文件都会被 Compaction。如果你提交的是流式作业，作业将持续监控表的新变更，并按需执行 Compaction。
+
+要了解 compact action 的更多用法，请参见
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    compact --help
+```
+
+</TabItem>
+
+</Tabs>
+
+:::info
+
+同样地，默认采用同步 Compaction，这可能会导致 checkpoint 超时。你可以配置 `table_conf` 来使用 [异步 Compaction](../primary-key-table/compaction#asynchronous-compaction)。
+
+:::
+
+## 数据库 Compaction 作业 {#database-compaction-job}
+
+你可以执行以下命令，为多个数据库提交一个 Compaction 作业。
+
+<Tabs groupId="database-compaction-job">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+执行以下 SQL：
+
+```sql
+CALL sys.compact_database(
+  including_databases => 'includingDatabases', 
+  mode => 'mode', 
+  including_tables => 'includingTables', 
+  excluding_tables => 'excludingTables', 
+  table_options => 'tableOptions'
+)
+
+-- example
+CALL sys.compact_database(
+  including_databases => 'db1|db2', 
+  mode => 'combined', 
+  including_tables => 'table_.*', 
+  excluding_tables => 'ignore', 
+  table_options => 'sink.parallelism=4'
+)
+```
+
+</TabItem>
+
+<TabItem value="flink-action-jar" label="Flink Action Jar">
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    compact_database \
+    --warehouse <warehouse-path> \
+    --including_databases <database-name|name-regular-expr> \
+    [--including_tables <paimon-table-name|name-regular-expr>] \
+    [--excluding_tables <paimon-table-name|name-regular-expr>] \
+    [--mode <compact-mode>] \
+    [--compact_strategy <minor / full>] \
+    [--catalog_conf <paimon-catalog-conf> [--catalog_conf <paimon-catalog-conf> ...]] \
+    [--table_conf <paimon-table_conf> [--table_conf <paimon-table_conf> ...]]
+```
+
+* `--including_databases` 用于指定要 Compaction 哪些数据库。在 compact 模式下，你需要指定一个数据库名；在 compact_database 模式下，你可以指定多个数据库，并支持正则表达式。
+* `--including_tables` 用于指定要 Compaction 哪些源表，你必须使用 '|' 分隔多张表，格式为 `databaseName.tableName`，并支持正则表达式。例如，指定 "--including_tables db1.t1|db2.+" 表示对表 'db1.t1' 以及 db2 数据库中的所有表进行 Compaction。
+* `--excluding_tables` 用于指定不需要 Compaction 哪些源表。用法与 "--including_tables" 相同。如果你同时指定了二者，"--excluding_tables" 的优先级高于 "--including_tables"。
+* `--mode` 用于指定 Compaction 模式。可选值：
+  * "divided"（如果你未指定，则为默认模式）：为每张表启动一个 Sink，新增表的 Compaction 需要重启作业。
+  * "combined"：为所有表启动一个统一的合并 Sink，新增表会被自动 Compaction。
+* `--catalog_conf` 是 Paimon Catalog 的配置。每条配置都应以 `key=value` 的格式指定。完整的 Catalog 配置列表请参见 [此处](./configurations)。
+* `--table_conf` 是 Compaction 的配置。每条配置都应以 `key=value` 的格式指定。关键配置如下所示：
+
+| Key                               | 默认值  | 类型       | 说明                                                                                                                                                                                                          |
+|-----------------------------------|---------|------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| continuous.discovery-interval     | 10 s    | Duration   | 持续读取的发现间隔。                                                                                                                                                                                          |
+| sink.parallelism                  | (none)  | Integer    | 为 Sink 定义一个自定义并行度。默认情况下，如果未定义该配置项，planner 会结合全局配置为每条语句单独推导并行度。                                                                                               |
+
+你可以使用 `-D execution.runtime-mode=batch` 来控制批式或流式模式。如果你提交的是批式作业，当前表的所有文件都会被 Compaction。如果你提交的是流式作业，作业将持续监控表的新变更，并按需执行 Compaction。
+
+:::info
+
+如果你只想提交 Compaction 作业，而不想等待作业完成，你应当以 [分离模式（detached mode）](https://nightlies.apache.org/flink/flink-docs-stable/docs/deployment/cli/#submitting-a-job) 提交。
+
+:::
+
+:::info
+
+你可以设置 `--mode combined` 以在不重启作业的情况下 Compaction 新增表。
+
+:::
+
+示例 1：Compaction 数据库
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    compact_database \
+    --warehouse s3:///path/to/warehouse \
+    --including_databases test_db \
+    --catalog_conf s3.endpoint=https://****.com \
+    --catalog_conf s3.access-key=***** \
+    --catalog_conf s3.secret-key=*****
+```
+
+示例 2：以 combined 模式 Compaction 数据库
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    compact_database \
+    --warehouse s3:///path/to/warehouse \
+    --including_databases test_db \
+    --mode combined \
+    --catalog_conf s3.endpoint=https://****.com \
+    --catalog_conf s3.access-key=***** \
+    --catalog_conf s3.secret-key=***** \
+    --table_conf continuous.discovery-interval=*****
+```
+
+要了解 compact_database action 的更多用法，请参见
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    compact_database --help
+```
+
+</TabItem>
+
+</Tabs>
+
+## 排序 Compaction（Sort Compact） {#sort-compact}
+
+如果你的表配置为 [动态分桶主键表](../primary-key-table/data-distribution#dynamic-bucket) 或 [Append 表](../append-table/overview)，你可以触发一次按指定列排序的 Compaction，以加速查询。
+
+<Tabs groupId="sort-compaction-job">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+执行以下 SQL：
+
+```sql
+-- sort compact table
+CALL sys.compact(`table` => 'default.T', order_strategy => 'zorder', order_by => 'a,b')
+```
+
+</TabItem>
+
+<TabItem value="flink-action-jar" label="Flink Action Jar">
+
+```bash  
+<FLINK_HOME>/bin/flink run \
+    -D execution.runtime-mode=batch \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    compact \
+    --warehouse <warehouse-path> \
+    --database <database-name> \
+    --table <table-name> \
+    --order_strategy <orderType> \
+    --order_by <col1,col2,...> \
+    [--partition <partition-name>] \
+    [--catalog_conf <paimon-catalog-conf> [--catalog_conf <paimon-catalog-conf> ...]] \
+    [--table_conf <paimon-table-dynamic-conf> [--table_conf <paimon-table-dynamic-conf>] ...]
+```
+在 `Sort Compact` 中有两个新的配置项
+<ConfigTable html={sortCompactHtml} />
+
+排序的并行度与 Sink 的并行度相同，你可以通过添加配置 `--table_conf sink.parallelism=<value>` 来动态指定它。
+
+</TabItem>
+
+</Tabs>
+
+:::info
+
+排序 Compaction 目前仅支持 bucket=-1 和批式模式。
+
+:::
+
+## 历史分区 Compaction（Historical Partition Compact） {#historical-partition-compact}
+
+你可以执行以下命令，为在一段时间内未收到任何新数据的分区提交一个 Compaction 作业。这些分区中的小文件将被进行全量 Compaction。
+
+:::info
+
+该功能目前仅用于批式模式。
+
+:::
+
+### 针对单表（For Table） {#for-table}
+
+这是针对单张表的。
+<Tabs groupId="history-partition-compaction-job-for-table">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+执行以下 SQL：
+
+```sql
+-- history partition compact table
+CALL sys.compact(`table` => 'default.T', partition_idle_time => '1 d')
+```
+
+</TabItem>
+
+<TabItem value="flink-action-jar" label="Flink Action Jar">
+
+```bash  
+<FLINK_HOME>/bin/flink run \
+    -D execution.runtime-mode=batch \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    compact \
+    --warehouse <warehouse-path> \
+    --database <database-name> \
+    --table <table-name> \
+    --partition_idle_time <partition-idle-time> \
+    [--partition <partition-name>] \
+    [--compact_strategy <minor / full>] \
+    [--catalog_conf <paimon-catalog-conf> [--catalog_conf <paimon-catalog-conf> ...]] \
+    [--table_conf <paimon-table-dynamic-conf> [--table_conf <paimon-table-dynamic-conf>] ...]
+```
+
+在 `Historical Partition Compact` 中有一个新的配置项
+
+* `--partition_idle_time`：用于对在 'partition_idle_time' 时间内未收到任何新数据的分区执行一次全量 Compaction。并且仅这些分区会被 Compaction。
+
+</TabItem>
+
+</Tabs>
+
+### 针对多个数据库（For Databases） {#for-databases}
+
+这是针对不同数据库中的多张表的。
+<Tabs groupId="history-partition-compaction-job-for-databases">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+执行以下 SQL：
+
+```sql
+-- history partition compact table
+CALL sys.compact_database(
+  including_databases => 'includingDatabases', 
+  mode => 'mode', 
+  including_tables => 'includingTables',
+  excluding_tables => 'excludingTables',
+  table_options => 'tableOptions',
+  partition_idle_time => 'partition_idle_time'
+);
+```
+
+示例：对数据库中的表进行历史分区 Compaction
+
+```sql
+-- history partition compact table
+CALL sys.compact_database(
+  includingDatabases => 'test_db', 
+  mode => 'combined', 
+  partition_idle_time => '1 d'
+);
+```
+
+</TabItem>
+
+<TabItem value="flink-action-jar" label="Flink Action Jar">
+
+```bash  
+<FLINK_HOME>/bin/flink run \
+    -D execution.runtime-mode=batch \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    compact_database \
+    --warehouse <warehouse-path> \
+    --including_databases <database-name|name-regular-expr> \
+    --partition_idle_time <partition-idle-time> \
+    [--including_tables <paimon-table-name|name-regular-expr>] \
+    [--excluding_tables <paimon-table-name|name-regular-expr>] \
+    [--mode <compact-mode>] \
+    [--compact_strategy <minor / full>] \
+    [--catalog_conf <paimon-catalog-conf> [--catalog_conf <paimon-catalog-conf> ...]] \
+    [--table_conf <paimon-table_conf> [--table_conf <paimon-table_conf> ...]]
+```
+
+示例：对数据库中的表进行历史分区 Compaction
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    compact_database \
+    --warehouse s3:///path/to/warehouse \
+    --including_databases test_db \
+    --partition_idle_time 1d \
+    --catalog_conf s3.endpoint=https://****.com \
+    --catalog_conf s3.access-key=***** \
+    --catalog_conf s3.secret-key=*****
+```
+
+</TabItem>
+
+</Tabs>

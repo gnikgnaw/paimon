@@ -1,0 +1,310 @@
+---
+title: "管理分支"
+sidebar_position: 11
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# 管理分支 {#manage-branches}
+
+在流式数据处理中，修正数据非常困难，因为它可能会影响已有数据，而且用户会看到流式的临时结果，这并不符合预期。
+
+我们假设现有工作流正在处理的分支为 'main' 分支，通过创建自定义数据分支（Branch），可以帮助在已有表上为新作业进行实验性测试和数据校验，无需停止现有的读 / 写工作流，也无需从 main 分支复制数据。
+
+通过合并或替换分支操作，用户可以完成数据的修正。
+
+## 创建分支 {#create-branches}
+
+Paimon 支持从指定的标签（Tag）创建分支，或者直接创建一个空分支，即所创建分支的初始状态就像一张空表。
+
+<Tabs groupId="create-branches">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+执行以下 sql：
+
+```sql
+-- create branch named 'branch1' from tag 'tag1'
+CALL sys.create_branch('default.T', 'branch1', 'tag1');
+
+-- create empty branch named 'branch1'
+CALL sys.create_branch('default.T', 'branch1');
+```
+
+</TabItem>
+
+<TabItem value="flink-action-jar" label="Flink Action Jar">
+
+执行以下命令：
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    create_branch \
+    --warehouse <warehouse-path> \
+    --database <database-name> \
+    --table <table-name> \
+    --branch_name <branch-name> \
+    [--tag_name <tag-name>] \
+    [--catalog_conf <paimon-catalog-conf> [--catalog_conf <paimon-catalog-conf> ...]]
+```
+
+</TabItem>
+
+<TabItem value="spark-sql" label="Spark SQL">
+
+执行以下 sql：
+
+```sql
+-- create branch named 'branch1' from tag 'tag1'
+CALL sys.create_branch('default.T', 'branch1', 'tag1');
+
+-- create empty branch named 'branch1'
+CALL sys.create_branch('default.T', 'branch1');
+```
+
+</TabItem>
+
+</Tabs>
+
+## 删除分支 {#delete-branches}
+
+你可以通过分支名称删除分支。
+
+:::warning
+
+__注意：__ `Delete Branches`（删除分支）操作仅删除元数据文件。如果你想清除在分支期间写入的数据，请使用 [remove_orphan_files](../flink/procedures)
+
+:::
+
+<Tabs groupId="delete-branches">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+执行以下 sql：
+
+```sql
+CALL sys.delete_branch('default.T', 'branch1');
+```
+
+</TabItem>
+
+<TabItem value="flink-action-jar" label="Flink Action Jar">
+
+执行以下命令：
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    delete_branch \
+    --warehouse <warehouse-path> \
+    --database <database-name> \
+    --table <table-name> \
+    --branch_name <branch-name> \
+    [--catalog_conf <paimon-catalog-conf> [--catalog_conf <paimon-catalog-conf> ...]]
+```
+
+</TabItem>
+
+<TabItem value="spark-sql" label="Spark SQL">
+
+执行以下 sql：
+
+```sql
+CALL sys.delete_branch('default.T', 'branch1');
+```
+
+</TabItem>
+
+</Tabs>
+
+## 通过分支进行读 / 写 {#read--write-with-branch}
+
+你可以按如下方式通过分支进行读或写。
+
+<Tabs groupId="read-write-branch">
+
+<TabItem value="flink" label="Flink">
+
+```sql
+-- read from branch 'branch1'
+SELECT * FROM `t$branch_branch1`;
+SELECT * FROM `t$branch_branch1` /*+ OPTIONS('consumer-id' = 'myid') */;
+
+-- write to branch 'branch1'
+INSERT INTO `t$branch_branch1` SELECT ...
+```
+
+</TabItem>
+
+<TabItem value="spark-sql" label="Spark SQL">
+
+```sql
+-- read from branch 'branch1'
+SELECT * FROM `t$branch_branch1`;
+
+-- write to branch 'branch1'
+INSERT INTO `t$branch_branch1` SELECT ...
+```
+
+</TabItem>
+
+<TabItem value="spark-dataframe" label="Spark DataFrame">
+
+```sql
+-- read from branch 'branch1'
+spark.read.format("paimon").option("branch", "branch1").table("t")
+```
+
+</TabItem>
+
+</Tabs>
+
+## 快进（Fast Forward） {#fast-forward}
+
+将自定义分支快进（Fast-Forward）到 main 分支，会删除 main 分支中在该分支初始标签之后创建的所有快照、标签和 schema，并将该分支的快照、标签和 schema 复制到 main 分支。
+
+如果你的分支修改了 schema，在快进之后，如果使用的是 Spark SQL，你可以执行 `REFRESH TABLE my_table`
+来清理缓存，以避免因缓存导致的不一致问题。
+
+<Tabs groupId="fast-forward">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+```sql
+CALL sys.fast_forward('default.T', 'branch1');
+```
+
+</TabItem>
+
+<TabItem value="flink-action-jar" label="Flink Action Jar">
+
+执行以下命令：
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    fast_forward \
+    --warehouse <warehouse-path> \
+    --database <database-name> \
+    --table <table-name> \
+    --branch_name <branch-name> \
+    [--catalog_conf <paimon-catalog-conf> [--catalog_conf <paimon-catalog-conf> ...]]
+```
+
+</TabItem>
+
+<TabItem value="spark-sql" label="Spark SQL">
+
+执行以下 sql：
+
+```sql
+CALL sys.fast_forward('default.T', 'branch1');
+```
+
+</TabItem>
+
+</Tabs>
+
+## 从回退分支进行批式读取 {#batch-reading-from-fallback-branch}
+
+你可以设置表配置项 `scan.fallback-branch`，
+这样当批式作业从当前分支读取时，如果某个分区不存在，
+读取器将尝试从回退分支读取该分区。
+对于流式读取作业，目前不支持此功能，它只会从当前分支产出结果。
+
+这个功能的使用场景是什么？假设你创建了一张按日期分区的 Paimon 表。
+你有一个长期运行的流式作业向 Paimon 中插入记录，以便能够及时查询到当天的数据。
+同时你还有一个批式作业，在每天晚上运行，将昨天经过修正的记录插入到 Paimon 中，
+从而保证数据的准确性。
+
+当你查询这张 Paimon 表时，你希望首先从批式作业的结果中读取。
+但如果某个分区（例如当天的分区）在批式作业的结果中不存在，
+那么你希望从流式作业的结果中读取。
+在这种情况下，你可以为流式作业创建一个分支，并将 `scan.fallback-branch` 设置为该流式分支。
+
+让我们来看一个示例。
+
+<Tabs groupId="read-fallback-branch">
+
+<TabItem value="flink" label="Flink">
+
+```sql
+-- create Paimon table
+CREATE TABLE T (
+    dt STRING NOT NULL,
+    name STRING NOT NULL,
+    amount BIGINT
+) PARTITIONED BY (dt);
+
+-- create a branch for streaming job
+CALL sys.create_branch('default.T', 'test');
+
+-- set primary key and bucket number for the branch
+ALTER TABLE `T$branch_test` SET (
+    'primary-key' = 'dt,name',
+    'bucket' = '2',
+    'changelog-producer' = 'lookup'
+);
+
+-- set fallback branch
+ALTER TABLE T SET (
+    'scan.fallback-branch' = 'test'
+);
+
+-- write records into the streaming branch
+INSERT INTO `T$branch_test` VALUES ('20240725', 'apple', 4), ('20240725', 'peach', 10), ('20240726', 'cherry', 3), ('20240726', 'pear', 6);
+
+-- write records into the default branch
+INSERT INTO T VALUES ('20240725', 'apple', 5), ('20240725', 'banana', 7);
+
+SELECT * FROM T;
+/*
++------------------+------------------+--------+
+|               dt |             name | amount |
++------------------+------------------+--------+
+|         20240725 |            apple |      5 |
+|         20240725 |           banana |      7 |
+|         20240726 |           cherry |      3 |
+|         20240726 |             pear |      6 |
++------------------+------------------+--------+
+*/
+
+-- reset fallback branch
+ALTER TABLE T RESET ( 'scan.fallback-branch' );
+
+-- now it only reads from default branch
+SELECT * FROM T;
+/*
++------------------+------------------+--------+
+|               dt |             name | amount |
++------------------+------------------+--------+
+|         20240725 |            apple |      5 |
+|         20240725 |           banana |      7 |
++------------------+------------------+--------+
+*/
+```
+
+</TabItem>
+
+</Tabs>

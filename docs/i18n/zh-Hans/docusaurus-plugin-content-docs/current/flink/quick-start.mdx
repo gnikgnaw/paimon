@@ -1,0 +1,310 @@
+---
+title: "快速开始"
+sidebar_position: 1
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+import Stable from '@site/src/components/Stable';
+import Unstable from '@site/src/components/Unstable';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# 快速开始 {#quick-start}
+
+本文档是在 Flink 中使用 Paimon 的指南。
+
+## Jar 包 {#jars}
+
+Paimon 当前支持 Flink 2.2、2.1、2.0、1.20、1.19、1.18、1.17、1.16。我们推荐使用最新的 Flink 版本以获得更好的体验。
+
+请下载对应版本的 jar 文件。
+
+> 当前，Paimon 提供两类 jar：其中一类（bundled jar）用于读/写数据，另一类（Action jar）用于诸如手动 Compaction 等操作，
+<Stable>
+
+
+
+| 版本         | 类型        | Jar                                                                                                                                                                           |
+|--------------|-------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Flink 2.2    | Bundled Jar | [paimon-flink-2.2-@@VERSION@@.jar](https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-flink-2.2/@@VERSION@@/paimon-flink-2.2-@@VERSION@@.jar)          |
+| Flink 2.1    | Bundled Jar | [paimon-flink-2.1-@@VERSION@@.jar](https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-flink-2.1/@@VERSION@@/paimon-flink-2.1-@@VERSION@@.jar)          |
+| Flink 2.0    | Bundled Jar | [paimon-flink-2.0-@@VERSION@@.jar](https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-flink-2.0/@@VERSION@@/paimon-flink-2.0-@@VERSION@@.jar)          |
+| Flink 1.20   | Bundled Jar | [paimon-flink-1.20-@@VERSION@@.jar](https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-flink-1.20/@@VERSION@@/paimon-flink-1.20-@@VERSION@@.jar)       |
+| Flink 1.19   | Bundled Jar | [paimon-flink-1.19-@@VERSION@@.jar](https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-flink-1.19/@@VERSION@@/paimon-flink-1.19-@@VERSION@@.jar)       |
+| Flink 1.18   | Bundled Jar | [paimon-flink-1.18-@@VERSION@@.jar](https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-flink-1.18/@@VERSION@@/paimon-flink-1.18-@@VERSION@@.jar)       |
+| Flink 1.17   | Bundled Jar | [paimon-flink-1.17-@@VERSION@@.jar](https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-flink-1.17/@@VERSION@@/paimon-flink-1.17-@@VERSION@@.jar)       |
+| Flink 1.16   | Bundled Jar | [paimon-flink-1.16-@@VERSION@@.jar](https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-flink-1.16/@@VERSION@@/paimon-flink-1.16-@@VERSION@@.jar)       |
+| Flink Action | Action Jar  | [paimon-flink-action-@@VERSION@@.jar](https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-flink-action/@@VERSION@@/paimon-flink-action-@@VERSION@@.jar) |
+
+
+
+</Stable>
+
+<Unstable>
+
+
+
+| 版本         | 类型        | Jar                                                                                                                                       |
+|--------------|-------------|-------------------------------------------------------------------------------------------------------------------------------------------|
+| Flink 2.0    | Bundled Jar | 尚未发布                                                                                                                                  |
+| Flink 1.20   | Bundled Jar | [paimon-flink-1.20-@@VERSION@@.jar](https://repository.apache.org/snapshots/org/apache/paimon/paimon-flink-1.20/@@VERSION@@/)     |
+| Flink 1.19   | Bundled Jar | [paimon-flink-1.19-@@VERSION@@.jar](https://repository.apache.org/snapshots/org/apache/paimon/paimon-flink-1.19/@@VERSION@@/)     |
+| Flink 1.18   | Bundled Jar | [paimon-flink-1.18-@@VERSION@@.jar](https://repository.apache.org/snapshots/org/apache/paimon/paimon-flink-1.18/@@VERSION@@/)     |
+| Flink 1.17   | Bundled Jar | [paimon-flink-1.17-@@VERSION@@.jar](https://repository.apache.org/snapshots/org/apache/paimon/paimon-flink-1.17/@@VERSION@@/)     |
+| Flink 1.16   | Bundled Jar | [paimon-flink-1.16-@@VERSION@@.jar](https://repository.apache.org/snapshots/org/apache/paimon/paimon-flink-1.16/@@VERSION@@/)     |
+| Flink Action | Action Jar  | [paimon-flink-action-@@VERSION@@.jar](https://repository.apache.org/snapshots/org/apache/paimon/paimon-flink-action/@@VERSION@@/) |
+
+
+
+</Unstable>
+
+你也可以从源代码手动构建 bundled jar。
+
+如需从源代码构建，请[克隆 git 仓库](@@GITHUB_REPO@@)。
+
+使用以下命令构建 bundled jar。
+- `mvn clean install -DskipTests`
+
+你可以在 `./paimon-flink/paimon-flink-<flink-version>/target/paimon-flink-<flink-version>-@@VERSION@@.jar` 找到 bundled jar，在 `./paimon-flink/paimon-flink-action/target/paimon-flink-action-@@VERSION@@.jar` 找到 Action jar。
+
+## 开始 {#start}
+
+**第 1 步：下载 Flink**
+
+如果你还没有下载 Flink，可以[下载 Flink](https://flink.apache.org/downloads.html)，然后使用以下命令解压压缩包。
+
+```bash
+tar -xzf flink-*.tgz
+```
+
+**第 2 步：复制 Paimon Bundled Jar**
+
+将 Paimon bundled jar 复制到 Flink home 的 `lib` 目录下。
+
+```bash
+cp paimon-flink-*.jar <FLINK_HOME>/lib/
+```
+
+**第 3 步：复制 Hadoop Bundled Jar**
+
+:::info
+
+如果机器处于 hadoop 环境中，请确保环境变量 `HADOOP_CLASSPATH` 的值包含通用 Hadoop 库的路径，此时你无需使用下面的预打包 Hadoop jar。
+
+:::
+
+[下载](https://flink.apache.org/downloads.html)预打包的 Hadoop jar，并将该 jar 文件复制到 Flink home 的 `lib` 目录下。
+
+```bash
+cp flink-shaded-hadoop-2-uber-*.jar <FLINK_HOME>/lib/
+```
+
+**第 4 步：启动 Flink 本地集群**
+
+为了能够同时运行多个 Flink 作业，你需要修改 `<FLINK_HOME>/conf/flink-conf.yaml`（Flink 版本 \< 1.19）或 `<FLINK_HOME>/conf/config.yaml`（Flink 版本 >= 1.19）中的集群配置。
+
+```yaml
+taskmanager.numberOfTaskSlots: 2
+```
+
+要启动本地集群，请运行 Flink 自带的 bash 脚本：
+
+```bash
+<FLINK_HOME>/bin/start-cluster.sh
+```
+
+你应该能够访问 Web UI [localhost:8081](http://localhost:8081) 来查看 Flink 仪表盘，并看到集群已经正常启动运行。
+
+现在你可以启动 Flink SQL client 来执行 SQL 脚本。
+
+```bash
+<FLINK_HOME>/bin/sql-client.sh
+```
+
+**第 5 步：创建 Catalog 和表**
+
+<Tabs groupId="create-flink-catalog">
+
+<TabItem value="catalog" label="Catalog">
+
+```sql
+-- if you're trying out Paimon in a distributed environment,
+-- the warehouse path should be set to a shared file system, such as HDFS or OSS
+CREATE CATALOG my_catalog WITH (
+    'type'='paimon',
+    'warehouse'='file:/tmp/paimon'
+);
+
+USE CATALOG my_catalog;
+
+-- create a word count table
+CREATE TABLE word_count (
+    word STRING PRIMARY KEY NOT ENFORCED,
+    cnt BIGINT
+);
+```
+
+</TabItem>
+
+<TabItem value="generic-catalog" label="通用 Catalog">
+
+使用 FlinkGenericCatalog 时，你需要使用 Hive metastore。然后，你就可以使用来自 Paimon、Hive 以及 Flink 通用表（Kafka 等表）的所有表！
+
+在这种模式下，创建表时应使用 'connector' 配置项。
+
+:::info
+
+Paimon 会使用你 `hive-site.xml` 中的 `hive.metastore.warehouse.dir`，请使用带 scheme 的路径。
+例如 `hdfs://...`。否则，Paimon 会使用本地路径。
+
+:::
+
+```sql
+CREATE CATALOG my_catalog WITH (
+    'type'='paimon-generic',
+    'hive-conf-dir'='...',
+    'hadoop-conf-dir'='...'
+);
+
+USE CATALOG my_catalog;
+
+-- create a word count table
+CREATE TABLE word_count (
+    word STRING PRIMARY KEY NOT ENFORCED,
+    cnt BIGINT
+) WITH (
+    'connector'='paimon'
+);
+```
+
+</TabItem>
+
+</Tabs>
+
+**第 6 步：写入数据**
+
+```sql
+-- create a word data generator table
+CREATE TEMPORARY TABLE word_table (
+    word STRING
+) WITH (
+    'connector' = 'datagen',
+    'fields.word.length' = '1'
+);
+
+-- paimon requires checkpoint interval in streaming mode
+SET 'execution.checkpointing.interval' = '10 s';
+
+-- write streaming data to dynamic table
+INSERT INTO word_count SELECT word, COUNT(*) FROM word_table GROUP BY word;
+```
+
+**第 7 步：OLAP 查询**
+
+```sql
+-- use tableau result mode
+SET 'sql-client.execution.result-mode' = 'tableau';
+
+-- switch to batch mode
+RESET 'execution.checkpointing.interval';
+SET 'execution.runtime-mode' = 'batch';
+
+-- olap query the table
+SELECT * FROM word_count;
+```
+
+你可以多次执行该查询，观察结果的变化。
+
+**第 8 步：流式查询**
+
+```sql
+-- switch to streaming mode
+SET 'execution.runtime-mode' = 'streaming';
+
+-- track the changes of table and calculate the count interval statistics
+SELECT `interval`, COUNT(*) AS interval_cnt FROM
+    (SELECT cnt / 10000 AS `interval` FROM word_count) GROUP BY `interval`;
+```
+
+**第 9 步：退出**
+
+在 [localhost:8081](http://localhost:8081) 中取消流式作业，然后执行以下 SQL 脚本退出 Flink SQL client。
+
+```sql
+-- uncomment the following line if you want to drop the dynamic table and clear the files
+-- DROP TABLE word_count;
+
+-- exit sql-client
+EXIT;
+```
+
+停止 Flink 本地集群。
+
+```bash
+./bin/stop-cluster.sh
+```
+
+## 使用 Flink 托管内存 {#use-flink-managed-memory}
+
+Paimon 任务可以基于 executor 内存创建内存池，这些内存池将由 Flink executor 管理，例如 Flink task manager 中的托管内存。它会通过 executor 为多个任务管理 writer 缓冲区，从而提升 Sink 的稳定性和性能。
+
+如果使用 Flink 托管内存，可以设置以下属性：
+
+| 配置项    | 默认值 | 说明                                                                                                                                                                    |
+|------------|----------|---------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| sink.use-managed-memory-allocator | false | 如果为 true，Flink Sink 将为 merge tree 使用托管内存；否则，它将创建一个独立的内存分配器，这意味着每个任务都会分配并管理自己的内存池（堆内存）。如果一个 Executor 中任务过多，可能会导致性能问题，甚至 OOM。 |
+| sink.managed.writer-buffer-memory | 256M  | writer 缓冲区在托管内存中的权重，Flink 会根据该权重为 writer 计算内存大小，实际使用的内存取决于运行环境。当前该属性中定义的内存大小等于运行时实际分配给写缓冲区的内存。 |
+
+**在 SQL 中使用**
+用户可以在 SQL 中为 Flink 托管内存设置内存权重，随后 Flink Sink 算子会获取内存池大小，并为 Paimon writer 创建分配器。
+
+```sql
+INSERT INTO paimon_table /*+ OPTIONS('sink.use-managed-memory-allocator'='true', 'sink.managed.writer-buffer-memory'='256M') */
+SELECT * FROM ....;
+```
+
+## 设置动态参数 {#setting-dynamic-options}
+
+在与 Paimon 表交互时，可以在不修改 Catalog 中配置项的情况下调整表的配置项。Paimon 会提取作业级别的动态参数，并在当前会话中生效。
+动态表配置项的 key 格式为 `paimon.${catalogName}.${dbName}.${tableName}.${config_key}`。其中 catalogName/dbName/tableName 可以为 `*`，表示匹配相应部分的所有取值。
+动态全局配置项的 key 格式为 `${config_key}`。全局配置项会对所有表生效。如果存在冲突，表配置项将覆盖全局配置项。
+
+例如：
+
+```sql
+-- set scan.timestamp-millis=1697018249001 for all tables
+SET 'scan.timestamp-millis' = '1697018249001';
+SELECT * FROM T;
+
+-- set scan.timestamp-millis=1697018249000 for the table mycatalog.default.T
+SET 'paimon.mycatalog.default.T.scan.timestamp-millis' = '1697018249000';
+SELECT * FROM T;
+
+-- set scan.timestamp-millis=1697018249000 for the table default.T in any catalog
+SET 'paimon.*.default.T.scan.timestamp-millis' = '1697018249000';
+SELECT * FROM T;
+
+-- set scan.timestamp-millis=1697018249000 for the table mycatalog.default.T1
+-- set scan.timestamp-millis=1697018249001 for others tables
+SET 'paimon.mycatalog.default.T1.scan.timestamp-millis' = '1697018249000';
+SET 'scan.timestamp-millis' = '1697018249001';
+SELECT * FROM T1 JOIN T2 ON xxxx;
+```

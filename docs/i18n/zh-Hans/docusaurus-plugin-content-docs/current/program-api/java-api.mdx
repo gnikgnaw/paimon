@@ -1,0 +1,437 @@
+---
+title: "Java API"
+sidebar_position: 3
+---
+
+import Stable from '@site/src/components/Stable';
+import Unstable from '@site/src/components/Unstable';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# Java API
+
+:::info
+
+如有可能，推荐使用 Flink SQL 或 Spark SQL 等计算引擎。
+
+:::
+
+## 依赖 {#dependency}
+
+Maven 依赖：
+
+```xml
+<dependency>
+  <groupId>org.apache.paimon</groupId>
+  <artifactId>paimon-bundle</artifactId>
+  <version>@@VERSION@@</version>
+</dependency>
+```
+
+或者下载该 jar 文件：
+<Stable>
+
+[Paimon Bundle](https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-bundle/@@VERSION@@/paimon-bundle-@@VERSION@@.jar)。
+
+</Stable>
+<Unstable>
+
+[Paimon Bundle](https://repository.apache.org/snapshots/org/apache/paimon/paimon-bundle/@@VERSION@@/)。
+
+</Unstable>
+
+Paimon 依赖 Hadoop 环境，你应当添加 hadoop classpath 或 bundled jar。
+
+## 创建 Catalog {#create-catalog}
+
+在接触 Table 之前，你需要先创建一个 Catalog。
+
+```java
+import org.apache.paimon.catalog.Catalog;
+import org.apache.paimon.catalog.CatalogContext;
+import org.apache.paimon.catalog.CatalogFactory;
+import org.apache.paimon.fs.Path;
+import org.apache.paimon.options.Options;
+
+public class CreateCatalog {
+
+    public static Catalog createFilesystemCatalog() {
+        CatalogContext context = CatalogContext.create(new Path("..."));
+        return CatalogFactory.createCatalog(context);
+    }
+
+    public static Catalog createHiveCatalog() {
+        // Paimon Hive catalog relies on Hive jars
+        // You should add hive classpath or hive bundled jar.
+        Options options = new Options();
+        options.set("warehouse", "...");
+        options.set("metastore", "hive");
+        options.set("uri", "...");
+        options.set("hive-conf-dir", "...");
+        options.set("hadoop-conf-dir", "...");
+        CatalogContext context = CatalogContext.create(options);
+        return CatalogFactory.createCatalog(context);
+    }
+}
+```
+
+## 创建表 {#create-table}
+
+你可以使用 Catalog 来创建表。创建的表会持久化在文件系统中。
+下次你可以直接获取这些表。
+
+```java
+import org.apache.paimon.catalog.Catalog;
+import org.apache.paimon.catalog.Identifier;
+import org.apache.paimon.schema.Schema;
+import org.apache.paimon.types.DataTypes;
+
+public class CreateTable {
+
+    public static void main(String[] args) {
+        Schema.Builder schemaBuilder = Schema.newBuilder();
+        schemaBuilder.primaryKey("f0", "f1");
+        schemaBuilder.partitionKeys("f1");
+        schemaBuilder.column("f0", DataTypes.STRING());
+        schemaBuilder.column("f1", DataTypes.INT());
+        Schema schema = schemaBuilder.build();
+
+        Identifier identifier = Identifier.create("my_db", "my_table");
+        try {
+            Catalog catalog = CreateCatalog.createFilesystemCatalog();
+            catalog.createTable(identifier, schema, false);
+        } catch (Catalog.TableAlreadyExistException e) {
+            // do something
+        } catch (Catalog.DatabaseNotExistException e) {
+            // do something
+        }
+    }
+}
+```
+
+## 获取表 {#get-table}
+
+`Table` 接口提供了访问表元数据的能力，以及读写表的工具。
+
+```java
+import org.apache.paimon.catalog.Catalog;
+import org.apache.paimon.catalog.Identifier;
+import org.apache.paimon.table.Table;
+
+public class GetTable {
+
+    public static Table getTable() {
+        Identifier identifier = Identifier.create("my_db", "my_table");
+        try {
+            Catalog catalog = CreateCatalog.createFilesystemCatalog();
+            return catalog.getTable(identifier);
+        } catch (Catalog.TableNotExistException e) {
+            // do something
+            throw new RuntimeException("table not exist");
+        }
+    }
+}
+```
+
+## 批式读取 {#batch-read}
+
+对于数据量相对较小的情况，或者经过投影和过滤后的数据，
+你可以直接使用单机程序读取表数据。
+
+但如果表的数据量相对较大，你可以将 split 分发到不同的任务中进行读取。
+
+读取分为两个阶段：
+
+1. 扫描计划（Scan Plan）：在全局节点（'Coordinator'，或称 'Driver'）上生成计划 split。
+2. 读取 Split（Read Split）：在分布式任务中读取 split。
+
+```java
+import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.predicate.Predicate;
+import org.apache.paimon.predicate.PredicateBuilder;
+import org.apache.paimon.reader.RecordReader;
+import org.apache.paimon.table.Table;
+import org.apache.paimon.table.source.ReadBuilder;
+import org.apache.paimon.table.source.Split;
+import org.apache.paimon.table.source.TableRead;
+import org.apache.paimon.types.DataTypes;
+import org.apache.paimon.types.RowType;
+
+import com.google.common.collect.Lists;
+
+import java.util.List;
+
+public class ReadTable {
+
+    public static void main(String[] args) throws Exception {
+        // 1. Create a ReadBuilder and push filter (`withFilter`)
+        // and projection (`withProjection`) if necessary
+        Table table = GetTable.getTable();
+
+        PredicateBuilder builder =
+                new PredicateBuilder(RowType.of(DataTypes.STRING(), DataTypes.INT()));
+        Predicate notNull = builder.isNotNull(0);
+        Predicate greaterOrEqual = builder.greaterOrEqual(1, 12);
+
+        int[] projection = new int[]{0, 1};
+
+        ReadBuilder readBuilder =
+                table.newReadBuilder()
+                        .withProjection(projection)
+                        .withFilter(Lists.newArrayList(notNull, greaterOrEqual));
+
+        // 2. Plan splits in 'Coordinator' (or named 'Driver')
+        List<Split> splits = readBuilder.newScan().plan().splits();
+
+        // 3. Distribute these splits to different tasks
+
+        // 4. Read a split in task
+        // You can use executeFilter to do filter per record.
+        // By default, only capable of performing coarse-grained filtering.
+        TableRead read = readBuilder.newRead().executeFilter();
+        RecordReader<InternalRow> reader = read.createReader(splits);
+        reader.forEachRemaining(System.out::println);
+    }
+}
+```
+
+## 批式写入 {#batch-write}
+
+写入分为两个阶段：
+
+1. 写入记录（Write records）：在分布式任务中写入记录，生成提交消息（commit message）。
+2. 提交/中止（Commit/Abort）：收集所有 CommitMessage，在全局节点（'Coordinator'，或称 'Driver'，或称 'Committer'）上进行提交。
+   当提交因某种原因失败时，通过 CommitMessage 中止未成功的提交。
+
+```java
+import org.apache.paimon.data.BinaryString;
+import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.table.Table;
+import org.apache.paimon.table.sink.BatchTableCommit;
+import org.apache.paimon.table.sink.BatchTableWrite;
+import org.apache.paimon.table.sink.BatchWriteBuilder;
+import org.apache.paimon.table.sink.CommitMessage;
+
+import java.util.List;
+
+public class BatchWrite {
+    public static void main(String[] args) throws Exception {
+        // 1. Create a WriteBuilder (Serializable)
+        Table table = GetTable.getTable();
+        BatchWriteBuilder writeBuilder = table.newBatchWriteBuilder().withOverwrite();
+
+        // 2. Write records in distributed tasks
+        BatchTableWrite write = writeBuilder.newWrite();
+
+        GenericRow record1 = GenericRow.of(BinaryString.fromString("Alice"), 12);
+        GenericRow record2 = GenericRow.of(BinaryString.fromString("Bob"), 5);
+        GenericRow record3 = GenericRow.of(BinaryString.fromString("Emily"), 18);
+
+        // If this is a distributed write, you can use writeBuilder.newWriteSelector.
+        // WriteSelector determines to which logical downstream writers a record should be written to.
+        // If it returns empty, no data distribution is required.
+
+        write.write(record1);
+        write.write(record2);
+        write.write(record3);
+
+        List<CommitMessage> messages = write.prepareCommit();
+
+        // 3. Collect all CommitMessages to a global node and commit
+        BatchTableCommit commit = writeBuilder.newCommit();
+        commit.commit(messages);
+
+        // Abort unsuccessful commit to delete data files
+        // commit.abort(messages);
+    }
+}
+```
+
+## 流式读取 {#stream-read}
+
+流式读取的不同之处在于，StreamTableScan 可以持续扫描并生成 split。
+
+StreamTableScan 提供了 checkpoint 和恢复的能力，可以让你在流式读取期间保存正确的状态。
+
+```java
+import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.predicate.Predicate;
+import org.apache.paimon.predicate.PredicateBuilder;
+import org.apache.paimon.reader.RecordReader;
+import org.apache.paimon.table.Table;
+import org.apache.paimon.table.source.ReadBuilder;
+import org.apache.paimon.table.source.Split;
+import org.apache.paimon.table.source.StreamTableScan;
+import org.apache.paimon.table.source.TableRead;
+import org.apache.paimon.types.DataTypes;
+import org.apache.paimon.types.RowType;
+
+import com.google.common.collect.Lists;
+
+import java.util.List;
+
+public class StreamReadTable {
+
+    public static void main(String[] args) throws Exception {
+        // 1. Create a ReadBuilder and push filter (`withFilter`)
+        // and projection (`withProjection`) if necessary
+        Table table = GetTable.getTable();
+
+        PredicateBuilder builder =
+                new PredicateBuilder(RowType.of(DataTypes.STRING(), DataTypes.INT()));
+        Predicate notNull = builder.isNotNull(0);
+        Predicate greaterOrEqual = builder.greaterOrEqual(1, 12);
+
+        int[] projection = new int[]{0, 1};
+
+        ReadBuilder readBuilder =
+                table.newReadBuilder()
+                        .withProjection(projection)
+                        .withFilter(Lists.newArrayList(notNull, greaterOrEqual));
+
+        // 2. Plan splits in 'Coordinator' (or named 'Driver')
+        StreamTableScan scan = readBuilder.newStreamScan();
+        while (true) {
+            List<Split> splits = scan.plan().splits();
+            // Distribute these splits to different tasks
+
+            Long state = scan.checkpoint();
+            // can be restored in scan.restore(state) after fail over
+
+            // 3. Read a split in task
+            // You can use executeFilter to do filter per record.
+            // By default, only capable of performing coarse-grained filtering.
+            TableRead read = readBuilder.newRead().executeFilter();
+            RecordReader<InternalRow> reader = read.createReader(splits);
+            reader.forEachRemaining(System.out::println);
+
+            Thread.sleep(1000);
+        }
+    }
+}
+```
+
+## 流式写入 {#stream-write}
+
+流式写入的不同之处在于，StreamTableCommit 可以持续提交。
+
+实现 exactly-once 一致性的关键点：
+
+- CommitUser 代表一个用户。一个用户可以多次提交。在分布式处理中，你应当使用相同的 commitUser。
+- 不同的应用程序需要使用不同的 commitUser。
+- `StreamTableWrite` 与 `StreamTableCommit` 的 commitIdentifier 需要保持一致，并且
+  在下一次提交时该 id 需要递增。
+- 当发生故障时，如果你仍有尚未提交的 `CommitMessage`，请使用 `StreamTableCommit#filterAndCommit`
+  按 commitIdentifier 排除已提交的消息。
+
+```java
+import org.apache.paimon.data.BinaryString;
+import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.table.Table;
+import org.apache.paimon.table.sink.CommitMessage;
+import org.apache.paimon.table.sink.StreamTableCommit;
+import org.apache.paimon.table.sink.StreamTableWrite;
+import org.apache.paimon.table.sink.StreamWriteBuilder;
+
+import java.util.List;
+
+public class StreamWriteTable {
+
+    public static void main(String[] args) throws Exception {
+        // 1. Create a WriteBuilder (Serializable)
+        Table table = GetTable.getTable();
+        StreamWriteBuilder writeBuilder = table.newStreamWriteBuilder();
+
+        // 2. Write records in distributed tasks
+        StreamTableWrite write = writeBuilder.newWrite();
+        // commitIdentifier like Flink checkpointId
+        long commitIdentifier = 0;
+
+        while (true) {
+            GenericRow record1 = GenericRow.of(BinaryString.fromString("Alice"), 12);
+            GenericRow record2 = GenericRow.of(BinaryString.fromString("Bob"), 5);
+            GenericRow record3 = GenericRow.of(BinaryString.fromString("Emily"), 18);
+
+            // If this is a distributed write, you can use writeBuilder.newWriteSelector.
+            // WriteSelector determines to which logical downstream writers a record should be written to.
+            // If it returns empty, no data distribution is required.
+
+            write.write(record1);
+            write.write(record2);
+            write.write(record3);
+            List<CommitMessage> messages = write.prepareCommit(false, commitIdentifier);
+            commitIdentifier++;
+
+            // 3. Collect all CommitMessages to a global node and commit
+            StreamTableCommit commit = writeBuilder.newCommit();
+            commit.commit(commitIdentifier, messages);
+
+            // 4. When failure occurs and you're not sure if the commit process is successful,
+            //    you can use `filterAndCommit` to retry the commit process.
+            //    Succeeded commits will be automatically skipped.
+            /*
+            Map<Long, List<CommitMessage>> commitIdentifiersAndMessages = new HashMap<>();
+            commitIdentifiersAndMessages.put(commitIdentifier, messages);
+            commit.filterAndCommit(commitIdentifiersAndMessages);
+            */
+
+            Thread.sleep(1000);
+        }
+    }
+}
+```
+
+## 数据类型 {#data-types}
+
+| Java         | Paimon                               | 
+|:-------------|:-------------------------------------|
+| boolean      | boolean                              |
+| byte         | byte                                 |
+| short        | short                                |
+| int          | int                                  |
+| long         | long                                 |
+| float        | float                                |
+| double       | double                               |
+| string       | org.apache.paimon.data.BinaryString  |
+| decimal      | org.apache.paimon.data.Decimal       |
+| timestamp    | org.apache.paimon.data.Timestamp     |
+| byte[]       | byte[]                               |
+| array        | org.apache.paimon.data.InternalArray |
+| map          | org.apache.paimon.data.InternalMap   |
+| InternalRow  | org.apache.paimon.data.InternalRow   |
+
+## 谓词类型 {#predicate-types}
+
+| SQL 谓词 | Paimon 谓词                                            | 
+|:--------------|:------------------------------------------------------------|
+| and           | org.apache.paimon.predicate.PredicateBuilder.and            |
+| or            | org.apache.paimon.predicate.PredicateBuilder.or             |
+| is null       | org.apache.paimon.predicate.PredicateBuilder.isNull         |
+| is not null   | org.apache.paimon.predicate.PredicateBuilder.isNotNull      |
+| in            | org.apache.paimon.predicate.PredicateBuilder.in             |
+| not in        | org.apache.paimon.predicate.PredicateBuilder.notIn          |
+| =             | org.apache.paimon.predicate.PredicateBuilder.equal          |
+| \<>            | org.apache.paimon.predicate.PredicateBuilder.notEqual       |
+| \<             | org.apache.paimon.predicate.PredicateBuilder.lessThan       |
+| \<=            | org.apache.paimon.predicate.PredicateBuilder.lessOrEqual    |
+| >             | org.apache.paimon.predicate.PredicateBuilder.greaterThan    |
+| >=            | org.apache.paimon.predicate.PredicateBuilder.greaterOrEqual |
+| between       | org.apache.paimon.predicate.PredicateBuilder.between        |
+| like          | org.apache.paimon.predicate.PredicateBuilder.like           |

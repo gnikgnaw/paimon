@@ -1,0 +1,139 @@
+---
+title: "从 Hive 迁移"
+sidebar_position: 1
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# Hive 表迁移 {#hive-table-migration}
+
+Apache Hive 支持 ORC、Parquet 文件格式，这些格式可以迁移到 Paimon。
+将数据迁移到 Paimon 表时，原始表将被永久删除。因此，如果你仍然需要原始表，请先备份你的数据。迁移后的表将是 [Append 表（追加表）](../append-table/overview)。
+
+现在，我们可以使用 Paimon Hive Catalog 配合 Migrate Table 存储过程（Procedure），将一张表从 Hive 完整迁移到 Paimon。
+同时，你也可以使用 Paimon Hive Catalog 配合 Migrate Database 存储过程（Procedure），将数据库中的所有表完整同步到 Paimon。
+
+* Migrate Table 存储过程：Paimon 表不存在，使用该存储过程将 Hive 表升级为 Paimon 表。操作完成后 Hive 表将消失。
+* Migrate Database 存储过程：Paimon 表不存在，使用该存储过程将数据库中的所有 Hive 表升级为 Paimon 表。操作完成后所有 Hive 表将消失。
+
+这三个 Action 现在支持 Hive 的 "orc"、"parquet" 和 "avro" 文件格式。
+
+<span style={{color: "red"}}> **我们强烈建议在迁移前备份 Hive 表数据，因为迁移操作不是原子的。如果在迁移过程中被中断，你可能会丢失数据。** </span>
+
+## 迁移 Hive 表 {#migrate-hive-table}
+
+<Tabs groupId="migrate-table">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+```sql
+CREATE CATALOG PAIMON WITH (
+   'type'='paimon',
+   'metastore' = 'hive',
+   'uri' = 'thrift://localhost:9083',
+   'warehouse'='/path/to/warehouse/');
+
+USE CATALOG PAIMON;
+
+CALL sys.migrate_table(
+    connector => 'hive',
+    source_table => 'default.hivetable',
+    -- You can specify the target table, and if the target table already exists
+    -- the file will be migrated directly to it
+    -- target_table => 'default.paimontarget',
+    -- You can specify delete_origin is false, this won't delete hivetable
+    -- delete_origin => false,
+    options => 'file.format=orc');
+```
+
+</TabItem>
+
+<TabItem value="flink-action" label="Flink Action">
+
+```bash
+<FLINK_HOME>/flink run ./paimon-flink-action-@@VERSION@@.jar \
+migrate_table \
+--warehouse /path/to/warehouse \
+--catalog_conf uri=thrift://localhost:9083 \
+--catalog_conf metastore=hive \
+--source_type hive \
+--table default.hive_or_paimon
+```
+
+</TabItem>
+
+</Tabs>
+
+调用之后，"hivetable" 将完全转换为 Paimon 格式。再以旧的 "hive 方式" 写入和读取该表将会失败。
+
+## 迁移 Hive 数据库 {#migrate-hive-database}
+
+<Tabs groupId="migrate-database">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+```sql
+CREATE CATALOG PAIMON WITH (
+   'type'='paimon', 
+   'metastore' = 'hive', 
+   'uri' = 'thrift://localhost:9083', 
+   'warehouse'='/path/to/warehouse/');
+
+USE CATALOG PAIMON;
+
+CALL sys.migrate_database(
+    connector => 'hive',
+    source_database => 'default',
+    options => 'file.format=orc');
+```
+
+</TabItem>
+
+<TabItem value="flink-action" label="Flink Action">
+
+```bash
+<FLINK_HOME>/bin/flink run \
+/path/to/paimon-flink-action-@@VERSION@@.jar \
+migrate_databse \
+--warehouse <warehouse-path> \
+--source_type hive \
+--database <database> \
+[--catalog_conf <paimon-catalog-conf> [--catalog_conf <paimon-catalog-conf> ...]] \
+[--options <paimon-table-conf  [,paimon-table-conf ...]> ]
+```
+
+示例：
+```bash
+<FLINK_HOME>/flink run ./paimon-flink-action-@@VERSION@@.jar migrate_table \
+--warehouse /path/to/warehouse \
+--catalog_conf uri=thrift://localhost:9083 \
+--catalog_conf metastore=hive \
+--source_type hive \
+--database default
+```
+
+</TabItem>
+
+</Tabs>
+
+调用之后，"default" 数据库中的所有表将完全转换为 Paimon 格式。再以旧的 "hive 方式" 写入和读取这些表将会失败。

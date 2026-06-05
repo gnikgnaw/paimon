@@ -1,2838 +1,829 @@
 # Flink 写入 Paimon 源码流程深度分析
 
-> 基于 Apache Paimon 1.5-SNAPSHOT (commit: 55f4fd175)
-> 分析日期: 2026-04-22
-> Flink 版本支持: 1.16 ~ 2.2
+> **版本**：1.5-SNAPSHOT　**源码模块**：`paimon-flink/paimon-flink-common`（写入算子链）+ `paimon-core`（存储层写入/提交）　**核对日期**：2026-06　**Flink 版本**：1.16 ~ 2.2
+
+**一句话定位**：本文讲透 Flink 把一条 `RowData` 从算子链写到 Paimon 落盘、再随 checkpoint 两阶段提交成 Snapshot 的**完整写入链路**——它要在 Flink 的分布式快照协议之上，叠加 Paimon 的 LSM 写缓冲、共享内存抢占、异步 compaction 与冲突重试，最终交付 exactly-once。
+
+读完本文你应能回答：① 一条 `RowData` 经过哪几个算子、几次 shuffle 才落成 Level 0 文件；② `StoreSinkWrite` 三种实现各自在什么场景被工厂选中、解决什么；③ checkpoint barrier 到达时 `prepareSnapshotPreBarrier` 为什么必须 flush、它和 `notifyCheckpointComplete` 如何构成两阶段提交；④ exactly-once 到底靠哪四件事（强制 EXACTLY_ONCE、commitUser 幂等、单并行度 Committer、冲突重试）共同兜底；⑤ Writer 故障与 Committer 故障恢复时分别发生什么、为什么不会重复或丢数；⑥ 共享内存池的抢占 flush 在什么情况下会"误伤"成小文件；⑦ 批作业 `endInput` 与流作业 checkpoint 的提交路径差在哪、为什么批作业要做幂等检查；⑧ 五种 BucketMode 的 Sink 拓扑差异（尤其动态桶为什么两次 shuffle）。
+
+> 阅读约定：本文每个机制按"① 要解决什么问题 → ② 设计原理与取舍 → ③ 关键源码（精选片段 + `路径:行号`）→ ④ 风险/陷阱/边界 → ⑤ 收益与代价"组织。源码行号以本次核对为准；与旧稿不符处用 `（已修正）` 标注。
+>
+> **重叠交叉引用**：Flink 整体集成架构（Source/Lookup/CDC 入口、Catalog 接入）由 **05 号文档**主讲，本文只聚焦写入链路；存储层 `FileStoreCommit` 的冲突检测与原子重命名细节见 **01 号文档 §13**，本文只讲它在两阶段提交里的位置；LSM Merge/Compaction 基础见 **01 号文档 §3/§8**；CDC 数据源同步见 **14 号文档**，本文只讲 RowKind 在写入侧的处理。
 
 ---
 
 ## 目录
 
-- [1. 全局架构概览](#1-全局架构概览)
-- [2. Flink SQL INSERT INTO 完整链路](#2-flink-sql-insert-into-完整链路)
-- [3. FlinkSinkBuilder 的 BucketMode 分发策略](#3-flinksinkbuilder-的-bucketmode-分发策略)
-- [4. Writer 算子拓扑图](#4-writer-算子拓扑图)
-- [5. StoreSinkWrite 策略分派](#5-storesinkwrite-策略分派)
-- [6. 数据写入核心路径](#6-数据写入核心路径)
-- [7. Checkpoint 触发的提交流程](#7-checkpoint-触发的提交流程)
-- [8. 内存管理](#8-内存管理)
-- [9. 异步 Compaction](#9-异步-compaction)
-- [10. CDC 写入场景](#10-cdc-写入场景)
-- [11. 批写入 vs 流写入的差异](#11-批写入-vs-流写入的差异)
-- [12. 与 Iceberg Flink Sink 写入流程的详细对比](#12-与-iceberg-flink-sink-写入流程的详细对比)
+- [1. 快速理解（核心问题 / 概念速查 / 高频陷阱）](#1-快速理解核心问题--概念速查--高频陷阱)
+  - [1.1 核心问题：Flink 写入要在快照协议上叠加什么](#11-核心问题flink-写入要在快照协议上叠加什么)
+  - [1.2 核心概念速查表](#12-核心概念速查表)
+  - [1.3 一条记录的写入全生命周期](#13-一条记录的写入全生命周期)
+  - [1.4 高频生产陷阱](#14-高频生产陷阱)
+- [2. 写入链路全景：算子链与类继承](#2-写入链路全景算子链与类继承)
+- [3. SQL INSERT 到 Sink 构建：DynamicTableSink 入口](#3-sql-insert-到-sink-构建dynamictablesink-入口)
+- [4. BucketMode 分发：五种 Sink 拓扑](#4-bucketmode-分发五种-sink-拓扑)
+- [5. Writer 算子三层：算子链如何承载写入](#5-writer-算子三层算子链如何承载写入)
+- [6. StoreSinkWrite 策略分派：三种写入实现](#6-storesinkwrite-策略分派三种写入实现)
+- [7. 数据写入核心路径：从 RowData 到 Level 0 文件](#7-数据写入核心路径从-rowdata-到-level-0-文件)
+- [8. Checkpoint 两阶段提交与 exactly-once](#8-checkpoint-两阶段提交与-exactly-once)
+- [9. 共享内存池与抢占机制](#9-共享内存池与抢占机制)
+- [10. 异步 Compaction 与写入反压](#10-异步-compaction-与写入反压)
+- [11. CDC / RowKind 在写入侧的处理](#11-cdc--rowkind-在写入侧的处理)
+- [12. 批写入 vs 流写入的差异](#12-批写入-vs-流写入的差异)
+- [13. 与 Iceberg Flink Sink 的对比](#13-与-iceberg-flink-sink-的对比)
+- [14. 设计决策总结](#14-设计决策总结)
+- [附录 A：核心源码文件索引](#附录-a核心源码文件索引)
 
 ---
 
-## 1. 全局架构概览
+## 1. 快速理解（核心问题 / 概念速查 / 高频陷阱）
 
-### 解决什么问题
+### 1.1 核心问题：Flink 写入要在快照协议上叠加什么
 
-**核心业务问题**: 如何将 Flink 的流式/批式数据高效、可靠地写入到 Paimon 表中,同时保证 Exactly-Once 语义和高吞吐量?
+**① 要解决什么问题**
 
-**没有这个设计的后果**:
-- 数据丢失或重复: 没有统一的写入框架,无法保证故障恢复时的数据一致性
-- 性能低下: 直接写入文件系统会产生大量小文件,严重影响读取性能
-- 无法支持更新: 追加式写入无法处理 CDC 场景的 UPDATE/DELETE 操作
-- 资源浪费: 没有内存管理和反压机制,容易 OOM 或资源利用率低
+Flink 已经提供了 checkpoint 这一分布式快照协议来保证状态一致性，但它只管"算子状态"，不管"外部存储里那一堆文件是否原子可见"。Paimon 要把流式/批式数据写成对象存储上的 ACID 快照，必须在 Flink 协议之上额外解决四件事：
 
-**实际场景**:
-```sql
--- 场景1: 实时数仓 - 从 Kafka 同步 MySQL binlog 到 Paimon
-INSERT INTO paimon_orders 
-SELECT * FROM kafka_cdc_source;
+- **原子可见**：N 个 writer 子任务各自写出一批文件，必须"要么一起对读可见、要么都不可见"——不能让读到一半提交的表。
+- **不丢不重**：writer 崩溃后未提交的文件要被丢弃（不重复），已 emit 给 committer 的 committable 要在恢复后补提交（不丢失）。
+- **写得快**：直接每条记录写文件会爆小文件，必须有内存写缓冲（LSM SortBuffer）+ 异步 compaction，且在有限内存下支撑成百上千个 partition+bucket 并发写。
+- **读得对**：CDC 的 INSERT/UPDATE/DELETE 要按 merge-engine 语义正确合并，需要把 RowKind 嵌进存储单元。
 
--- 场景2: 批量 ETL - 每天凌晨全量覆盖分区
-INSERT OVERWRITE paimon_dim_user PARTITION (dt='2026-04-22')
-SELECT * FROM hive_user_snapshot;
+**② 设计原理与取舍**
 
--- 场景3: 流批一体 - 同一张表既支持实时写入又支持批量回填
--- 流式作业持续写入
-INSERT INTO paimon_events SELECT * FROM kafka_stream;
--- 批作业回填历史数据
-INSERT INTO paimon_events SELECT * FROM hive_history WHERE dt < '2026-01-01';
-```
+Paimon 的答案是把写入拆成**两类算子 + 两阶段提交**：
 
-### 有什么坑
+- **Writer 算子**（多并行度）：负责把数据写进内存缓冲、flush 成文件、触发异步 compaction，但**不提交**。它在 checkpoint barrier 之前（`prepareSnapshotPreBarrier`）把这一轮产生的文件元数据（`Committable`）发给下游。
+- **Committer 算子**（**固定并行度 1**）：收集所有 writer 的 committable，在 checkpoint **完成后**（`notifyCheckpointComplete`）一次性原子写出 Snapshot。
 
-**误区陷阱**:
-1. **误以为 Paimon 写入不需要 Checkpoint**: 流式写入必须开启 EXACTLY_ONCE checkpoint,否则会抛异常
-2. **忽略 BucketMode 的选择**: 错误的 bucket 配置会导致数据倾斜或写入性能差
-   - `bucket=1` 导致所有数据写入单个 bucket,完全串行化
-   - `bucket=-1` 但主键包含分区键时,应该用 HASH_DYNAMIC 而非 KEY_DYNAMIC
-3. **LocalMerge 配置不当**: `local-merge-buffer-size` 设置过大导致 OOM,过小则失去预合并效果
+这正是 Flink `TwoPhaseCommit` 思想的落地，但 Paimon 没用 Flink 的 `TwoPhaseCommittingSink` 接口，而是自己实现 `PrepareCommitOperator` + `CommitterOperator`，以便控制内存池、compaction 协调和冲突重试。
 
-**错误配置示例**:
-```sql
--- 错误1: 流式作业未开启 checkpoint
-SET 'execution.checkpointing.interval' = '0';  -- 错误!会导致写入失败
+一句话设计哲学：**Writer 只"备货"，Committer 才"过账"；备货可重做（幂等丢弃），过账靠 commitUser + 冲突重试保证只过一次。**
 
--- 错误2: 主键表设置 bucket=0
-CREATE TABLE t (id INT PRIMARY KEY NOT ENFORCED, name STRING) 
-WITH ('bucket' = '0');  -- 错误!主键表不支持 BUCKET_UNAWARE
+**与"每个 writer 自己提交"的替代方案对比**：
 
--- 错误3: 动态桶表设置了固定并行度
-CREATE TABLE t (id INT PRIMARY KEY NOT ENFORCED, name STRING) 
-WITH ('bucket' = '-1', 'sink.parallelism' = '1');  
--- 性能差!动态桶的优势在于自动扩展,固定并行度限制了扩展能力
-```
+| 维度 | 各 writer 自行提交 | Paimon：单 Committer 两阶段提交 |
+|------|-------------------|-------------------------------|
+| 原子性 | 差（部分 writer 提交成功就可见） | 优（一次 commit 覆盖全部 bucket） |
+| 冲突处理 | 多写者竞争同一 snapshot 指针，冲突频繁 | 串行提交，冲突只来自其他作业，重试简单 |
+| 故障恢复 | 难判断哪些已提交 | commitUser 幂等 + snapshot 存在性检查 |
+| 吞吐瓶颈 | 无单点 | Committer 单点（但只做元数据操作，通常不是瓶颈） |
 
-**生产环境注意事项**:
-1. **Checkpoint 间隔**: 建议 1-5 分钟,过短会增加 HDFS 压力,过长会导致故障恢复时间长
-2. **内存配置**: `write-buffer-size` 默认 256MB,高吞吐场景建议调整到 512MB-1GB
-3. **Compaction 配置**: 默认异步 compaction 可能跟不上写入速度,需要监控 `sorted-run` 数量
-4. **并行度设置**: Writer 并行度应该 >= bucket 数量,否则会有空闲 subtask
+### 1.2 核心概念速查表
 
-**性能陷阱**:
-1. **热点分区**: 如果按日期分区且只写当天数据,会导致只有少数 writer 工作
-2. **小文件问题**: 高频 checkpoint + 低吞吐会产生大量小文件,需要调整 `target-file-size`
-3. **内存抢占风暴**: 多个 partition+bucket 同时写入时,频繁的内存抢占会降低吞吐量
+| 概念 | 一句话定义 | 关键源码 |
+|------|-----------|---------|
+| **FlinkSinkBuilder** | Sink 构建入口，按 BucketMode 路由到具体 Sink 子类 | `FlinkSinkBuilder.java:211` |
+| **FlinkSink / FlinkWriteSink** | 抽象基类，定义 `doWrite → doCommit` 骨架；强制 EXACTLY_ONCE | `FlinkSink.java:270` |
+| **PrepareCommitOperator** | Writer 算子最底层基类：建内存池、checkpoint 前 `emitCommittables` | `PrepareCommitOperator.java:92` |
+| **RowDataStoreWriteOperator** | 实际写入算子：`processElement → write.write(row)` | `RowDataStoreWriteOperator.java:54` |
+| **StoreSinkWrite** | Flink 侧写入策略接口 + 工厂 `createWriteProvider` | `StoreSinkWrite.java:100` |
+| **TableWriteImpl** | core 侧写入：非空检查、提取 partition/bucket/key、转 KeyValue | `TableWriteImpl.java:182` |
+| **MergeTreeWriter** | LSM 写入器：分配 seqNum、写 WriteBuffer、flush、触发 compaction | `MergeTreeWriter.java:163` |
+| **CommitterOperator** | 提交算子（并行度 1）：`notifyCheckpointComplete → commitUpToCheckpoint` | `CommitterOperator.java:189` |
+| **StoreCommitter** | 包装 `TableCommitImpl.commitMultiple` 做原子提交 | `StoreCommitter.java:98` |
+| **Committable** | 待提交单元：`checkpointId + CommitMessage(文件增量)` | `Committable`（paimon-flink） |
+| **CommitUser** | 作业唯一标识，从算子状态恢复，用于提交幂等 | `CommitterOperator.java:129` |
+| **MemoryPoolFactory** | 所有 writer 共享的内存池 + 抢占 flush | `MemoryPoolFactory.java:73` |
+| **BucketMode** | 五种数据分桶策略，决定 Sink 拓扑 | `BucketMode.java` |
 
-### 核心概念解释
+### 1.3 一条记录的写入全生命周期
 
-**术语定义**:
-- **BucketMode**: 数据分桶策略,决定了数据如何分布到不同的 bucket 中
-  - `HASH_FIXED`: 固定桶数,按 hash(partition+bucket) 分区
-  - `HASH_DYNAMIC`: 动态桶,先按 key hash 分配 bucket,再按 partition+bucket 分区
-  - `KEY_DYNAMIC`: 全局索引动态桶,支持跨分区 upsert
-  - `BUCKET_UNAWARE`: 无桶模式,仅用于追加表
-  - `POSTPONE_MODE`: 延迟桶分配,首次写入时动态决定桶数
-
-- **Committable**: 写入阶段产生的待提交数据,包含新增/删除的文件元数据
-- **CommitUser**: 每个 Flink 作业的唯一标识,用于幂等性检查
-- **Snapshot**: Paimon 的版本快照,类似 Git commit,记录某个时间点的完整表状态
-
-**概念关系**:
-```
-Table
-  ├── Partition (分区,如 dt=2026-04-22)
-  │     ├── Bucket 0 (桶,数据分片单元)
-  │     │     ├── Level 0 (LSM-tree 层级)
-  │     │     │     ├── data-file-1.parquet
-  │     │     │     └── data-file-2.parquet
-  │     │     └── Level 1
-  │     │           └── data-file-3.parquet (compaction 后的合并文件)
-  │     └── Bucket 1
-  └── Snapshot (版本快照)
-        ├── ManifestList (清单列表)
-        │     ├── manifest-1 (记录 Partition A 的文件变更)
-        │     └── manifest-2 (记录 Partition B 的文件变更)
-        └── Schema (表结构版本)
-```
-
-**与其他系统对比**:
-- **vs Hive**: Hive 直接写 Parquet/ORC 文件,无 LSM-tree 结构,不支持更新
-- **vs Iceberg**: Iceberg 用 Delete File 实现更新,Paimon 用 LSM merge,写入性能更优
-- **vs Delta Lake**: Delta Lake 用事务日志 + Parquet,Paimon 的 Snapshot 机制更轻量
-
-### 设计理念
-
-**为什么这样设计**:
-1. **分层架构**: FlinkSink → StoreSinkWrite → TableWrite → FileStoreWrite → MergeTreeWriter
-   - 每层职责清晰: Flink 层处理算子拓扑,Table 层处理业务逻辑,FileStore 层处理存储
-   - 易于扩展: 新增 MergeEngine 只需修改 TableWrite 层,不影响 Flink 集成
-
-2. **模板方法模式**: FlinkSink 定义 `doWrite → doCommit` 骨架,子类实现具体策略
-   - 好处: 新增 BucketMode 只需继承 FlinkSink,不需修改核心提交逻辑
-   - 例如: FixedBucketSink / DynamicBucketSink 共享相同的 CommitterOperator
-
-3. **LSM-tree 存储引擎**: 写入先进入内存 SortBuffer,定期 flush 到 Level 0,后台异步 compaction
-   - 写入性能优异: 内存写入 + 批量 flush,避免随机 IO
-   - 支持高频更新: 同一 key 的多次更新在 compaction 时合并,减少存储空间
-   - 读写分离: 写入不阻塞读取,compaction 在后台进行
-
-**权衡取舍**:
-- **写放大 vs 读放大**: LSM-tree 牺牲了一定的读性能(需要 merge 多个 sorted run),换取极致的写入性能
-- **内存 vs 磁盘**: SortBuffer 占用内存,但避免了频繁的磁盘 IO,适合流式场景
-- **一致性 vs 可用性**: 强制 EXACTLY_ONCE checkpoint,牺牲了一定的灵活性,保证了数据一致性
-
-**架构演进**:
-1. **早期版本**: 只支持 HASH_FIXED 模式,bucket 数量固定,无法动态扩展
-2. **引入动态桶**: 支持 HASH_DYNAMIC,自动分配 bucket,解决了数据倾斜问题
-3. **全局索引**: 支持 KEY_DYNAMIC,实现跨分区 upsert,满足复杂业务需求
-4. **延迟分配**: 支持 POSTPONE_MODE,首次写入时动态决定桶数,兼顾灵活性和性能
-
-**业界对比**:
-- **Flink + Iceberg**: 写入路径更简单,但更新性能较差,需要独立的 compaction 作业
-- **Flink + Hudi**: 支持 MoR/CoW 两种模式,但架构复杂,运维成本高
-- **Flink + Paimon**: 原生 LSM-tree,写入性能最优,流批一体支持最好
-
-### 1.1 写入链路全景图
+以流式 upsert 一行 `+U(pk=42, ...)` 为例，串起全文各章：
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              Flink SQL / DataStream API                         │
-│                          INSERT INTO paimon_table ...                            │
-└───────────────────────────────────┬─────────────────────────────────────────────┘
-                                    │
-                    ┌───────────────▼───────────────┐
-                    │   FlinkTableSinkBase           │
-                    │   getSinkRuntimeProvider()      │
-                    │   → FlinkSinkBuilder.build()    │
-                    └───────────────┬───────────────┘
-                                    │
-           ┌────────────────────────▼─────────────────────────┐
-           │            FlinkSinkBuilder.build()               │
-           │  1. mapToInternalRow (RowData → InternalRow)      │
-           │  2. LocalMergeOperator (可选, 主键表+开启配置)      │
-           │  3. 根据 BucketMode 选择 Sink 类型                │
-           └────────────────────────┬─────────────────────────┘
-                                    │
-  ┌──────────────┬──────────────────┼──────────────┬──────────────────┐
-  ▼              ▼                  ▼              ▼                  ▼
-HASH_FIXED   HASH_DYNAMIC    KEY_DYNAMIC    BUCKET_UNAWARE    POSTPONE_MODE
-  │              │                  │              │                  │
-  ▼              ▼                  ▼              ▼                  ▼
-FixedBucket  RowDynamic      GlobalDynamic  RowAppendTable    PostponeBucket
-   Sink      BucketSink      BucketSink       Sink               Sink
-  │              │                  │              │                  │
-  └──────────────┴──────────────────┼──────────────┴──────────────────┘
-                                    │
-                    ┌───────────────▼───────────────┐
-                    │   FlinkSink.sinkFrom()         │
-                    │   doWrite() → doCommit()       │
-                    └───────────────┬───────────────┘
-                                    │
-              ┌─────────────────────▼─────────────────────┐
-              │  Writer 算子 (PrepareCommitOperator)        │
-              │  → TableWriteOperator                      │
-              │    → RowDataStoreWriteOperator              │
-              │      → StoreSinkWrite.write(InternalRow)    │
-              │        → TableWriteImpl.writeAndReturn()    │
-              │          → FileStoreWrite.write()           │
-              │            → MergeTreeWriter.write()        │
-              └─────────────────────┬─────────────────────┘
-                                    │
-              ┌─────────────────────▼─────────────────────┐
-              │  Committer 算子 (CommitterOperator)         │
-              │  → StoreCommitter                          │
-              │    → FileStoreCommitImpl                   │
-              │      → 原子写入 Snapshot                    │
-              └───────────────────────────────────────────┘
+1. RowData 进入算子链      FlinkRowWrapper 零拷贝包成 InternalRow（§7.2）
+2. [可选] LocalMerge       主键表本地预合并，同 key 连续更新只下发最终值（§5.3）
+3. shuffle                 按 BucketMode 分区：固定桶一次、动态桶两次 shuffle（§4）
+4. RowDataStoreWriteOperator.processElement → write.write(row)（§5.1）
+5. TableWriteImpl.writeAndReturn   非空检查→默认值→取 RowKind→提取 partition/bucket/key→转 KeyValue（§7.3）
+6. MergeTreeWriter.write    分配 sequenceNumber，put 进 WriteBuffer；满则 flush（§7.4）
+7. flushWriteBuffer         排序+MergeFunction 预合并→落 Level 0 文件；INPUT 模式同时写 changelog（§7.4，详见 01 §4.3）
+8. compaction 异步触发      CompactManager 选 run 异步合并；run 过多则写入反压（§10，策略见 01 §8）
+9. checkpoint barrier 前    prepareSnapshotPreBarrier → prepareCommit → drainIncrement → emit Committable（§8.2）
+10. checkpoint 完成后       Committer.notifyCheckpointComplete → commitMultiple → 冲突检测+原子重命名生成 Snapshot（§8.3，详见 01 §13）
 ```
 
-### 1.2 核心类继承层次
+写快（内存缓冲 + 异步 compaction）、提交对（两阶段 + 单 Committer）、恢复稳（commitUser 幂等 + 冲突重试）、内存省（共享池 + 抢占）——这条链贯穿全文。
+
+### 1.4 高频生产陷阱
+
+| 陷阱 | 后果 | 规避 |
+|------|------|------|
+| **流式作业用 AT_LEAST_ONCE 或不开 checkpoint** | 直接抛异常（`FlinkSink.java:270`），或同一 cp 被提交多次导致重复 | 必须 `execution.checkpointing.mode=exactly-once` |
+| **checkpoint 超时设得太短** | flush + 同步 compaction（尤其 full-compaction/lookup 模式 `waitCompaction=true`）耗时超 timeout，cp 反复失败 | timeout 至少 5 分钟；间隔 1–5 分钟 |
+| **误以为 `write-buffer-size` 是每 writer 的内存** | 实际是整个算子实例所有 writer 共享的总量（§9）；按"每 writer"估算会严重高估 | 监控 `bufferPreemptCount`，频繁抢占说明总量不足 |
+| **抢占风暴致小文件爆炸** | 多 partition+bucket 并发 + 内存紧张 → 频繁抢占 flush → 每次 flush 出的文件很小（§9.2） | 调大 `write-buffer-size`、减少同时活跃的 bucket、开 spillable |
+| **流式作业用 INSERT OVERWRITE** | 抛 `Paimon doesn't support streaming INSERT OVERWRITE`（`FlinkTableSinkBase.java:104`） | OVERWRITE 仅批模式 |
+| **主键表设 `bucket=0`** | 抛"Unaware bucket mode only works with append-only table"（`FlinkSinkBuilder.java:338`） | 主键表用固定/动态/postpone 桶 |
+| **跨分区 upsert 误判成 HASH_DYNAMIC** | 同一主键的新旧版本落到不同分区，造成重复 | 主键不含全部分区键时 `bucket=-1` 会自动选 KEY_DYNAMIC（需全量 bootstrap，启动慢） |
+| **commitUser 未固定** | 作业重启后 commitUser 变化，旧未提交数据无法被幂等识别 | 显式配置 `commit.user`（生产强烈建议） |
+| **full-compaction 模式 checkpoint 被 compaction 阻塞** | `GlobalFullCompactionSinkWrite` 每 `deltaCommits` 个 cp 强制全量 compaction 并 `waitCompaction=true`，那一次 cp 会很慢 | 合理设 `full-compaction.delta-commits`，配足 timeout |
+
+## 2. 写入链路全景：算子链与类继承
+
+### 2.1 端到端算子链（以 HASH_FIXED 流式为例）
 
 ```
-FlinkSink<T> (abstract)
-  └── FlinkWriteSink<T> (abstract) ─── 提供 StoreCommitter/CommittableStateManager 创建
+INSERT INTO paimon_table ...
+   │  Planner 经 Catalog 解析到 FileStoreTable，构造 FlinkTableSinkBase（DynamicTableSink）
+   ▼
+FlinkTableSinkBase.getSinkRuntimeProvider() → PaimonDataStreamSinkProvider（Lambda 延迟构建）
+   ▼
+FlinkSinkBuilder.build()
+   │  ① mapToInternalRow：RowData → InternalRow（FlinkRowWrapper 零拷贝包装）
+   │  ② [可选] LocalMergeOperator：主键表本地预合并（forward 连接，不 shuffle）
+   │  ③ switch(BucketMode) 路由到具体 Sink
+   ▼
+=========================== 以下是真正的 Flink 算子链 ===========================
+DataStream<InternalRow>
+   │  FlinkStreamPartitioner（按 partition+bucket hash 重分区）        ← 一次 shuffle
+   ▼
+"Writer : <table>"  = RowDataStoreWriteOperator（多并行度）
+   │   processElement → StoreSinkWrite.write → TableWriteImpl → MergeTreeWriter.write
+   │   checkpoint barrier 前：prepareSnapshotPreBarrier → emit Committable
+   ▼
+DataStream<Committable>
+   │  [可选] Changelog Compact Coordinator/Worker（PRECOMMIT_COMPACT 时）
+   ▼
+"Global Committer : <table>" = CommitterOperator（并行度强制 1）
+   │   notifyCheckpointComplete → commitUpToCheckpoint → StoreCommitter.commit
+   ▼
+DiscardingSink
+```
+
+要点：**写入算子是多并行度、提交算子是单并行度**；二者之间隔着一次 checkpoint。Writer 在 barrier 前把文件备好发下游，Committer 在 cp 完成后才过账（§8）。整体的 SQL→Catalog→DynamicTableSink 接入细节属于 Flink 集成层，**详见 05 号文档**。
+
+### 2.2 Sink 类继承层次
+
+```
+FlinkSink<T> (abstract)                         ← doWrite/doCommit 骨架、EXACTLY_ONCE 校验
+  └── FlinkWriteSink<T> (abstract)              ← 提供 StoreCommitter/CommittableStateManager
         ├── FixedBucketSink                     ← HASH_FIXED
         ├── PostponeBucketSink                  ← POSTPONE_MODE (流式/首次批)
         ├── PostponeFixedBucketSink             ← POSTPONE_MODE (已知桶数批写)
-        ├── DynamicBucketSink<T> (abstract)     ← 动态桶基类
+        ├── DynamicBucketSink<T> (abstract)
         │     ├── RowDynamicBucketSink          ← HASH_DYNAMIC
-        │     └── DynamicBucketCompactSink      ← HASH_DYNAMIC (compact sink)
+        │     └── DynamicBucketCompactSink      ← HASH_DYNAMIC compact
         ├── GlobalDynamicBucketSink             ← KEY_DYNAMIC
-        └── AppendTableSink<T> (abstract)       ← BUCKET_UNAWARE 基类
+        └── AppendTableSink<T> (abstract)
               └── RowAppendTableSink            ← BUCKET_UNAWARE
 ```
 
-**为什么这样设计**: 通过模板方法模式，`FlinkSink` 定义了写入流程骨架 (`doWrite → doCommit`)，各子类只需关注自己的 `createWriteOperatorFactory()` 和数据分区策略，实现了开闭原则。
-
-**好处**: 新增 BucketMode 只需新增 Sink 子类和对应的分区器，不需修改核心写入/提交逻辑。
+**设计哲学（模板方法）**：`FlinkSink` 把"建 Writer 算子 → 建 Committer 算子 → 连成拓扑"的骨架固定下来，子类只重写 `createWriteOperatorFactory()` 和数据分区策略。新增一种 BucketMode 只需加一个 Sink 子类 + 一个 `ChannelComputer`，**不碰提交逻辑**——这是这套继承体系的全部价值。所有子类共享同一个 `CommitterOperator`，因此 exactly-once 语义只实现一遍。
 
 ---
 
-## 2. Flink SQL INSERT INTO 完整链路
+## 3. SQL INSERT 到 Sink 构建：DynamicTableSink 入口
 
-### 解决什么问题
+> 本节属于 Flink 集成层的"最后一公里"——SQL 如何落到 `FlinkSinkBuilder`。Catalog 接入、Planner 优化、Source 侧等整体集成由 **05 号文档**主讲，这里只讲与**写入**直接相关的两个决策点：ChangelogMode 协商、Sink 延迟构建。
 
-**核心业务问题**: 如何将 Flink SQL 的 INSERT 语句无缝对接到 Paimon 的写入框架,让用户无需关心底层实现细节?
+### 3.1 ChangelogMode 协商：决定要不要 UPDATE_BEFORE
 
-**没有这个设计的后果**:
-- 用户需要手动编写 DataStream 代码,学习成本高
-- SQL 和 DataStream API 行为不一致,容易出错
-- 无法利用 Flink SQL 的优化器(谓词下推、列裁剪等)
+**① 要解决什么问题**
 
-**实际场景**:
-```sql
--- 场景1: 简单的 INSERT INTO
-INSERT INTO paimon_table SELECT * FROM source_table;
+Flink Planner 需要知道 Sink 能接收哪些 RowKind，以决定是否在 Sink 前插入 `SinkMaterializer`（一个把 changelog 流物化成 upsert 流的算子，开销不小）。如果 Sink 声明"我不要 UPDATE_BEFORE"，上游就能省掉一半的更新数据传输。
 
--- 场景2: INSERT OVERWRITE 覆盖分区
-INSERT OVERWRITE paimon_table PARTITION (dt='2026-04-22')
-SELECT id, name, age FROM source_table WHERE dt='2026-04-22';
+**② 设计原理与取舍**
 
--- 场景3: 多表 JOIN 后写入
-INSERT INTO paimon_result
-SELECT a.id, a.name, b.amount
-FROM paimon_user a
-JOIN paimon_order b ON a.id = b.user_id;
-```
-
-### 有什么坑
-
-**误区陷阱**:
-1. **流式作业使用 INSERT OVERWRITE**: 会直接抛异常,OVERWRITE 只支持批模式
-2. **忽略 ChangelogMode 协商**: 如果上游算子产生 UPDATE_BEFORE,但 Sink 不接受,Flink 会自动插入 SinkMaterializer,影响性能
-3. **FormatTable 的特殊处理**: 日志存储表(FormatTable)走的是完全不同的写入路径,不支持主键和 compaction
-
-**错误配置示例**:
-```sql
--- 错误1: 流式作业使用 OVERWRITE
-SET 'execution.runtime-mode' = 'streaming';
-INSERT OVERWRITE paimon_table SELECT * FROM kafka_source;
--- 报错: Paimon doesn't support streaming INSERT OVERWRITE
-
--- 错误2: 主键表未开启 changelog-producer,但期望读取 changelog
-CREATE TABLE t (id INT PRIMARY KEY NOT ENFORCED, name STRING);
--- 默认 changelog-producer=none,读取时无法获取完整的 +I/-U/+U/-D 数据
-```
-
-**生产环境注意事项**:
-1. **Catalog 配置**: 确保 Flink SQL 能正确识别 Paimon Catalog,否则会被当作普通文件系统表
-2. **并行度设置**: `sink.parallelism` 优先级高于全局并行度,建议显式配置
-3. **Clustering 优化**: 仅在批模式 + BUCKET_UNAWARE 时生效,流式作业配置无效
-
-**性能陷阱**:
-1. **SinkMaterializer 开销**: 如果 ChangelogMode 协商失败,Flink 会插入物化算子,增加内存和 CPU 开销
-2. **Clustering 排序开销**: `clustering.columns` 配置不当会导致全局排序,严重影响性能
-
-### 核心概念解释
-
-**术语定义**:
-- **DynamicTableSink**: Flink Table API 的 Sink 接口,负责将逻辑表转换为物理执行计划
-- **SinkRuntimeProvider**: 提供实际的 DataStream Sink 实现,是 DynamicTableSink 和 DataStream API 的桥梁
-- **ChangelogMode**: 描述数据流包含哪些 RowKind(INSERT/UPDATE_BEFORE/UPDATE_AFTER/DELETE)
-- **SinkMaterializer**: Flink 自动插入的物化算子,用于将 changelog 流转换为 upsert 流
-
-**概念关系**:
-```
-Flink SQL Parser
-  ↓ 解析 SQL 文本
-Logical Plan (逻辑计划)
-  ↓ 优化器优化
-Physical Plan (物理计划)
-  ↓ 识别目标表
-FlinkCatalog.getTable()
-  ↓ 返回 FileStoreTable
-FlinkTableSinkBase (DynamicTableSink 实现)
-  ↓ getSinkRuntimeProvider()
-PaimonDataStreamSinkProvider
-  ↓ consumeDataStream()
-FlinkSinkBuilder.build()
-  ↓ 构建 DataStream 拓扑
-FlinkSink.sinkFrom()
-```
-
-**与其他系统对比**:
-- **Hive**: 通过 HiveOutputFormat 写入,不支持流式
-- **Iceberg**: 通过 IcebergTableSink 实现,架构类似但细节不同
-- **Kafka**: 通过 KafkaSink 写入,无需 Catalog,配置更简单
-
-### 设计理念
-
-**为什么这样设计**:
-1. **分层解耦**: SQL 层(FlinkTableSinkBase) → DataStream 层(FlinkSinkBuilder) → 存储层(FileStoreTable)
-   - SQL 层只负责协商 ChangelogMode 和构建 SinkRuntimeProvider
-   - DataStream 层负责算子拓扑构建和数据分区
-   - 存储层负责实际的文件写入和提交
-
-2. **ChangelogMode 协商机制**: 让 Sink 告诉 Planner 自己能接受哪些 RowKind
-   - 避免不必要的 UPDATE_BEFORE 传输,减少网络开销
-   - 对于 AGGREGATE merge engine,保留 UPDATE_BEFORE 用于撤回
-   - 对于 INPUT changelog producer,保留全部 RowKind 用于完整 changelog
-
-3. **延迟构建**: getSinkRuntimeProvider 返回的是 Lambda,真正的 Sink 构建发生在 DataStream 执行时
-   - 好处: 可以根据运行时信息(如 isBounded)动态调整策略
-   - 例如: 批模式自动启用 Clustering 优化
-
-**权衡取舍**:
-- **灵活性 vs 复杂性**: ChangelogMode 协商增加了复杂性,但避免了不必要的数据传输
-- **通用性 vs 性能**: 统一的 DynamicTableSink 接口保证了通用性,但某些场景(如 FormatTable)需要特殊处理
-
-**架构演进**:
-1. **早期版本**: 直接实现 Flink 的 OutputFormat,只支持批模式
-2. **引入 DynamicTableSink**: 支持流批一体,统一 SQL 和 DataStream API
-3. **ChangelogMode 协商**: 优化 CDC 场景的性能,减少不必要的数据传输
-4. **Clustering 优化**: 支持批模式的数据排序,提升查询性能
-
-**业界对比**:
-- **Iceberg**: 也实现了 DynamicTableSink,但 ChangelogMode 协商逻辑不同
-- **Hudi**: 通过 HoodieTableSink 实现,支持更复杂的 ChangelogMode(如 CDC 格式)
-- **Delta Lake**: Flink 集成较弱,主要通过 Spark 写入
-
-### 2.1 从 SQL 解析到 Sink 构建
-
-```
-用户执行: INSERT INTO paimon_table SELECT ...
-
-           ┌─────────────────────────┐
-           │  Flink SQL Parser        │  SQL 文本解析为逻辑计划
-           └────────────┬────────────┘
-                        ▼
-           ┌─────────────────────────┐
-           │  Flink SQL Planner       │  逻辑优化 → 物理计划
-           │  识别目标表为 Paimon      │  通过 Catalog 解析到 PaimonTable
-           └────────────┬────────────┘
-                        ▼
-           ┌─────────────────────────────────────────────┐
-           │  FlinkCatalog                                │
-           │  通过 SPI 加载 Paimon CatalogFactory         │
-           │  getTable() 返回 FileStoreTable              │
-           └────────────┬────────────────────────────────┘
-                        ▼
-           ┌─────────────────────────────────────────────┐
-           │  FlinkTableSinkBase                          │
-           │  实现 DynamicTableSink 接口                   │
-           │  getSinkRuntimeProvider() 返回                │
-           │  PaimonDataStreamSinkProvider                │
-           └────────────┬────────────────────────────────┘
-                        ▼
-           ┌─────────────────────────────────────────────┐
-           │  PaimonDataStreamSinkProvider.consumeDataStream()│
-           │  调用 FlinkSinkBuilder.build()                │
-           └─────────────────────────────────────────────┘
-```
-
-**源码路径**:
-- `FlinkTableSinkBase.getSinkRuntimeProvider()` — `paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/sink/FlinkTableSinkBase.java:103`
-- `FlinkSinkBuilder.build()` — `paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/sink/FlinkSinkBuilder.java:207`
-
-### 2.2 FlinkTableSinkBase.getSinkRuntimeProvider 关键逻辑
+主键表默认走 **upsert 语义**：UPDATE_AFTER 已经携带完整最新值，不需要 UPDATE_BEFORE。但三种情况例外，必须保留全部 RowKind：
 
 ```java
-// FlinkTableSinkBase.java:103-146
-public SinkRuntimeProvider getSinkRuntimeProvider(Context context) {
-    // 1. 流式不支持 INSERT OVERWRITE
-    if (overwrite && !context.isBounded()) {
-        throw new UnsupportedOperationException("Paimon doesn't support streaming INSERT OVERWRITE.");
-    }
-    String name = tableIdentifier.asSummaryString();
-    
-    // 2. FormatTable 特殊处理（日志存储表）
-    if (table instanceof FormatTable) {
-        return new PaimonDataStreamSinkProvider(
-            (dataStream) -> new FlinkFormatTableDataStreamSink(formatTable, overwrite, staticPartitions)
-                    .sinkFrom(dataStream),
-            name, table);
-    }
-    
-    // 3. 创建 PaimonDataStreamSinkProvider，Lambda 内构建 FlinkSinkBuilder
-    Options conf = Options.fromMap(table.options());
-    return new PaimonDataStreamSinkProvider(
-        (dataStream) -> {
-            FlinkSinkBuilder builder = createSinkBuilder();
-            builder.forRowData(dataStream);
-            // 4. 可选：Clustering 排序优化（仅批模式 + BUCKET_UNAWARE）
-            if (!conf.get(CLUSTERING_INCREMENTAL) || conf.get(CLUSTERING_INCREMENTAL_OPTIMIZE_WRITE)) {
-                builder.clusteringIfPossible(
-                    conf.get(CLUSTERING_COLUMNS),
-                    conf.get(CLUSTERING_STRATEGY),
-                    conf.get(CLUSTERING_SORT_IN_CLUSTER),
-                    conf.get(CLUSTERING_SAMPLE_FACTOR));
-            }
-            // 5. 可选：INSERT OVERWRITE
-            if (overwrite) builder.overwrite(staticPartitions);
-            // 6. 可选：自定义并行度
-            conf.getOptional(SINK_PARALLELISM).ifPresent(builder::parallelism);
-            return builder.build();
-        }, name, table);
-}
-```
-
-### 2.3 ChangelogMode 协商
-
-**为什么需要 ChangelogMode 协商**: Flink Planner 需要知道 Sink 能接收哪些 RowKind，以决定是否需要在 Sink 前插入 SinkMaterializer 做 upsert 物化。
-
-```java
-// FlinkTableSinkBase.java:71-100
+// FlinkTableSinkBase.java:70-100
 public ChangelogMode getChangelogMode(ChangelogMode requestedMode) {
     if (table.primaryKeys().isEmpty()) {
-        // 无主键表：接受所有 RowKind
-        return requestedMode;
-    } else {
-        Options options = Options.fromMap(table.options());
-        
-        // 特殊情况 1: INPUT changelog producer，保留全部 RowKind
-        if (options.get(CHANGELOG_PRODUCER) == ChangelogProducer.INPUT) {
-            return requestedMode;
-        }
-
-        // 特殊情况 2: AGGREGATE merge engine，需要 UPDATE_BEFORE 做撤回
-        if (options.get(MERGE_ENGINE) == MergeEngine.AGGREGATE) {
-            return requestedMode;
-        }
-
-        // 特殊情况 3: PARTIAL_UPDATE + 定义了聚合函数，保留全部 RowKind
-        if (options.get(MERGE_ENGINE) == MergeEngine.PARTIAL_UPDATE
-                && new CoreOptions(options).definedAggFunc()) {
-            return requestedMode;
-        }
-
-        // 主键表默认 Upsert 模式：过滤掉 UPDATE_BEFORE
-        ChangelogMode.Builder builder = ChangelogMode.newBuilder();
-        for (RowKind kind : requestedMode.getContainedKinds()) {
-            if (kind != RowKind.UPDATE_BEFORE) {
-                builder.addContainedKind(kind);
-            }
-        }
-        return builder.build();
+        return requestedMode;                       // 无主键表：原样接受
     }
+    Options options = Options.fromMap(table.options());
+    if (options.get(CHANGELOG_PRODUCER) == ChangelogProducer.INPUT) return requestedMode;        // 例外1：INPUT 要完整 changelog
+    if (options.get(MERGE_ENGINE) == MergeEngine.AGGREGATE) return requestedMode;                 // 例外2：聚合需 UPDATE_BEFORE 撤回
+    if (options.get(MERGE_ENGINE) == MergeEngine.PARTIAL_UPDATE
+            && new CoreOptions(options).definedAggFunc()) return requestedMode;                    // 例外3：部分更新带聚合
+    // 默认：过滤掉 UPDATE_BEFORE
+    ChangelogMode.Builder builder = ChangelogMode.newBuilder();
+    for (RowKind kind : requestedMode.getContainedKinds())
+        if (kind != RowKind.UPDATE_BEFORE) builder.addContainedKind(kind);
+    return builder.build();
 }
 ```
 
-**好处**: 对于 deduplicate/partial-update 等只需 INSERT+UPDATE_AFTER+DELETE 的场景，避免了不必要的 UPDATE_BEFORE 传输，减少数据量。
+**④ 风险/陷阱**：若 Paimon 声明只接受 INSERT/UPDATE_AFTER/DELETE，而 Flink 仍判定需要物化，会插入 `SinkMaterializer`——但 Paimon Sink 与该算子不兼容，`StoreSinkWrite.createWriteProvider` 里有 `assertNoSinkMaterializer` 兜底，会直接报错让你把 `table.exec.sink.upsert-materialize` 设为 `none`（见 `StoreSinkWrite.java:106-115`）。aggregate 表若误把 changelog 配成 upsert 过滤了 UPDATE_BEFORE，会导致聚合撤回失效、结果偏大。
+
+**⑤ 收益**：对 deduplicate/partial-update 这类只需最新值的场景，省掉 UPDATE_BEFORE 等于网络与序列化量减半。
+
+### 3.2 Sink 延迟构建：getSinkRuntimeProvider
+
+`getSinkRuntimeProvider` 返回的是一个 Lambda，真正的拓扑在 DataStream 执行期才构建——这样能拿到运行时的 `isBounded`，按流/批动态决定是否启用 Clustering（仅批模式有效）。
+
+```java
+// FlinkTableSinkBase.java:102-146（精简）
+public SinkRuntimeProvider getSinkRuntimeProvider(Context context) {
+    if (overwrite && !context.isBounded())                                  // 流式禁止 OVERWRITE
+        throw new UnsupportedOperationException("Paimon doesn't support streaming INSERT OVERWRITE.");
+    if (table instanceof FormatTable)                                       // 日志表走独立路径，无 LSM
+        return new PaimonDataStreamSinkProvider(ds -> new FlinkFormatTableDataStreamSink(...).sinkFrom(ds), name, table);
+    return new PaimonDataStreamSinkProvider(dataStream -> {
+        FlinkSinkBuilder builder = createSinkBuilder();
+        builder.forRowData(dataStream);
+        if (!conf.get(CLUSTERING_INCREMENTAL) || conf.get(CLUSTERING_INCREMENTAL_OPTIMIZE_WRITE))
+            builder.clusteringIfPossible(...);                              // 仅批 + BUCKET_UNAWARE 实际生效
+        if (overwrite) builder.overwrite(staticPartitions);
+        conf.getOptional(SINK_PARALLELISM).ifPresent(builder::parallelism); // sink.parallelism 优先级最高
+        return builder.build();
+    }, name, table);
+}
+```
+
+**陷阱**：`FormatTable`（日志存储表）完全不走本文的写入链路——没有主键、没有 LSM、没有 compaction，别拿本文的调优经验套它。
 
 ---
 
-## 3. FlinkSinkBuilder 的 BucketMode 分发策略
+## 4. BucketMode 分发：五种 Sink 拓扑
 
-### 解决什么问题
+### 4.1 一处 switch 决定整条拓扑
 
-**核心业务问题**: 如何根据表的配置(bucket 数量、主键、分区键)自动选择最优的数据分区和写入策略?
+**① 要解决什么问题**：不同 bucket 配置对"正确性"和"性能"的最优拓扑完全不同——固定桶可一次 shuffle 直达 writer，但跨分区 upsert 必须先建全局索引才能知道某主键的旧桶在哪。BucketMode 的本质是把"如何把数据正确路由到 writer"这一决策从用户手里收归框架。
 
-**没有这个设计的后果**:
-- 数据倾斜: 所有数据写入单个 bucket,无法并行
-- 跨分区更新失败: 主键不包含分区键时,无法正确路由更新操作
-- 资源浪费: 固定桶数无法适应数据量变化,要么桶太少(倾斜),要么桶太多(空闲)
-- 小文件问题: 追加表没有合理的分区策略,产生大量小文件
-
-**实际场景**:
-```sql
--- 场景1: 固定桶主键表 (HASH_FIXED)
-CREATE TABLE orders (
-    order_id BIGINT PRIMARY KEY NOT ENFORCED,
-    user_id BIGINT,
-    amount DECIMAL(10,2)
-) WITH ('bucket' = '16');  -- 16 个固定桶
-
--- 场景2: 动态桶主键表 (HASH_DYNAMIC)
-CREATE TABLE user_profile (
-    user_id BIGINT PRIMARY KEY NOT ENFORCED,
-    name STRING,
-    age INT
-) WITH ('bucket' = '-1');  -- 动态桶,自动扩展
-
--- 场景3: 跨分区更新 (KEY_DYNAMIC)
-CREATE TABLE user_behavior (
-    user_id BIGINT,
-    event_time TIMESTAMP,
-    action STRING,
-    PRIMARY KEY (user_id, event_time) NOT ENFORCED
-) PARTITIONED BY (dt STRING)
-WITH ('bucket' = '-1');  -- 主键不包含分区键,需要全局索引
-
--- 场景4: 追加表 (BUCKET_UNAWARE)
-CREATE TABLE logs (
-    log_time TIMESTAMP,
-    level STRING,
-    message STRING
-) WITH ('bucket' = '0');  -- 无桶,适合日志追加
-
--- 场景5: 延迟分配 (POSTPONE_MODE)
-CREATE TABLE dynamic_table (
-    id BIGINT PRIMARY KEY NOT ENFORCED,
-    data STRING
-) WITH ('bucket' = '-2');  -- 首次写入时动态决定桶数
-```
-
-### 有什么坑
-
-**误区陷阱**:
-1. **混淆 HASH_DYNAMIC 和 KEY_DYNAMIC**: 
-   - HASH_DYNAMIC: 主键包含全部分区键,只需在分区内分配 bucket
-   - KEY_DYNAMIC: 主键不包含分区键,需要全局索引支持跨分区 upsert
-   - 错误使用会导致数据重复或更新失败
-
-2. **BUCKET_UNAWARE 用于主键表**: 会直接抛异常,主键表必须有 bucket
-
-3. **动态桶表设置过小的并行度**: 
-   ```sql
-   WITH ('bucket' = '-1', 'sink.parallelism' = '1')
-   -- 动态桶的优势在于自动扩展,单并行度完全浪费了这个特性
-   ```
-
-4. **POSTPONE_MODE 的两种行为**: 流式和批式行为不同,容易混淆
-   - 流式: 使用 PostponeBucketSink,桶号在 writer 侧动态分配
-   - 批式(已知桶数): 使用 PostponeFixedBucketSink,桶号在 shuffle 时分配
-
-**错误配置示例**:
-```sql
--- 错误1: 主键表使用 bucket=0
-CREATE TABLE t (id INT PRIMARY KEY NOT ENFORCED, name STRING) 
-WITH ('bucket' = '0');
--- 报错: Unaware bucket mode only works with append-only table
-
--- 错误2: 跨分区更新使用 HASH_DYNAMIC
-CREATE TABLE t (
-    user_id BIGINT PRIMARY KEY NOT ENFORCED,
-    event_time TIMESTAMP,
-    data STRING
-) PARTITIONED BY (dt STRING)
-WITH ('bucket' = '-1');
--- 问题: 同一 user_id 的数据可能分布在不同分区,HASH_DYNAMIC 无法正确处理
--- 应该使用 bucket=-1 且让 Paimon 自动识别为 KEY_DYNAMIC
-
--- 错误3: 非分区表设置 partition-sink-strategy
-CREATE TABLE t (id INT, name STRING) 
-WITH ('bucket' = '0', 'sink.partition-strategy' = 'hash');
--- 无效配置,非分区表没有分区可以 hash
-```
-
-**生产环境注意事项**:
-1. **固定桶数选择**: 建议设置为并行度的 1-2 倍,避免数据倾斜
-2. **动态桶的 assigner 并行度**: 默认为 writer 并行度,高吞吐场景建议单独配置
-3. **全局索引的 bootstrap 时间**: KEY_DYNAMIC 模式启动时需要扫描全表,大表可能需要数分钟
-4. **POSTPONE_MODE 的适用场景**: 适合桶数不确定的场景,但性能略低于固定桶
-
-**性能陷阱**:
-1. **动态桶的两次 shuffle**: 先按 key hash,再按 partition+bucket,网络开销是固定桶的 2 倍
-2. **全局索引的内存开销**: KEY_DYNAMIC 需要在 assigner 中维护全局索引(RocksDB),内存占用大
-3. **BUCKET_UNAWARE 的小文件**: 无桶模式下每个 writer 独立写文件,容易产生小文件
-
-### 核心概念解释
-
-**术语定义**:
-- **Bucket**: 数据分片单元,类似 Hive 的 bucket,用于并行写入和读取
-- **BucketMode**: 数据分桶策略,决定了如何将数据分配到不同的 bucket
-- **Assigner**: 动态桶模式下的桶分配器,维护 key→bucket 的映射关系
-- **Bootstrap**: 全局索引模式下的初始化阶段,扫描全表构建 key→partition+bucket 的索引
-
-**BucketMode 详解**:
-```
-BucketMode 决策树:
-  ├── bucket > 0  → HASH_FIXED (固定桶)
-  ├── bucket = 0  → BUCKET_UNAWARE (无桶,仅追加表)
-  ├── bucket = -1 → 
-  │     ├── 主键包含全部分区键  → HASH_DYNAMIC (动态桶)
-  │     └── 主键不包含分区键    → KEY_DYNAMIC (全局索引)
-  └── bucket = -2 → POSTPONE_MODE (延迟分配)
-```
-
-**数据流对比**:
-```
-HASH_FIXED:
-  input → partition by (partition+bucket) → writer → committer
-
-HASH_DYNAMIC:
-  input → partition by key → assigner → partition by (partition+bucket) → writer → committer
-
-KEY_DYNAMIC:
-  input → bootstrap index → partition by key → global-assigner → partition by bucket → writer → committer
-
-BUCKET_UNAWARE:
-  input → [partition by partition] → writer → committer → [compact coordinator]
-```
-
-**与其他系统对比**:
-- **Hive**: 只支持固定桶(CLUSTERED BY),不支持动态桶
-- **Iceberg**: 无 bucket 概念,通过 hidden partition 实现类似功能
-- **Hudi**: 支持 BUCKET 和 CONSISTENT_HASHING 两种索引,类似 Paimon 的固定桶和动态桶
-
-### 设计理念
-
-**为什么这样设计**:
-1. **多种 BucketMode 并存**: 不同场景有不同的最优策略
-   - 固定桶: 简单高效,适合数据分布均匀的场景
-   - 动态桶: 自动扩展,适合数据倾斜或数据量不确定的场景
-   - 全局索引: 支持跨分区 upsert,适合复杂业务需求
-   - 无桶: 最大化并行度,适合纯追加场景
-
-2. **自动识别 BucketMode**: 根据表配置自动选择,用户无需显式指定
-   - 好处: 降低使用门槛,避免配置错误
-   - 例如: bucket=-1 时,根据主键是否包含分区键自动选择 HASH_DYNAMIC 或 KEY_DYNAMIC
-
-3. **两次 shuffle 的必要性** (HASH_DYNAMIC):
-   - 第一次 shuffle: 保证相同主键到同一个 assigner,避免同一 key 被分配到不同 bucket
-   - 第二次 shuffle: 保证同一 partition+bucket 到同一个 writer,保证文件写入一致性
-   - 虽然增加了网络开销,但保证了正确性
-
-4. **LocalMerge 的位置**: 在第一次 shuffle 之前
-   - 好处: 减少 shuffle 数据量,降低网络开销
-   - 例如: 一条记录被连续更新 100 次,LocalMerge 只向下游发送最终值
-
-**权衡取舍**:
-- **灵活性 vs 性能**: 动态桶更灵活但性能略低(两次 shuffle),固定桶性能更优但不够灵活
-- **功能 vs 复杂性**: 全局索引支持跨分区 upsert,但需要维护全局索引,增加了复杂性和内存开销
-- **并行度 vs 小文件**: 无桶模式并行度最高,但容易产生小文件,需要额外的 compaction
-
-**架构演进**:
-1. **早期版本**: 只支持 HASH_FIXED,bucket 数量固定
-2. **引入 HASH_DYNAMIC**: 支持动态桶,自动分配 bucket,解决数据倾斜
-3. **引入 KEY_DYNAMIC**: 支持全局索引,实现跨分区 upsert
-4. **引入 BUCKET_UNAWARE**: 支持无桶模式,最大化追加表的并行度
-5. **引入 POSTPONE_MODE**: 支持延迟分配,兼顾灵活性和性能
-
-**业界对比**:
-- **Hudi 的 BUCKET 索引**: 类似 Paimon 的 HASH_FIXED,但不支持动态扩展
-- **Hudi 的 CONSISTENT_HASHING**: 类似 Paimon 的 HASH_DYNAMIC,支持动态扩展
-- **Iceberg 的 hidden partition**: 通过隐藏分区实现类似 bucket 的功能,但不支持主键表
-
-### 3.1 核心分发代码
+**② 设计原理**：`FlinkSinkBuilder.build()` 把通用前处理（并行度冲突、排序、RowData→InternalRow、可选 LocalMerge）做完后，用一个 `switch` 路由：
 
 ```java
-// FlinkSinkBuilder.java:207-243
+// FlinkSinkBuilder.java:211-251（精简）
 public DataStreamSink<?> build() {
-    // Step 1: 自适应并行度冲突处理
     setParallelismIfAdaptiveConflict();
     input = trySortInput(input);
-    
-    // Step 2: RowData → InternalRow
-    CatalogContext contextForDescriptor = BlobDescriptorUtils.getCatalogContext(...);
-    DataStream<InternalRow> input = mapToInternalRow(this.input, table.rowType(), contextForDescriptor);
-
-    // Step 3: 可选 LocalMerge 算子（主键表 + local-merge-buffer-size > 0）
+    DataStream<InternalRow> input = mapToInternalRow(this.input, table.rowType(), ...);
     if (table.coreOptions().localMergeEnabled() && table.schema().primaryKeys().size() > 0) {
+        // 主键表本地预合并：forward 连接（同并行度、不跨网络），见 §5.3
         SingleOutputStreamOperator<InternalRow> newInput =
-            input.forward().transform("local merge", input.getType(), 
-                new LocalMergeOperator.Factory(table.schema()));
+            input.forward().transform("local merge", input.getType(), new LocalMergeOperator.Factory(table.schema()));
         forwardParallelism(newInput, input);
         input = newInput;
     }
-
-    // Step 4: 根据 BucketMode 路由到不同 Sink
-    BucketMode bucketMode = table.bucketMode();
-    switch (bucketMode) {
+    switch (table.bucketMode()) {
         case POSTPONE_MODE:   return buildPostponeBucketSink(input);
         case HASH_FIXED:      return buildForFixedBucket(input);
         case HASH_DYNAMIC:    return buildDynamicBucketSink(input, false);
         case KEY_DYNAMIC:     return buildDynamicBucketSink(input, true);
         case BUCKET_UNAWARE:  return buildUnawareBucketSink(input);
-        default:
-            throw new UnsupportedOperationException("Unsupported bucket mode: " + bucketMode);
+        default: throw new UnsupportedOperationException("Unsupported bucket mode: " + table.bucketMode());
     }
 }
 ```
 
-### 3.2 五种 BucketMode 详解
+注意 `bucketMode()` 由表 schema 自动推导（`bucket>0`→HASH_FIXED，`=0`→BUCKET_UNAWARE，`=-1`→主键含全部分区键则 HASH_DYNAMIC 否则 KEY_DYNAMIC，`=-2`→POSTPONE），用户只配 `bucket` 数即可。BucketMode 的存储层语义（每桶一棵 LSM、动态桶索引维护）见 **01 号文档 §10**。
 
-| BucketMode | 配置方式 | 适用表类型 | Sink 实现 | 分区策略 |
-|---|---|---|---|---|
-| `HASH_FIXED` | `bucket = N` (N>0) | 主键表/追加表 | `FixedBucketSink` | `FlinkStreamPartitioner` 按 partition+bucket hash |
-| `HASH_DYNAMIC` | `bucket = -1` | 主键表 | `RowDynamicBucketSink` | 先按 key hash 分区到 assigner，再按 partition+bucket 分区到 writer |
-| `KEY_DYNAMIC` | `bucket = -1` + 主键不包含全部分区键 | 主键表（跨分区） | `GlobalDynamicBucketSink` | 先 bootstrap 全量索引，再 assigner 分配 bucket |
-| `BUCKET_UNAWARE` | `bucket = 0` | 追加表 | `RowAppendTableSink` | 可选按 partition hash 分区，或不分区 |
-| `POSTPONE_MODE` | `bucket = -2` | 主键表 | `PostponeBucketSink` | 按 partition hash 或推迟桶号计算分区 |
+### 4.2 五种模式：拓扑与代价对照
 
-### 3.3 各模式的 Sink 构建细节
+| BucketMode | 触发 | 适用表 | Sink 类 | shuffle 次数 | 关键代价 |
+|---|---|---|---|---|---|
+| `HASH_FIXED` | `bucket=N (N>0)` | 主键/追加表 | `FixedBucketSink` | 1（按 partition+bucket） | 桶数固定，倾斜需重建 |
+| `HASH_DYNAMIC` | `bucket=-1`，主键含全部分区键 | 主键表 | `RowDynamicBucketSink` | **2**（先 key、后 partition+bucket） | 网络翻倍 + assigner 维护 hash 索引 |
+| `KEY_DYNAMIC` | `bucket=-1`，主键不含全部分区键 | 跨分区主键表 | `GlobalDynamicBucketSink` | 2 + **bootstrap** | 启动需全量扫主键建 RocksDB 索引，大表数分钟 |
+| `BUCKET_UNAWARE` | `bucket=0` | 仅追加表 | `RowAppendTableSink` | 0~1（可选按 partition） | 无确定路由，易小文件，需独立 compact 拓扑（§12.4） |
+| `POSTPONE_MODE` | `bucket=-2` | 主键表 | `PostponeBucketSink`/`PostponeFixedBucketSink` | 1 | 桶号推迟到 writer/已知时分配 |
 
-#### HASH_FIXED 模式
+### 4.3 关键拓扑细节
 
+**HASH_FIXED——非分区表自动收并行度**（`FlinkSinkBuilder.java:292-307`）：若用户没指定并行度、桶数 < 输入并行度、且无分区键，writer 并行度自动降为桶数。原因：非分区表只有 4 个 bucket 却开 128 并行度时，124 个 writer 子任务永远收不到数据，纯浪费。
+
+**HASH_DYNAMIC——为什么两次 shuffle**（`buildDynamicBucketSink`，`FlinkSinkBuilder.java:280-290`）：
+- 第一次按 key hash → 保证**同一主键永远到同一个 assigner**，否则同 key 可能被两个 assigner 分到不同 bucket，破坏"一个主键一个桶"的不变式。
+- assigner 算子据 hash 索引给每条记录打上 bucket 号，输出 `Tuple2<row, bucket>`。
+- 第二次按 partition+bucket → 保证**同一 partition+bucket 到同一 writer**，否则两个 writer 写同一 LSM 树必然冲突。
+两次 shuffle 是正确性的代价，不是可选优化。
+
+**KEY_DYNAMIC——多一个 bootstrap 阶段**：跨分区 upsert 要知道"主键 X 之前落在哪个分区+桶"，否则会在新分区再插一份造成重复。所以 assigner 前插 `INDEX_BOOTSTRAP`，启动时全量扫主键载入 RocksDB 索引——这是它启动慢、占内存的根源。
+
+**POSTPONE_MODE——流批两种行为**（`buildPostponeBucketSink`，`FlinkSinkBuilder.java:309-335`）：
+- 流式或首次批写：`PostponeBucketSink`，桶号推迟到 writer 侧动态定。
+- 批写且 `postpone-batch-write-fixed-bucket=true` 且桶数已知：`PostponeFixedBucketSink`，shuffle 时就按已知桶数分配，性能更好。
+
+**BUCKET_UNAWARE——只允许追加表**（`buildUnawareBucketSink`，`FlinkSinkBuilder.java:337-348`）：
 ```java
-// FlinkSinkBuilder.java:272-287
-protected DataStreamSink<?> buildForFixedBucket(DataStream<InternalRow> input) {
-    int bucketNums = table.bucketSpec().getNumBuckets();
-    // 优化：非分区表如果桶数 < 并行度，自动降低 writer 并行度
-    if (parallelism == null && bucketNums < input.getParallelism() && table.partitionKeys().isEmpty()) {
-        parallelism = bucketNums;
-    }
-    // 按 partition + bucket hash 分区
-    DataStream<InternalRow> partitioned =
-        partition(input, new RowDataChannelComputer(table.schema()), parallelism);
-    return new FixedBucketSink(table, overwritePartition).sinkFrom(partitioned);
-}
+checkArgument(table.primaryKeys().isEmpty(),
+    "Unaware bucket mode only works with append-only table for now.");
 ```
-
-**为什么自动降低并行度**: 如果非分区表只有 4 个 bucket 但并行度是 128，则 124 个 writer 子任务永远不会收到数据，白白浪费资源。
-
-#### HASH_DYNAMIC 模式
-
-```java
-// DynamicBucketSink.java:75-117
-// 拓扑: input → shuffle by key hash → bucket-assigner → shuffle by partition+bucket → writer → committer
-public DataStreamSink<?> build(DataStream<T> input, Integer parallelism) {
-    // 1. 按 key hash 分区到 assigner
-    DataStream<T> partitionByKeyHash = partition(input, assignerChannelComputer(numAssigners), ...);
-    // 2. Assigner 算子：维护 key→bucket 映射（基于 hash index）
-    SingleOutputStreamOperator<Tuple2<T, Integer>> bucketAssigned =
-        partitionByKeyHash.transform("dynamic-bucket-assigner", ..., assignerOperator);
-    // 3. 按 partition+bucket 二次分区到 writer
-    DataStream<Tuple2<T, Integer>> partitionByBucket = partition(bucketAssigned, channelComputer2(), ...);
-    // 4. 写入和提交
-    return sinkFrom(partitionByBucket, initialCommitUser);
-}
-```
-
-**为什么需要两次 shuffle**: 第一次 shuffle 保证相同主键的记录到同一个 assigner（避免同一主键被分配到不同 bucket），第二次 shuffle 保证同一 partition+bucket 的数据到同一个 writer（保证文件写入的一致性）。
-
-#### KEY_DYNAMIC (Global Index) 模式
-
-相比 `HASH_DYNAMIC` 多了一个 `INDEX_BOOTSTRAP` 阶段：在 assigner 之前需要读取表中已有的所有主键，构建全局索引（存储在 RocksDB 中），以支持跨分区 upsert。
-
-```
-input → INDEX_BOOTSTRAP → shuffle by key hash → cross-partition-bucket-assigner
-      → shuffle by bucket → writer → committer
-```
-
-**为什么需要 bootstrap**: 跨分区 upsert 要求知道一个主键之前属于哪个分区+桶，因此必须在启动时加载全量索引。
-
-#### POSTPONE_MODE 模式
-
-```java
-// FlinkSinkBuilder.java:289-315
-private DataStreamSink<?> buildPostponeBucketSink(DataStream<InternalRow> input) {
-    // 流式模式或未启用 postponeBatchWriteFixedBucket：使用 PostponeBucketSink
-    if (isStreaming(input) || !table.coreOptions().postponeBatchWriteFixedBucket()) {
-        ChannelComputer<InternalRow> channelComputer;
-        if (!table.partitionKeys().isEmpty()
-                && table.coreOptions().partitionSinkStrategy() == PartitionSinkStrategy.HASH) {
-            channelComputer = new RowDataHashPartitionChannelComputer(table.schema());
-        } else {
-            channelComputer = new PostponeBucketChannelComputer(table.schema());
-        }
-        DataStream<InternalRow> partitioned = partition(input, channelComputer, parallelism);
-        PostponeBucketSink sink = new PostponeBucketSink(table, overwritePartition);
-        return sink.sinkFrom(partitioned);
-    } else {
-        // 批模式且启用 postponeBatchWriteFixedBucket：使用 PostponeFixedBucketSink
-        // 这种情况下桶数已知，可以提前分配
-        Map<BinaryRow, Integer> knownNumBuckets = PostponeUtils.getKnownNumBuckets(table);
-        DataStream<InternalRow> partitioned =
-                partition(input,
-                    new PostponeFixedBucketChannelComputer(table.schema(), knownNumBuckets),
-                    parallelism);
-
-        FileStoreTable tableForWrite = PostponeUtils.tableForFixBucketWrite(table);
-        PostponeFixedBucketSink sink =
-                new PostponeFixedBucketSink(tableForWrite, overwritePartition, knownNumBuckets);
-        return sink.sinkFrom(partitioned);
-    }
-}
-```
-
-**POSTPONE_MODE 的两种行为**:
-1. **流式或首次批写**: 使用 `PostponeBucketSink`，桶号在 writer 侧动态分配
-2. **已知桶数的批写**: 使用 `PostponeFixedBucketSink`，桶号在 shuffle 时提前分配，性能更优
-
-#### BUCKET_UNAWARE 模式
-
-```java
-// FlinkSinkBuilder.java:317-332
-private DataStreamSink<?> buildUnawareBucketSink(DataStream<InternalRow> input) {
-    checkArgument(
-        table.primaryKeys().isEmpty(),
-        "Unaware bucket mode only works with append-only table for now.");
-
-    // 可选：分区表+HASH策略时按分区 hash 分区
-    if (!table.partitionKeys().isEmpty()
-            && table.coreOptions().partitionSinkStrategy() == PartitionSinkStrategy.HASH) {
-        input = partition(input, new RowDataHashPartitionChannelComputer(table.schema()), parallelism);
-    }
-
-    return new RowAppendTableSink(table, overwritePartition, parallelism).sinkFrom(input);
-}
-```
-
-**为什么只支持追加表**: 无桶模式下没有确定性的数据路由，无法保证同一主键的更新操作发送到同一个文件写入器，因此不支持主键表。
+无桶模式没有确定性路由，无法保证同一主键的更新到同一 writer，所以主键表配 `bucket=0` 直接报错。
 
 ---
 
-## 4. Writer 算子拓扑图
+## 5. Writer 算子三层：算子链如何承载写入
 
-### 4.1 算子继承层次
+### 5.1 三层算子的职责切分
+
+**① 要解决什么问题**：写入算子要同时干三件互不相干的事——管内存池、管 Flink 状态、写数据。如果揉在一个类里，每加一种数据类型（InternalRow / CDC Record）都要复制全部逻辑。
+
+**② 设计原理（三层继承）**：
 
 ```
 AbstractStreamOperator<Committable>
-  └── PrepareCommitOperator<IN, Committable>    ← 内存管理 + Checkpoint 前刷数据
-        └── TableWriteOperator<IN>              ← 状态管理 + StoreSinkWrite 持有
-              └── RowDataStoreWriteOperator     ← processElement 调用 write.write(row)
-
-PrepareCommitOperator.Factory<IN, Committable>
-  └── TableWriteOperator.Factory<IN>
-        └── RowDataStoreWriteOperator.Factory
-  └── TableWriteOperator.CoordinatedFactory<IN>  ← 带 OperatorCoordinator
-        └── RowDataStoreWriteOperator.CoordinatedFactory
+  └── PrepareCommitOperator       建内存池 + checkpoint 前 emitCommittables（与数据类型无关）
+        └── TableWriteOperator     持有 StoreSinkWrite、管理 commitUser/write 状态、状态恢复
+              └── RowDataStoreWriteOperator   只负责 processElement → write.write(row)
 ```
 
-### 4.2 完整的算子链 (以 HASH_FIXED 为例)
+每层只关心一件事：底层管"什么时候把货发出去"，中层管"状态怎么存/恢复"，顶层管"一条数据怎么写"。CDC 场景换一个顶层算子即可复用下面两层（§11）。
 
-```
-DataStream<RowData>
-    │
-    │ map (FlinkRowWrapper)
-    ▼
-DataStream<InternalRow>
-    │
-    │ forward() + transform("local merge")     ← 可选: LocalMergeOperator
-    ▼
-DataStream<InternalRow>
-    │
-    │ FlinkStreamPartitioner (按 partition+bucket hash)
-    ▼
-DataStream<InternalRow>  (重分区后)
-    │
-    │ transform("Writer : table_name")         ← RowDataStoreWriteOperator
-    │   内部：StoreSinkWrite.write(row)
-    │   Checkpoint 前：prepareSnapshotPreBarrier → emitCommittables
-    ▼
-DataStream<Committable>
-    │
-    │ [可选] transform("Changelog Compact Coordinator")  ← PRECOMMIT_COMPACT 时
-    │ transform("Changelog Compact Worker")
-    │ transform("Changelog Sort by Creation Time")
-    ▼
-DataStream<Committable>
-    │
-    │ transform("Global Committer : table_name")   ← CommitterOperator (parallelism=1)
-    ▼
-DataStream<Committable>
-    │
-    │ sinkTo(DiscardingSink)
-    ▼
-DataStreamSink
+**③ 关键源码**——顶层薄得只剩一句：
+```java
+// RowDataStoreWriteOperator.java:53-65
+public void processElement(StreamRecord<InternalRow> element) throws Exception {
+    write(element.getValue());
+}
+protected SinkRecord write(InternalRow row) throws Exception {
+    try { return write.write(row); }            // 委托给 StoreSinkWrite
+    catch (Exception e) { throw new IOException(e); }
+}
 ```
 
-### 4.3 LocalMergeOperator 的作用
+### 5.2 PrepareCommitOperator：备货与发货的总闸
 
-**源码路径**: `paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/sink/LocalMergeOperator.java`
+这是整个写入侧的"心脏"——它定义了 checkpoint 前后的行为，所有 writer 子类都继承它：
 
 ```java
-// LocalMergeOperator.java:152-172
-public void processElement(StreamRecord<InternalRow> record) throws Exception {
-    InternalRow row = record.getValue();
-    RowKind rowKind = RowKindGenerator.getRowKind(rowKindGenerator, row);
-    // row kind 统一设为 INSERT (key-value 分离后 kind 存储在 value 中)
-    row.setRowKind(RowKind.INSERT);
-    BinaryRow key = keyProjection.apply(row);
-    if (!merger.put(rowKind, key, row)) {
-        flushBuffer();  // 缓冲区满，先 flush
-        if (!merger.put(rowKind, key, row)) {
-            row.setRowKind(rowKind);  // 恢复原始 RowKind
-            output.collect(record);   // 直接下发
-        }
-    }
-}
-
-// prepareSnapshotPreBarrier 中 flush 缓冲区
+// PrepareCommitOperator.java:92-117
 public void prepareSnapshotPreBarrier(long checkpointId) throws Exception {
-    if (!endOfInput) {
-        flushBuffer();
-    }
+    if (!endOfInput) emitCommittables(false, checkpointId);   // 流式：barrier 前发货，不等 compaction
 }
-
-// endInput 时也要 flush
 public void endInput() throws Exception {
     endOfInput = true;
-    flushBuffer();
+    emitCommittables(true, Long.MAX_VALUE);                   // 批式：结尾发货，等 compaction
+}
+private void emitCommittables(boolean waitCompaction, long checkpointId) throws IOException {
+    prepareCommit(waitCompaction, checkpointId)
+        .forEach(committable -> output.collect(new StreamRecord<>(committable)));
 }
 ```
 
-**为什么需要 LocalMerge**: 解决主键数据倾斜问题。在 shuffle 之前先在本地做预合并，减少网络传输量。例如一条记录被连续更新 100 次，LocalMerge 只向下游发送最终值。
+两个发货时机的差异是流批分野的关键（§12）：流式在 `prepareSnapshotPreBarrier`（barrier 之前）发，`waitCompaction=false`；批式在 `endInput` 发，`waitCompaction=true` 强制把 compaction 等完。`setup()`（`PrepareCommitOperator.java:67-90`）在这里建好 `MemoryPoolFactory`，整个算子实例的所有 writer 共享它（§9）。
 
-**LocalMerger 的两种实现**:
-1. **HashMapLocalMerger**: 用于所有非主键字段都是固定长度的情况（如 INT、LONG、DOUBLE）。使用 HashMap 存储 key→value 映射，内存高效。
-2. **SortBufferLocalMerger**: 用于存在变长字段（如 STRING、ARRAY）的情况。使用排序缓冲区，支持溢写到磁盘。
+### 5.3 LocalMergeOperator：shuffle 前的本地预合并
 
-**LocalMerger 的选择逻辑**:
+**① 要解决什么问题**：主键热点。某些主键被高频更新（如某爆款商品的库存），所有更新都 shuffle 到同一个 writer，单点压力大、网络也浪费。
 
+**② 设计原理**：在第一次 shuffle **之前**用 `forward()` 连接（同并行度、本地直连不跨网络）插一个本地合并算子。同一主键的连续更新在本地先 merge 成一条，只把最终值下发，shuffle 数据量大减。
+
+**③ 关键源码**——两种 merger 自动选型：
 ```java
-// LocalMergeOperator.java:108-145
+// LocalMergeOperator.java:108-145（精简）
 boolean canHashMerger = true;
 for (DataField field : valueType.getFields()) {
-    if (primaryKeys.contains(field.name())) {
-        continue;  // 跳过主键字段
-    }
-    if (!BinaryRow.isInFixedLengthPart(field.type())) {
-        canHashMerger = false;  // 存在变长字段，不能用 HashMap
-        break;
-    }
+    if (primaryKeys.contains(field.name())) continue;
+    if (!BinaryRow.isInFixedLengthPart(field.type())) { canHashMerger = false; break; }  // 有变长字段
 }
-
-if (canHashMerger) {
-    merger = new HashMapLocalMerger(...);
-} else {
-    merger = new SortBufferLocalMerger(...);
-}
+merger = canHashMerger ? new HashMapLocalMerger(...)   // 全定长：HashMap，内存高效
+                       : new SortBufferLocalMerger(...); // 有变长（STRING/ARRAY）：排序缓冲，可溢写
 ```
+flush 时机：缓冲满、`prepareSnapshotPreBarrier`、`endInput` 三处都会 flush（`LocalMergeOperator.java:152/181/189`）。
 
-**好处**:
-1. 显著减少 shuffle 数据量，降低网络开销
-2. 减轻下游 writer 的写放大
-3. 自动选择最优的 merger 实现
+**④ 风险**：`local-merge-buffer-size` 配太大 → OOM；配太小 → 合不动、白白多一层算子开销。它不改变最终结果，只是吞吐优化，热点不明显时可不开。
 
-### 4.4 FlinkStreamPartitioner 数据分区
+### 5.4 FlinkStreamPartitioner：把 ChannelComputer 接进 Flink
 
-**源码路径**: `paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/sink/FlinkStreamPartitioner.java`
-
+分区器本身极薄，真正的路由逻辑在 `ChannelComputer`：
 ```java
 // FlinkStreamPartitioner.java:49-51
 public int selectChannel(SerializationDelegate<StreamRecord<T>> record) {
     return channelComputer.channel(record.getInstance().getValue());
 }
 ```
-
-`ChannelComputer` 的实现根据 BucketMode 不同：
-- **RowDataChannelComputer**: 按 `partition + bucket` 做 hash 取模 → 固定桶模式
-- **RowAssignerChannelComputer**: 按主键 hash 取模 → 动态桶 assigner 前的分区
-- **RowWithBucketChannelComputer**: 按 `partition + bucket` 做 hash 取模 → 动态桶 writer 前的分区
-- **RowDataHashPartitionChannelComputer**: 仅按 `partition` 做 hash → 无桶模式的分区分发
+按 BucketMode 换不同 `ChannelComputer`：`RowDataChannelComputer`（partition+bucket，固定桶）、`RowAssignerChannelComputer`（主键 hash，动态桶 assigner 前）、`RowWithBucketChannelComputer`（partition+bucket，动态桶 writer 前）、`RowDataHashPartitionChannelComputer`（仅 partition，无桶）。bucket 计算公式见 **01 号文档 §10.2**。
 
 ---
 
-## 5. StoreSinkWrite 策略分派
+## 6. StoreSinkWrite 策略分派：三种写入实现
 
-### 5.1 工厂方法 createWriteProvider
+### 6.1 工厂按配置选实现
 
-**源码路径**: `paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/sink/StoreSinkWrite.java:100-187`
+**① 要解决什么问题**：写入器在"基础写入"之外，有时还要承担额外职责——定期触发全局 full compaction（为了产 changelog）、恢复时重新触发 compact（lookup changelog）。这些职责不该硬编码进基础写入器，而应按表配置在工厂里挑实现。
+
+**② 设计原理（工厂 + 继承）**：`StoreSinkWrite.createWriteProvider` 是唯一入口，按 `write-only` / `changelog-producer` / `full-compaction.delta-commits` 选三种实现之一，全部以 `StoreSinkWriteImpl` 为基类：
 
 ```
-StoreSinkWrite.createWriteProvider()
-    │
-    ├── writeOnly = true?  ──yes──→ StoreSinkWriteImpl (无 compaction)
-    │
-    ├── changelog-producer = FULL_COMPACTION 或配置了 full-compaction.delta-commits?
-    │    ──yes──→ GlobalFullCompactionSinkWrite
-    │
-    ├── needLookup() = true (changelog-producer = LOOKUP)?
-    │    ──yes──→ LookupSinkWrite
-    │
-    └── 默认 ──→ StoreSinkWriteImpl
+createWriteProvider（StoreSinkWrite.java:100-187）
+  ├── writeOnly                                         → StoreSinkWriteImpl（waitCompaction=false，纯写）
+  ├── changelog-producer=FULL_COMPACTION 或配了 delta  → GlobalFullCompactionSinkWrite
+  ├── needLookup()（changelog-producer=LOOKUP）          → LookupSinkWrite
+  └── 默认                                              → StoreSinkWriteImpl
 ```
 
-**源码逻辑**:
+每条分支返回的 Provider Lambda 里都先跑 `assertNoSinkMaterializer.run()`（`StoreSinkWrite.java:106-115`）——这是与 ChangelogMode 协商（§3.1）配套的兜底：一旦 Flink 误插了 `SinkMaterializer` 就直接报错。`waitCompaction` 来源：write-only 恒 false，否则取 `prepareCommitWaitCompaction()`，full-compaction 触发点会临时置 true（§6.2）。
 
-```java
-// StoreSinkWrite.java:100-187
-static StoreSinkWrite.Provider createWriteProvider(
-        FileStoreTable fileStoreTable,
-        CheckpointConfig checkpointConfig,
-        boolean isStreaming,
-        boolean ignorePreviousFiles,
-        boolean hasSinkMaterializer) {
-    
-    Options options = fileStoreTable.coreOptions().toConfiguration();
-    CoreOptions.ChangelogProducer changelogProducer = fileStoreTable.coreOptions().changelogProducer();
-    boolean waitCompaction;
-    CoreOptions coreOptions = fileStoreTable.coreOptions();
-    
-    if (coreOptions.writeOnly()) {
-        waitCompaction = false;
-    } else {
-        waitCompaction = coreOptions.prepareCommitWaitCompaction();
-        int deltaCommits = -1;
-        
-        // 检查 full-compaction.delta-commits 或 changelog-producer-full-compaction-trigger-interval
-        if (options.contains(FULL_COMPACTION_DELTA_COMMITS)) {
-            deltaCommits = options.get(FULL_COMPACTION_DELTA_COMMITS);
-        } else if (options.contains(CHANGELOG_PRODUCER_FULL_COMPACTION_TRIGGER_INTERVAL)) {
-            long fullCompactionThresholdMs = options.get(CHANGELOG_PRODUCER_FULL_COMPACTION_TRIGGER_INTERVAL).toMillis();
-            deltaCommits = (int)(fullCompactionThresholdMs / checkpointConfig.getCheckpointInterval());
-        }
+### 6.2 三种实现对比
 
-        // 如果配置了 FULL_COMPACTION 或 deltaCommits >= 0，使用 GlobalFullCompactionSinkWrite
-        if (changelogProducer == CoreOptions.ChangelogProducer.FULL_COMPACTION || deltaCommits >= 0) {
-            int finalDeltaCommits = Math.max(deltaCommits, 1);
-            return (table, commitUser, state, ioManager, memoryPoolFactory, metricGroup) -> {
-                assertNoSinkMaterializer.run();
-                return new GlobalFullCompactionSinkWrite(
-                        table, commitUser, state, ioManager, ignorePreviousFiles,
-                        waitCompaction, finalDeltaCommits, isStreaming, memoryPoolFactory, metricGroup);
-            };
-        }
-
-        // 如果需要 Lookup changelog producer，使用 LookupSinkWrite
-        if (coreOptions.needLookup()) {
-            return (table, commitUser, state, ioManager, memoryPoolFactory, metricGroup) -> {
-                assertNoSinkMaterializer.run();
-                return new LookupSinkWrite(
-                        table, commitUser, state, ioManager, ignorePreviousFiles,
-                        waitCompaction, isStreaming, memoryPoolFactory, metricGroup);
-            };
-        }
-    }
-
-    // 默认使用 StoreSinkWriteImpl
-    return (table, commitUser, state, ioManager, memoryPoolFactory, metricGroup) -> {
-        assertNoSinkMaterializer.run();
-        return new StoreSinkWriteImpl(
-                table, commitUser, state, ioManager, ignorePreviousFiles,
-                waitCompaction, isStreaming, memoryPoolFactory, metricGroup);
-    };
-}
-
-### 5.2 三种 StoreSinkWrite 实现对比
-
-| 特性 | StoreSinkWriteImpl | GlobalFullCompactionSinkWrite | LookupSinkWrite |
+| | StoreSinkWriteImpl | GlobalFullCompactionSinkWrite | LookupSinkWrite |
 |---|---|---|---|
-| **继承关系** | 实现 StoreSinkWrite 接口 | 继承 StoreSinkWriteImpl | 继承 StoreSinkWriteImpl |
-| **核心职责** | 基础写入 + prepareCommit | 定期触发全局 Full Compaction | 恢复时重新触发 compact |
-| **状态管理** | 无额外状态 | 维护 `writtenBuckets` 状态 | 维护 `activeBuckets` 状态 |
-| **适用场景** | 默认 / write-only | `changelog-producer = full-compaction` | `changelog-producer = lookup` |
-| **Compaction 行为** | 由 CompactManager 自动触发 | 每隔 `deltaCommits` 个 checkpoint 强制 full compaction | 恢复时对所有活跃 bucket 触发 compact |
+| 关系 | 基类 | 继承 Impl | 继承 Impl |
+| 职责 | 基础写入 + prepareCommit | 定期全局 full compaction 产 changelog | 恢复时对活跃 bucket 重触发 compact |
+| 额外状态 | 无 | `writtenBuckets`（每 cp 改了哪些桶） | `activeBuckets`（活跃桶集合） |
+| 适用 | 默认 / write-only | `changelog-producer=full-compaction` | `changelog-producer=lookup` |
 
-#### GlobalFullCompactionSinkWrite
-
-**源码路径**: `paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/sink/GlobalFullCompactionSinkWrite.java`
-
+**GlobalFullCompactionSinkWrite——为什么要"全局同步"**：full-compaction 模式靠"全量 compact 前后 diff"生成 changelog。若各 writer 各自决定何时 full compact，产出的 changelog 在时间线上不一致。所以它记录每个 cp 修改过的桶，到达 `deltaCommits` 倍数的 cp 时统一对所有 `writtenBuckets` 触发 full compaction 并 `waitCompaction=true`：
 ```java
-// GlobalFullCompactionSinkWrite.java:149-184
-public List<Committable> prepareCommit(boolean waitCompaction, long checkpointId)
-        throws IOException {
-    checkSuccessfulFullCompaction();  // 检查之前的 full compaction 是否成功
-    
-    // 记录本 checkpoint 期间修改的 bucket
-    if (!currentWrittenBuckets.isEmpty()) {
-        writtenBuckets.computeIfAbsent(checkpointId, k -> new HashSet<>())
-                      .addAll(currentWrittenBuckets);
-        currentWrittenBuckets.clear();
-    }
-    
-    // 判断是否到达 full compaction 触发点
-    // isFullCompactedIdentifier 检查 checkpointId 是否是 deltaCommits 的倍数
-    if (!writtenBuckets.isEmpty() && isFullCompactedIdentifier(checkpointId, deltaCommits)) {
-        waitCompaction = true;
-    }
-    
-    if (waitCompaction) {
-        submitFullCompaction(checkpointId);  // 对所有 writtenBuckets 提交 full compaction
-        commitIdentifiersToCheck.add(checkpointId);
-    }
-    
+// GlobalFullCompactionSinkWrite.java:149-185（精简）
+public List<Committable> prepareCommit(boolean waitCompaction, long checkpointId) {
+    checkSuccessfulFullCompaction();                                         // 校验上次 full compaction 落地
+    /* 记录本 cp 改过的桶到 writtenBuckets ... */
+    if (!writtenBuckets.isEmpty() && isFullCompactedIdentifier(checkpointId, deltaCommits))
+        waitCompaction = true;                                               // 到触发点
+    if (waitCompaction) submitFullCompaction(checkpointId);                  // 对所有 writtenBuckets 提交
     return super.prepareCommit(waitCompaction, checkpointId);
 }
 ```
+**陷阱**：这一次 cp 会因等 full compaction 而变慢，timeout 要配足（§1.4）。
 
-**为什么全局同步 Full Compaction**: 为了生成完整的 changelog。Full Compaction 会将所有 level 的数据合并，通过对比前后快照的 diff 生成 changelog。如果每个 writer 独立 compact，可能在不同时间点生成不一致的 changelog。
+**LookupSinkWrite——为什么恢复时要 compact**：lookup changelog 在 compaction 时查旧值来生成。failover 后必须对所有曾活跃的桶重新触发 compact（构造函数里从 `activeBuckets` 状态读出后逐个 `write.compact(...)`），否则会漏 changelog。
 
-#### LookupSinkWrite
-
-```java
-// LookupSinkWrite.java:64-75 (构造函数中)
-List<StoreSinkWriteState.StateValue> activeBucketsStateValues =
-    state.get(tableName, ACTIVE_BUCKETS_STATE_NAME);
-if (activeBucketsStateValues != null) {
-    for (StoreSinkWriteState.StateValue stateValue : activeBucketsStateValues) {
-        write.compact(stateValue.partition(), stateValue.bucket(), false);
-    }
-}
-```
-
-**为什么恢复时要触发 compact**: Lookup changelog producer 通过 compaction 时查找旧值来生成 changelog。恢复后需要重新触发 compact 以确保不遗漏任何 changelog 数据。
+> changelog producer 四种机制的存储层原理见 **01 号文档 §8.6** 与 **24 号文档**，这里只讲它在 Flink 写入器选型上的体现。
 
 ---
 
-## 6. 数据写入核心路径
+## 7. 数据写入核心路径：从 RowData 到 Level 0 文件
 
-### 解决什么问题
+### 7.1 调用链总览
 
-**核心业务问题**: 如何将 Flink 的 RowData 高效地转换为 Paimon 的存储格式,并写入到 LSM-tree 中?
-
-**没有这个设计的后果**:
-- 类型不兼容: Flink 和 Paimon 的数据类型不一致,无法直接写入
-- 性能低下: 每条记录都深拷贝会导致严重的性能问题
-- 数据丢失: 没有非空约束检查和默认值填充,可能写入不完整的数据
-- 写放大严重: 每条记录直接写文件,产生大量小文件
-
-**实际场景**:
-```java
-// 场景1: CDC 数据写入
-// Flink RowData: +I[1, "Alice", 25]  (INSERT)
-// → InternalRow: +I[1, "Alice", 25]
-// → KeyValue: {key=[1], value=[1,"Alice",25], valueKind=INSERT, seq=1}
-// → SortBuffer 暂存
-// → flush 时写入 data-file-1.parquet
-
-// 场景2: 更新操作
-// Flink RowData: +U[1, "Alice", 26]  (UPDATE_AFTER)
-// → InternalRow: +U[1, "Alice", 26]
-// → KeyValue: {key=[1], value=[1,"Alice",26], valueKind=UPDATE_AFTER, seq=2}
-// → SortBuffer 中已有 seq=1 的旧值
-// → flush 时 merge,只保留最新值
-
-// 场景3: 删除操作
-// Flink RowData: -D[1, "Alice", 26]  (DELETE)
-// → InternalRow: -D[1, "Alice", 26]
-// → KeyValue: {key=[1], value=[1,"Alice",26], valueKind=DELETE, seq=3}
-// → compaction 时清除该 key 的所有历史版本
-```
-
-### 有什么坑
-
-**误区陷阱**:
-1. **误以为 FlinkRowWrapper 会深拷贝**: 实际上是零拷贝的代理模式,修改原始 RowData 会影响 InternalRow
-2. **忽略非空约束**: 如果表定义了 NOT NULL 但数据中有 null,会在 checkNullability 时抛异常
-3. **默认值配置错误**: `fields.{field_name}.default-value` 只在字段为 null 时生效,不会覆盖已有值
-4. **RowKindFilter 配置不当**: 例如 first-row merge engine 配置了 rowkind-filter,可能导致更新被忽略
-
-**错误配置示例**:
-```sql
--- 错误1: 非空字段未提供默认值
-CREATE TABLE t (
-    id INT PRIMARY KEY NOT ENFORCED,
-    name STRING NOT NULL,
-    age INT
-);
-INSERT INTO t SELECT id, NULL, age FROM source;  -- 报错: name 不能为 null
-
--- 错误2: 默认值类型不匹配
-CREATE TABLE t (
-    id INT,
-    create_time TIMESTAMP
-) WITH ('fields.create_time.default-value' = 'now()');  -- 错误!应该是具体的时间戳字符串
-
--- 错误3: RowKindFilter 过滤了必要的 RowKind
-CREATE TABLE t (
-    id INT PRIMARY KEY NOT ENFORCED,
-    name STRING
-) WITH (
-    'merge-engine' = 'deduplicate',
-    'rowkind-filter' = 'insert'  -- 错误!会过滤掉 UPDATE 和 DELETE
-);
-```
-
-**生产环境注意事项**:
-1. **SortBuffer 大小**: `write-buffer-size` 默认 256MB,高吞吐场景建议调整到 512MB-1GB
-2. **Flush 频率**: 由 SortBuffer 大小和 checkpoint 间隔共同决定,需要平衡内存和小文件
-3. **MergeFunction 选择**: 不同的 merge-engine 有不同的 merge 逻辑,影响写入性能
-4. **Sequence Number**: 单调递增的序列号保证了 merge 的正确性,不要手动修改
-
-**性能陷阱**:
-1. **频繁的 flush**: SortBuffer 过小导致频繁 flush,产生大量小文件
-2. **Merge 开销**: 同一 key 的多次更新在 flush 时需要 merge,CPU 开销大
-3. **序列化开销**: KeyValue 的二进制序列化是 CPU 密集型操作,影响吞吐量
-
-### 核心概念解释
-
-**术语定义**:
-- **FlinkRowWrapper**: Flink RowData 到 Paimon InternalRow 的零拷贝适配器
-- **SinkRecord**: 包含 partition、bucket、primaryKey 和完整行数据的中间结构
-- **KeyValue**: LSM-tree 的存储单元,包含 key、value、valueKind 和 sequenceNumber
-- **SortBuffer**: 内存排序缓冲区,暂存待写入的 KeyValue,flush 时排序并 merge
-- **MergeFunction**: 定义如何合并同一 key 的多个 KeyValue,不同的 merge-engine 有不同的实现
-
-**数据转换流程**:
-```
-Flink RowData (Flink 类型系统)
-  ↓ FlinkRowWrapper (零拷贝适配)
-InternalRow (Paimon 类型系统)
-  ↓ checkNullability (非空检查)
-  ↓ wrapDefaultValue (默认值填充)
-  ↓ RowKindGenerator.getRowKind (提取 RowKind)
-  ↓ rowKindFilter.test (RowKind 过滤)
-  ↓ toSinkRecord (提取 partition/bucket/key)
-SinkRecord {partition, bucket, primaryKey, row}
-  ↓ recordExtractor.extract (SinkRecord → KeyValue)
-KeyValue {key, value, valueKind, sequenceNumber}
-  ↓ SortBuffer.put (暂存到内存)
-  ↓ flush 时排序并 merge
-  ↓ RollingFileWriter.write (写入 Parquet/ORC)
-DataFileMeta (文件元数据)
-```
-
-**KeyValue 结构**:
-```java
-KeyValue {
-    BinaryRow key;              // 主键(去除分区列)
-    long sequenceNumber;        // 单调递增序列号,用于 merge 时排序
-    RowKind valueKind;          // INSERT/UPDATE_BEFORE/UPDATE_AFTER/DELETE
-    BinaryRow value;            // 完整行数据(包含主键和非主键列)
-}
-```
-
-**与其他系统对比**:
-- **Hive**: 直接写 Parquet/ORC,无中间缓冲,无 merge 逻辑
-- **Iceberg**: 写入时不做 merge,通过 Delete File 实现更新
-- **Hudi**: 有类似的 HoodieRecord 结构,但 merge 逻辑在 compaction 时进行
-
-### 设计理念
-
-**为什么这样设计**:
-1. **零拷贝适配器 (FlinkRowWrapper)**: 避免深拷贝带来的性能开销
-   - 好处: 高吞吐场景下,零拷贝可以节省 30%-50% 的 CPU 和内存
-   - 代价: 需要保证原始 RowData 在使用期间不被修改
-
-2. **SortBuffer 预合并**: 在 flush 之前先在内存中 merge
-   - 好处: 减少写入的数据量,降低 Level 0 文件大小,减轻后续 compaction 压力
-   - 例如: 一条记录被连续更新 100 次,flush 时只写入最终值
-
-3. **Sequence Number 机制**: 保证 merge 的正确性
-   - 问题: 同一 key 的多个 KeyValue 可能乱序到达(网络延迟、重试等)
-   - 解决: 通过单调递增的 sequenceNumber 排序,保证 merge 时按时间顺序处理
-   - 实现: 每个 MergeTreeWriter 维护独立的 sequenceNumber 计数器
-
-4. **分层的数据结构**: RowData → InternalRow → SinkRecord → KeyValue
-   - RowData: Flink 层,包含 Flink 特有的类型和 RowKind
-   - InternalRow: Paimon 通用层,与计算引擎无关
-   - SinkRecord: 业务层,包含 partition/bucket/key 等业务信息
-   - KeyValue: 存储层,LSM-tree 的存储单元
-
-**权衡取舍**:
-- **内存 vs 磁盘**: SortBuffer 占用内存,但避免了频繁的磁盘 IO
-- **写入延迟 vs 吞吐量**: SortBuffer 增加了写入延迟(数据先暂存),但提升了吞吐量(批量写入)
-- **CPU vs IO**: flush 时的 merge 消耗 CPU,但减少了磁盘 IO 和存储空间
-
-**架构演进**:
-1. **早期版本**: 直接写入文件,无 SortBuffer,写放大严重
-2. **引入 SortBuffer**: 支持内存排序和预合并,显著降低写放大
-3. **引入 Sequence Number**: 解决乱序问题,保证 merge 正确性
-4. **引入 MergeFunction**: 支持多种 merge 策略(deduplicate/partial-update/aggregate)
-
-**业界对比**:
-- **RocksDB**: 也使用 MemTable(类似 SortBuffer) + Sequence Number 机制
-- **HBase**: 使用 MemStore + MVCC 机制,思路类似但实现不同
-- **Cassandra**: 使用 Memtable + Timestamp,不需要 Sequence Number(因为是分布式系统)
-
-### 6.1 完整写入调用链
+一条 `InternalRow` 从 Flink 写入算子穿到 LSM 内存缓冲，跨越 Flink 层（`StoreSinkWrite`）、core 表层（`TableWriteImpl`）、core 存储层（`FileStoreWrite` → `MergeTreeWriter`）：
 
 ```
-RowData (Flink 类型)
-  │
-  │ FlinkSinkBuilder.mapToInternalRow()
-  │   new FlinkRowWrapper(rowData, catalogContext)
-  ▼
-InternalRow (Paimon 类型，FlinkRowWrapper 实现)
-  │
-  │ RowDataStoreWriteOperator.processElement()
-  │   → write.write(row)  [StoreSinkWrite 接口]
-  ▼
-StoreSinkWriteImpl.write(InternalRow rowData)
-  │   → write.writeAndReturn(rowData)  [TableWriteImpl]
-  ▼
-TableWriteImpl.writeAndReturn(InternalRow row, int bucket)
-  │ ① checkNullability(row)         ← 非空约束检查
-  │ ② wrapDefaultValue(row)         ← 默认值填充
-  │ ③ RowKindGenerator.getRowKind() ← 获取 RowKind（CDC 行类型）
-  │ ④ rowKindFilter.test(rowKind)   ← 行类型过滤
-  │ ⑤ toSinkRecord(row)             ← 提取 partition / bucket / primaryKey
-  │ ⑥ recordExtractor.extract()     ← SinkRecord → KeyValue
-  │ ⑦ write.write(partition, bucket, keyValue)  [FileStoreWrite 接口]
-  ▼
-AbstractFileStoreWrite.write(BinaryRow partition, int bucket, KeyValue data)
-  │   → getWriterWrapper(partition, bucket)
-  │   → container.writer.write(data)  [RecordWriter 接口]
-  ▼
-MergeTreeWriter.write(KeyValue kv)
-  │ ① sequenceNumber = newSequenceNumber()     ← 单调递增序列号
-  │ ② success = writeBuffer.put(seq, kind, key, value)
-  │ ③ if (!success) {
-  │      flushWriteBuffer(false, false);       ← 缓冲区满，flush 到文件
-  │      writeBuffer.put(seq, kind, key, value);
-  │    }
-  ▼
-SortBufferWriteBuffer.put(long sequenceNumber, RowKind valueKind, InternalRow key, InternalRow value)
-  │   → 序列化为 KeyValue 的二进制行格式
-  │   → BinaryInMemorySortBuffer / BinaryExternalSortBuffer 存储
-  ▼
-(数据暂存在内存排序缓冲区中，等待 flush)
+RowDataStoreWriteOperator.processElement(InternalRow)        Flink 层
+  → StoreSinkWriteImpl.write(row)                            Flink 层
+    → TableWriteImpl.writeAndReturn(row)                     core 表层 ── §7.3
+      ① checkNullability   非空约束
+      ② wrapDefaultValue   填默认值
+      ③ getRowKind         取 +I/-U/+U/-D（来自行或 rowkind-field）
+      ④ rowKindFilter      行类型过滤（如 first-row 丢 UPDATE/DELETE）
+      ⑤ toSinkRecord       KeyAndBucketExtractor 提取 partition/bucket/trimmedKey
+      ⑥ recordExtractor    SinkRecord → KeyValue（嵌入 valueKind）
+      → write.write(partition, bucket, keyValue)             core 存储层
+        → AbstractFileStoreWrite.getWriterWrapper(...)       路由到具体 bucket 的 writer
+          → MergeTreeWriter.write(kv)                        core 存储层 ── §7.4
+            ① seq = newSequenceNumber()
+            ② writeBuffer.put(seq, kind, key, value)         内存排序缓冲
+            ③ 满则 flushWriteBuffer → 排序+merge → Level 0 文件
 ```
 
-### 6.2 FlinkRowWrapper 类型转换
+设计上把"业务校验/路由"（core 表层）和"LSM 写入"（core 存储层）分开：换 merge-engine 只动存储层的 `MergeFunction`，换计算引擎只动 Flink 层，互不影响。
 
-**源码路径**: `paimon-flink/paimon-flink-common/src/main/java/org/apache/paimon/flink/FlinkRowWrapper.java`
+### 7.2 FlinkRowWrapper：零拷贝跨类型系统
 
-`FlinkRowWrapper` 实现了 Paimon 的 `InternalRow` 接口，内部包装了 Flink 的 `RowData`。核心是类型映射：
+`mapToInternalRow` 把 Flink `RowData` 用 `FlinkRowWrapper` 包成 Paimon `InternalRow`（`FlinkSinkBuilder.java:260-278`）。它是**零拷贝代理**——所有 `getXxx()` 委托给底层 RowData，不深拷贝，高吞吐下省掉大量对象分配。代价：底层 RowData 在被引用期间不能被复用修改（Flink 算子链内默认满足）。RowKind 也在这里映射（`fromFlinkRowKind`：Flink 的 INSERT/UPDATE_BEFORE/UPDATE_AFTER/DELETE 一一对应 Paimon 同名枚举）。
+
+### 7.3 TableWriteImpl：六步把行变成 KeyValue
 
 ```java
-// RowKind 映射: Flink → Paimon
-public static RowKind fromFlinkRowKind(org.apache.flink.types.RowKind rowKind) {
-    switch (rowKind) {
-        case INSERT:        return RowKind.INSERT;
-        case UPDATE_BEFORE: return RowKind.UPDATE_BEFORE;
-        case UPDATE_AFTER:  return RowKind.UPDATE_AFTER;
-        case DELETE:        return RowKind.DELETE;
-    }
-}
-```
-
-**为什么用 Wrapper 而不是深拷贝**: 零拷贝设计，避免在高吞吐场景下频繁的对象创建和内存分配。`FlinkRowWrapper` 只是一个代理，所有 `getXxx()` 调用都委托给底层 Flink RowData。
-
-### 6.3 TableWriteImpl 的分区和桶提取
-
-```java
-// TableWriteImpl.java:178-193
+// TableWriteImpl.java:182-216（精简）
 public SinkRecord writeAndReturn(InternalRow row, int bucket) throws Exception {
-    checkNullability(row);
-    row = wrapDefaultValue(row);
-    RowKind rowKind = RowKindGenerator.getRowKind(rowKindGenerator, row);
-    if (rowKindFilter != null && !rowKindFilter.test(rowKind)) {
-        return null;  // 被过滤的行类型直接跳过
-    }
-    SinkRecord record = bucket == -1 ? toSinkRecord(row) : toSinkRecord(row, bucket);
-    write.write(record.partition(), record.bucket(), recordExtractor.extract(record, rowKind));
+    checkNullability(row);                                           // ① NOT NULL 列为 null 直接抛异常
+    row = wrapDefaultValue(row);                                     // ② 用 fields.<f>.default-value 填 null
+    RowKind rowKind = RowKindGenerator.getRowKind(rowKindGenerator, row);  // ③
+    if (rowKindFilter != null && !rowKindFilter.test(rowKind)) return null; // ④ 被过滤的行直接丢弃
+    SinkRecord record = bucket == -1 ? toSinkRecord(row) : toSinkRecord(row, bucket);  // ⑤
+    write.write(record.partition(), record.bucket(), recordExtractor.extract(record, rowKind)); // ⑥
     return record;
 }
-
-// toSinkRecord: 通过 KeyAndBucketExtractor 提取
-private SinkRecord toSinkRecord(InternalRow row) {
+private SinkRecord toSinkRecord(InternalRow row) {                  // KeyAndBucketExtractor 提取三元组
     keyAndBucketExtractor.setRecord(row);
-    return new SinkRecord(
-        keyAndBucketExtractor.partition(),     // BinaryRow: 分区值
-        keyAndBucketExtractor.bucket(),        // int: 桶号
-        keyAndBucketExtractor.trimmedPrimaryKey(), // BinaryRow: 去除分区列的主键
-        row);
+    return new SinkRecord(keyAndBucketExtractor.partition(),
+        keyAndBucketExtractor.bucket(), keyAndBucketExtractor.trimmedPrimaryKey(), row);
 }
 ```
 
-### 6.4 flushWriteBuffer → 数据文件
+**陷阱**：`fields.<f>.default-value` 只在该字段为 null 时填充，不覆盖已有值；NOT NULL 列写 null 会在 ① 直接抛 `Cannot write null to non-null column`，不是静默丢弃。RowKind 的两种来源与各 merge-engine 处理见 §11。
+
+### 7.4 MergeTreeWriter：写缓冲 + flush 预合并
+
+**① 要解决什么问题**：每条记录直接写文件会爆小文件、且无法在写入侧预先合并同 key 的多次更新。
+
+**② 设计原理**：先 put 进内存排序缓冲 `SortBufferWriteBuffer`，缓冲满才 flush；flush 时按 key 排序并用 `MergeFunction` 预合并，再落成 Level 0 文件——把"一个 key 写 N 次"压成"flush 时合并后写一次"。
 
 ```java
-// MergeTreeWriter.java:209-249
-private void flushWriteBuffer(boolean waitForLatestCompaction, boolean forcedFullCompaction) throws Exception {
+// MergeTreeWriter.java:163-174
+public void write(KeyValue kv) throws Exception {
+    long sequenceNumber = newSequenceNumber();                       // 单调递增，决定 merge 顺序
+    boolean success = writeBuffer.put(sequenceNumber, kv.valueKind(), kv.key(), kv.value());
+    if (!success) {                                                  // 缓冲满
+        flushWriteBuffer(false, false);
+        success = writeBuffer.put(sequenceNumber, kv.valueKind(), kv.key(), kv.value());
+        if (!success) throw new RuntimeException("Mem table is too small to hold a single element.");
+    }
+}
+```
+
+flush 是写入与 compaction 的交汇点：
+```java
+// MergeTreeWriter.java:209-249（精简）
+private void flushWriteBuffer(boolean waitForLatestCompaction, boolean forcedFullCompaction) {
     if (writeBuffer.size() > 0) {
-        if (compactManager.shouldWaitForLatestCompaction()) {
-            waitForLatestCompaction = true;  // sorted run 数量超过阈值，必须等待
-        }
-
-        // 创建 changelog 文件写入器（仅 INPUT changelog-producer 模式）
-        final RollingFileWriter<KeyValue, DataFileMeta> changelogWriter =
-            changelogProducer == ChangelogProducer.INPUT
+        if (compactManager.shouldWaitForLatestCompaction()) waitForLatestCompaction = true;  // run 过多→反压（§10）
+        // INPUT changelog-producer 时同时写 changelog 文件
+        RollingFileWriter changelogWriter = changelogProducer == ChangelogProducer.INPUT
                 ? writerFactory.createRollingChangelogFileWriter(0) : null;
-        // 创建数据文件写入器
-        final RollingFileWriter<KeyValue, DataFileMeta> dataWriter =
-            writerFactory.createRollingMergeTreeFileWriter(0, FileSource.APPEND);
-
-        // 按 key 排序并 merge 后写出
-        writeBuffer.forEach(
-            keyComparator, mergeFunction,
-            changelogWriter == null ? null : changelogWriter::write,
-            dataWriter::write);
+        RollingFileWriter dataWriter = writerFactory.createRollingMergeTreeFileWriter(0, FileSource.APPEND);
+        writeBuffer.forEach(keyComparator, mergeFunction,            // 排序 + MergeFunction 预合并
+                changelogWriter == null ? null : changelogWriter::write, dataWriter::write);
         writeBuffer.clear();
-
-        // 新文件注册到 CompactManager
-        for (DataFileMeta fileMeta : dataWriter.result()) {
-            newFiles.add(fileMeta);
-            compactManager.addNewFile(fileMeta);
-        }
+        for (DataFileMeta f : dataWriter.result()) { newFiles.add(f); compactManager.addNewFile(f); } // 注册到 Levels
     }
-
-    // 尝试获取已完成的 compaction 结果
-    trySyncLatestCompaction(waitForLatestCompaction);
-    // 触发新的 compaction
-    compactManager.triggerCompaction(forcedFullCompaction);
+    trySyncLatestCompaction(waitForLatestCompaction);                // 取回已完成的 compaction 结果
+    compactManager.triggerCompaction(forcedFullCompaction);          // 触发新一轮异步 compaction
 }
 ```
 
-**为什么 flush 时要做 merge**: SortBufferWriteBuffer 中可能有同一 key 的多条记录（例如连续的 INSERT→UPDATE→DELETE），flush 时通过 MergeFunction 预合并，减少写出的数据量和后续 compaction 的工作量。
+**③ 关键点**：`sequenceNumber` 单调递增，是 merge 正确性的基石——同 key 多版本乱序到达时靠它定先后（KeyValue 结构与 merge 语义见 **01 号文档 §3.4**）。Level 0 文件、SortBuffer 溢写、MergeFunction 等存储层细节见 **01 号文档 §4**。
 
----
+**④ 风险**：`write-buffer-size` 太小 → 频繁 flush → 小文件多、compaction 压力大；太大 → 占内存、抢占其他 writer（§9）。INPUT 模式 flush 时双写 changelog，写放大约翻倍。
 
-## 7. Checkpoint 触发的提交流程
 
-### 解决什么问题
 
-**核心业务问题**: 如何在分布式环境下保证 Exactly-Once 语义,确保数据不丢失、不重复?
+## 8. Checkpoint 两阶段提交与 exactly-once
 
-**没有这个设计的后果**:
-- 数据丢失: Writer 写入的文件未提交,故障恢复后丢失
-- 数据重复: 同一批数据被提交多次,导致重复
-- 不一致: 多个 Writer 的数据部分提交,表状态不一致
-- 无法回滚: 提交失败后无法回滚到之前的一致性状态
+### 8.1 为什么是两阶段，问题出在哪
 
-**实际场景**:
-```
-场景1: 正常提交流程
-  t0: Writer 写入数据到 SortBuffer
-  t1: Checkpoint barrier 到达,触发 prepareSnapshotPreBarrier
-  t2: Writer flush SortBuffer,生成 data-file-1.parquet
-  t3: Writer emit Committable(cpId=1, files=[data-file-1.parquet])
-  t4: Committer 收集所有 Writer 的 Committable
-  t5: Checkpoint 完成,触发 notifyCheckpointComplete
-  t6: Committer 原子写入 Snapshot,提交成功
+**① 要解决什么问题**：N 个 writer 各写了一批文件，谁来"过账"成 Snapshot？如果 writer 各自提交，会出现"部分 writer 提交成功就被读到"的中间态；如果只在作业结束提交，流式作业永不结束。必须借 Flink 的 checkpoint 把"提交"这件事卡在一个**全局一致的时间点**上。
 
-场景2: Writer 故障恢复
-  t0: Writer 写入数据,但在 checkpoint 前崩溃
-  t1: Flink 从上一个 checkpoint 恢复
-  t2: Writer 重新处理数据,生成新的文件
-  t3: 旧文件(未提交)被忽略,不会造成数据重复
+**② 设计原理（两阶段）**：
+- **阶段一（barrier 前，写侧）**：barrier 流到每个 writer 时，Flink 回调 `prepareSnapshotPreBarrier`。writer 此刻 flush 缓冲、把这一轮产生的文件元数据打包成 `Committable` 发给下游 Committer，并把"未提交的 committable"存进自己的算子状态。**此时文件已落盘，但尚未对读可见**。
+- **阶段二（cp 完成后，提交侧）**：当这一轮 cp 在所有算子都成功后，JobManager 回调 Committer 的 `notifyCheckpointComplete`，Committer 才真正 `commit` 成 Snapshot。
 
-场景3: Committer 故障恢复
-  t0: Writer 已 emit Committable,但 Committer 在提交前崩溃
-  t1: Flink 从 checkpoint 恢复,Committer 从状态恢复 Committable
-  t2: Committer 重新提交,幂等性检查确保不会重复提交
-```
-
-### 有什么坑
-
-**误区陷阱**:
-1. **误以为 prepareCommit 就是提交**: 实际上只是准备 Committable,真正的提交在 notifyCheckpointComplete
-2. **忽略 Barrier 对齐**: 如果 Checkpoint 模式是 AT_LEAST_ONCE,会导致数据重复
-3. **CommitUser 不一致**: 作业重启后 commitUser 变化,导致幂等性检查失效
-4. **批作业的 endInput 重复调用**: Flink 新版本中,批作业失败后可能从中间算子重启,导致 endInput 被多次调用
-
-**错误配置示例**:
-```sql
--- 错误1: 使用 AT_LEAST_ONCE checkpoint
-SET 'execution.checkpointing.mode' = 'at-least-once';
--- 报错: Paimon sink currently only supports EXACTLY_ONCE checkpoint mode
-
--- 错误2: Checkpoint 间隔过短
-SET 'execution.checkpointing.interval' = '10s';
--- 问题: 频繁的 checkpoint 会增加 HDFS 压力,影响吞吐量
--- 建议: 1-5 分钟
-
--- 错误3: Checkpoint 超时时间过短
-SET 'execution.checkpointing.timeout' = '30s';
--- 问题: 大表的 flush 和 compaction 可能超过 30 秒,导致 checkpoint 失败
--- 建议: 至少 5 分钟
-```
-
-**生产环境注意事项**:
-1. **Checkpoint 间隔**: 建议 1-5 分钟,平衡故障恢复时间和系统开销
-2. **Checkpoint 超时**: 建议至少 5 分钟,避免 compaction 导致超时
-3. **CommitUser 配置**: 建议显式配置 `commit.user`,避免作业重启后变化
-4. **状态后端**: 建议使用 RocksDB 状态后端,避免大状态导致 OOM
-
-**性能陷阱**:
-1. **频繁的 flush**: Checkpoint 间隔过短导致频繁 flush,产生大量小文件
-2. **Compaction 阻塞 Checkpoint**: waitCompaction=true 时,Checkpoint 会等待 compaction 完成,可能超时
-3. **Committer 单点瓶颈**: Committer 并行度为 1,大量 Committable 可能导致提交慢
-
-### 核心概念解释
-
-**术语定义**:
-- **Checkpoint**: Flink 的分布式快照机制,保证 Exactly-Once 语义
-- **Barrier**: Checkpoint 的标记,在数据流中传播,触发算子的快照
-- **prepareSnapshotPreBarrier**: Checkpoint barrier 到达前的回调,用于 flush 数据
-- **notifyCheckpointComplete**: Checkpoint 完成后的回调,用于提交数据
-- **Committable**: Writer 准备提交的数据,包含文件元数据和 checkpoint ID
-- **CommitUser**: 每个 Flink 作业的唯一标识,用于幂等性检查
-
-**Checkpoint 流程**:
-```
-JobManager                    Writer (N个)                Committer (1个)
-    │                             │                            │
-    │ triggerCheckpoint(cpId)     │                            │
-    │────────────────────────────>│                            │
-    │                             │                            │
-    │         prepareSnapshotPreBarrier(cpId)                  │
-    │                             │                            │
-    │                   flush SortBuffer                       │
-    │                   emit Committable                       │
-    │                             │───────────────────────────>│
-    │                             │                            │
-    │         snapshotState(cpId) │                            │
-    │         (保存 Writer 状态)   │                            │
-    │                             │                            │
-    │                             │         snapshotState(cpId)│
-    │                             │         (保存 Committable)  │
-    │                             │                            │
-    │ notifyCheckpointComplete(cpId)                           │
-    │─────────────────────────────────────────────────────────>│
-    │                             │                            │
-    │                             │         commit()           │
-    │                             │         (原子写入 Snapshot) │
-    │                             │                            │
-```
-
-**Committable 结构**:
-```java
-Committable {
-    long checkpointId;           // Checkpoint ID
-    CommitMessage commitMessage; // 提交消息
-}
-
-CommitMessageImpl {
-    BinaryRow partition;         // 分区
-    int bucket;                  // 桶号
-    DataIncrement {              // 数据文件变更
-        List<DataFileMeta> newFiles;       // 新增文件
-        List<DataFileMeta> deletedFiles;   // 删除文件
-        List<DataFileMeta> changelogFiles; // Changelog 文件
-    }
-    CompactIncrement {           // Compaction 文件变更
-        List<DataFileMeta> compactBefore;  // Compaction 输入
-        List<DataFileMeta> compactAfter;   // Compaction 输出
-        List<DataFileMeta> changelogFiles; // Compaction Changelog
-    }
-}
-```
-
-**与其他系统对比**:
-- **Hive**: 无 Checkpoint 机制,依赖 HDFS 的原子 rename
-- **Iceberg**: 也依赖 Flink Checkpoint,但提交逻辑不同(通过 Iceberg 的事务 API)
-- **Hudi**: 支持 Flink Checkpoint,但也支持独立的 commit 机制
-
-### 设计理念
-
-**为什么这样设计**:
-1. **两阶段提交 (2PC)**: prepareSnapshotPreBarrier + notifyCheckpointComplete
-   - 第一阶段: Writer flush 数据,生成文件,但不提交
-   - 第二阶段: Committer 收集所有文件,原子提交
-   - 好处: 保证了分布式环境下的原子性,要么全部成功,要么全部失败
-
-2. **Barrier 对齐机制**: 确保所有 Writer 在同一时间点 flush
-   - 问题: 如果不对齐,不同 Writer 的数据可能属于不同的逻辑时间点
-   - 解决: Flink 的 Barrier 对齐机制保证了所有 Writer 在同一 Barrier 到达时 flush
-   - 代价: Barrier 对齐会增加延迟,但保证了一致性
-
-3. **CommitUser 幂等性**: 通过 commitUser 避免重复提交
-   - 问题: Committer 故障恢复后,可能重新提交已提交的数据
-   - 解决: Snapshot 中记录 commitUser,提交前检查是否已提交
-   - 实现: commitUser 从状态恢复,保证作业重启后不变
-
-4. **Committer 单并行度**: 保证提交的原子性
-   - 问题: 如果多个 Committer 并行提交,可能导致部分提交
-   - 解决: Committer 并行度固定为 1,串行提交
-   - 代价: Committer 可能成为瓶颈,但保证了一致性
-
-**权衡取舍**:
-- **一致性 vs 性能**: 强制 EXACTLY_ONCE checkpoint,牺牲了一定的性能,保证了一致性
-- **延迟 vs 吞吐量**: Barrier 对齐增加了延迟,但保证了数据的一致性
-- **单点 vs 并行**: Committer 单并行度是单点,但保证了提交的原子性
-
-**架构演进**:
-1. **早期版本**: 直接在 Writer 中提交,无法保证原子性
-2. **引入 Committer**: 单独的 Committer 算子,保证原子提交
-3. **引入 CommitUser**: 支持幂等性检查,避免重复提交
-4. **引入 CommittableStateManager**: 支持状态恢复,保证故障恢复后的一致性
-
-**业界对比**:
-- **Flink + Kafka**: 也使用两阶段提交,但 Kafka 的事务机制更复杂
-- **Flink + Iceberg**: 类似的两阶段提交,但 Iceberg 的事务 API 更灵活
-- **Flink + Hudi**: 支持多种提交模式(同步/异步),更灵活但更复杂
-
-### 7.1 流程时序图
+为什么提交必须放在 `notifyCheckpointComplete` 而不是 `snapshotState`？因为只有收到该回调，才能确定"这一轮 cp 已全局持久化"——此时提交，failover 时一定能从该 cp 恢复，提交与状态一致。若在 cp 完成前就提交，cp 一旦失败，已提交的 Snapshot 就与恢复点对不上，破坏 exactly-once。
 
 ```
-  Flink JobManager                Writer Subtask (N个)              Committer (1个)
-       │                                │                                │
-       │ triggerCheckpoint(cpId)         │                                │
-       │───────────────────────────────>│                                │
-       │                                │                                │
-       │                  prepareSnapshotPreBarrier(cpId)                │
-       │                                │                                │
-       │                 PrepareCommitOperator                           │
-       │                   .emitCommittables(false, cpId)               │
-       │                                │                                │
-       │                 StoreSinkWrite.prepareCommit(false, cpId)      │
-       │                   → MergeTreeWriter.prepareCommit()           │
-       │                     → flushWriteBuffer()                      │
-       │                     → trySyncLatestCompaction()               │
-       │                     → drainIncrement() → CommitIncrement      │
-       │                                │                                │
-       │                 new Committable(cpId, CommitMessage)           │
-       │                   → output.collect(StreamRecord)              │
-       │                                │─────────────────────────────>│
-       │                                │                                │
-       │                                │            CommitterOperator   │
-       │                                │            .processElement()   │
-       │                                │            → inputs.add()     │
-       │                                │                                │
-       │                  snapshotState(cpId)                            │
-       │                                │                                │
-       │                                │         snapshotState(cpId)   │
-       │                                │            → pollInputs()     │
-       │                                │            → groupByCheckpoint│
-       │                                │            → committableState │
-       │                                │              Manager          │
-       │                                │              .snapshotState() │
-       │                                │                                │
-       │ notifyCheckpointComplete(cpId)  │                               │
-       │────────────────────────────────│──────────────────────────────>│
-       │                                │                                │
-       │                                │         commitUpToCheckpoint  │
-       │                                │           (cpId)              │
-       │                                │                                │
-       │                                │         StoreCommitter        │
-       │                                │           .commit()           │
-       │                                │           → TableCommitImpl   │
-       │                                │             .commitMultiple() │
-       │                                │           → FileStoreCommitImpl│
-       │                                │             .commit()         │
-       │                                │           → 原子写入 Snapshot │
-       │                                │                                │
+JobManager      Writer×N (RowDataStoreWriteOperator)          Committer (并行度1)
+   │ triggerCheckpoint(cpId)
+   ├──────────────►│ prepareSnapshotPreBarrier(cpId)
+   │               │   flush → prepareCommit(false,cpId) → drainIncrement
+   │               │   emit Committable(cpId, CommitMessage) ──────────►│ processElement: inputs.add
+   │               │ snapshotState: 存"未提交 committable"             │ snapshotState: 按 cp 分组存盘
+   │ notifyCheckpointComplete(cpId)                                     │
+   ├────────────────────────────────────────────────────────────────► │ commitUpToCheckpoint(cpId)
+   │                                                                    │   StoreCommitter.commit → 冲突检测 → 原子 Snapshot
 ```
 
-### 7.2 关键代码解析
+### 8.2 阶段一：writer 如何"备货发货"
 
-#### Step 1: prepareSnapshotPreBarrier (Writer 侧)
+发货入口在 `PrepareCommitOperator`（§5.2 已列），它调 `prepareCommit`，最终落到 `StoreSinkWriteImpl.prepareCommit`：
 
 ```java
-// PrepareCommitOperator.java:93-98
-public void prepareSnapshotPreBarrier(long checkpointId) throws Exception {
-    if (!endOfInput) {
-        emitCommittables(false, checkpointId);
-    }
-}
-
-private void emitCommittables(boolean waitCompaction, long checkpointId) throws IOException {
-    prepareCommit(waitCompaction, checkpointId)
-        .forEach(committable -> output.collect(new StreamRecord<>(committable)));
-}
-
-// endInput 时也要 emit committables，但 waitCompaction=true
-public void endInput() throws Exception {
-    endOfInput = true;
-    emitCommittables(true, Long.MAX_VALUE);
-}
-```
-
-**为什么在 `prepareSnapshotPreBarrier` 中 emit**: 这保证了所有数据文件在 checkpoint barrier 到达 Committer 之前已经准备好。Barrier 对齐机制确保了一致性。
-
-#### Step 2: StoreSinkWriteImpl.prepareCommit
-
-```java
-// StoreSinkWriteImpl.java:137-151
+// StoreSinkWriteImpl.java:136-151
 public List<Committable> prepareCommit(boolean waitCompaction, long checkpointId) throws IOException {
     List<Committable> committables = new ArrayList<>();
-    for (CommitMessage committable : write.prepareCommit(this.waitCompaction || waitCompaction, checkpointId)) {
-        committables.add(new Committable(checkpointId, committable));
-    }
+    for (CommitMessage committable : write.prepareCommit(this.waitCompaction || waitCompaction, checkpointId))
+        committables.add(new Committable(checkpointId, committable));   // 打上 cpId
     return committables;
 }
 ```
 
-#### Step 3: CommitterOperator 接收并提交
+`write.prepareCommit` 进存储层，对每个活跃 writer 调 `MergeTreeWriter.prepareCommit`（`MergeTreeWriter.java:251-267`）：先 `flushWriteBuffer`，再按需 `waitCompaction`，最后 `drainIncrement()` 把这一轮的六类文件增量（new/deleted/changelog + compactBefore/After/changelog）打包成 `CommitMessage`。注意这里有第二次 `shouldWaitForPreparingCheckpoint()` 判断——即便流式 `waitCompaction=false`，若 Level 0 文件堆太多也会强制等一等，避免反复 failover 把 L0 越堆越高。
+
+**Committable / CommitMessage 结构**（理解提交内容）：
+```
+Committable { long checkpointId; CommitMessage commitMessage; }
+CommitMessageImpl {
+    BinaryRow partition; int bucket; int totalBuckets;
+    DataIncrement    { newFiles; deletedFiles; changelogFiles; }       // 本轮写入
+    CompactIncrement { compactBefore; compactAfter; changelogFiles; }  // 本轮 compaction
+}
+```
+
+### 8.3 阶段二：Committer 如何"过账"
 
 ```java
-// CommitterOperator.java:190-218
+// CommitterOperator.java:189-218
 public void notifyCheckpointComplete(long checkpointId) throws Exception {
     super.notifyCheckpointComplete(checkpointId);
     commitUpToCheckpoint(endInput ? END_INPUT_CHECKPOINT_ID : checkpointId);
 }
-
 private void commitUpToCheckpoint(long checkpointId) throws Exception {
-    NavigableMap<Long, GlobalCommitT> headMap =
-        committablesPerCheckpoint.headMap(checkpointId, true);
+    NavigableMap<Long, GlobalCommitT> headMap = committablesPerCheckpoint.headMap(checkpointId, true);
     List<GlobalCommitT> committables = committables(headMap);
-    
-    if (committables.isEmpty() && committer.forceCreatingSnapshot()) {
-        committables = Collections.singletonList(
-            toCommittables(checkpointId, Collections.emptyList()));
-    }
-
-    if (checkpointId == END_INPUT_CHECKPOINT_ID) {
-        // 批作业重启后可能再次 endInput，需要检查 snapshot 是否已存在
-        committer.filterAndCommit(committables, false, true);
-    } else {
-        committer.commit(committables);
-    }
+    if (committables.isEmpty() && committer.forceCreatingSnapshot())          // 即便空也可能要造 snapshot（如 watermark）
+        committables = Collections.singletonList(toCommittables(checkpointId, Collections.emptyList()));
+    if (checkpointId == END_INPUT_CHECKPOINT_ID)
+        committer.filterAndCommit(committables, false, true);                 // 批结尾：幂等提交（§8.5/§12）
+    else
+        committer.commit(committables);                                       // 流式：直接提交
     headMap.clear();
 }
 ```
 
-#### Step 4: StoreCommitter → FileStoreCommitImpl
+`committer.commit` 进 `StoreCommitter`（`StoreCommitter.java:98-104`）→ `TableCommitImpl.commitMultiple` → `FileStoreCommitImpl.commit`：在这里做**冲突检测 + 原子重命名生成 Snapshot**。这一步的细节（要删的文件是否还在、key 区间是否冲突、冲突后从最新 snapshot 重扫重试）属于存储层提交，**详见 01 号文档 §13**，本文不展开。这里只强调它在两阶段提交里的位置：Committer 是唯一的提交者、串行执行，冲突只可能来自**其他作业**，因此重试逻辑简单可控。
+
+### 8.4 exactly-once 的四道防线
+
+单靠 Flink checkpoint 不足以保证"文件级"的不丢不重，Paimon 叠了四道防线：
+
+| 防线 | 作用 | 源码 |
+|------|------|------|
+| ① 强制 EXACTLY_ONCE | AT_LEAST_ONCE 下同一 cp 可能被处理多次→重复，直接禁掉 | `FlinkSink.java:270` |
+| ② commitUser 幂等标识 | 从算子状态恢复的作业唯一 ID，写进 Snapshot；提交前据此识别"是不是本作业已提交过" | `CommitterOperator.java:129` |
+| ③ Committer 并行度 1 | 串行提交，杜绝多提交者竞争同一 snapshot 指针造成部分提交 | `FlinkWriteSink` 固定 |
+| ④ 提交冲突检测 + 重试 | 提交前校验文件存在性与 key 区间，冲突则重扫重试 | `FileStoreCommitImpl`（见 01 §13） |
 
 ```java
-// StoreCommitter.java:99-104
-public void commit(List<ManifestCommittable> committables) throws IOException, InterruptedException {
-    commit.commitMultiple(committables, false);  // TableCommitImpl
-    calcNumBytesAndRecordsOut(committables);
-    commitListeners.notifyCommittable(committables);
-}
+// FlinkSink.java:270-271 —— 防线①
+checkArgument(env.getCheckpointConfig().getCheckpointingMode() == CheckpointingMode.EXACTLY_ONCE,
+    "Paimon sink currently only supports EXACTLY_ONCE checkpoint mode. ...");
+// CommitterOperator.java:129-131 —— 防线②
+commitUser = StateUtils.getSingleValueFromState(context, "commit_user_state", String.class, initialCommitUser);
 ```
 
-### 7.3 CommitMessage 的结构
+### 8.5 故障恢复：为什么不丢也不重
 
-```java
-// CommitMessageImpl 包含:
-CommitMessageImpl {
-    BinaryRow partition;     // 分区
-    int bucket;              // 桶号
-    int totalBuckets;        // 总桶数
-    DataIncrement {          // 新增数据文件
-        List<DataFileMeta> newFiles;       // 新写入的数据文件
-        List<DataFileMeta> deletedFiles;   // 被删除的数据文件
-        List<DataFileMeta> changelogFiles; // changelog 文件
-    }
-    CompactIncrement {       // Compaction 相关文件
-        List<DataFileMeta> compactBefore;  // 参与 compaction 的输入文件
-        List<DataFileMeta> compactAfter;   // compaction 输出文件
-        List<DataFileMeta> changelogFiles; // compaction 产生的 changelog
-    }
-}
-```
+- **Writer 崩溃**：从上一个 cp 恢复，writer 重放上轮数据写出**新文件**。崩溃前写的旧文件因为从未被任何成功的 Snapshot 引用，等同孤儿文件，后续被孤儿清理回收——**不重复**。已 emit 给 Committer 的 committable 存在 writer 自己的状态里，恢复后会重发——**不丢失**。
+- **Committer 崩溃**：committable 按 cp 分组存在 Committer 状态（`snapshotState` 里 `pollInputs → groupByCheckpoint → CommittableStateManager.snapshotState`）。恢复后重放 `notifyCheckpointComplete`，凭 commitUser 幂等识别"这批是否已提交"，已提交则跳过——**不重复**；未提交则补提交——**不丢失**。
+- **批作业 endInput 被重复调用**：新版 Flink 批作业 failover 可能从中间算子重启，导致 `endInput` 多次触发。所以 `END_INPUT_CHECKPOINT_ID` 走 `filterAndCommit`（先查 snapshot 是否已存在再决定提不提），而非无脑 commit（§12.3）。
 
-### 7.5 事务性保证机制
+### 8.6 风险 / 陷阱
 
-Paimon Flink Sink 通过以下机制保证 Exactly-Once 语义：
-
-#### 1. Checkpoint 模式强制检查
-
-```java
-// FlinkSink.java
-env.getCheckpointConfig().getCheckpointingMode() == CheckpointingMode.EXACTLY_ONCE,
-"Paimon sink currently only supports EXACTLY_ONCE checkpoint mode. Please set "
-+ "execution.checkpointing.mode to exactly-once");
-```
-
-**为什么强制 EXACTLY_ONCE**: Paimon 的原子提交依赖于 Flink 的 checkpoint 协议。AT_LEAST_ONCE 模式下，同一个 checkpoint 可能被提交多次，导致重复数据。
-
-#### 2. CommitUser 机制
-
-```java
-// CommitterOperator.java:126-131
-commitUser = StateUtils.getSingleValueFromState(
-    context, "commit_user_state", String.class, initialCommitUser);
-```
-
-**CommitUser 的作用**:
-- 每个 Flink 作业有唯一的 commitUser（基于作业启动时间或用户指定）
-- 作业重启后从状态恢复 commitUser，保证一致性
-- Snapshot 中记录 commitUser，用于幂等性检查
-
-#### 3. Snapshot 幂等性检查
-
-```java
-// CommitterOperator.java:205-213
-if (checkpointId == END_INPUT_CHECKPOINT_ID) {
-    // 批作业重启后可能再次 endInput，需要检查 snapshot 是否已存在
-    committer.filterAndCommit(committables, false, true);
-} else {
-    committer.commit(committables);
-}
-```
-
-**幂等性检查流程**:
-1. 批作业 endInput 时，检查对应的 snapshot 是否已存在
-2. 如果存在，跳过重复提交
-3. 如果不存在，正常提交
-
-#### 4. Barrier 对齐保证
-
-```
-Writer 侧                          Committer 侧
-    │                                  │
-    │ prepareSnapshotPreBarrier        │
-    │ (flush 所有数据文件)              │
-    │                                  │
-    │ ─────── Barrier ─────────────>   │
-    │                                  │
-    │ snapshotState()                  │
-    │ (保存状态)                        │
-    │                                  │
-    │ notifyCheckpointComplete         │
-    │ ─────────────────────────────>   │
-    │                                  │
-    │                          commit() │
-    │                          (原子提交) │
-```
-
-**Barrier 对齐的意义**:
-- 所有 Writer 的数据文件在 Barrier 到达 Committer 前已准备好
-- Committer 收到 Barrier 后，所有数据文件已稳定，可以安全提交
-- 即使 Committer 失败，重启后可以从状态恢复并重新提交（幂等）
-
-#### 5. 文件冲突检查
-
-```java
-// FileStoreCommitImpl.java
-// 提交前检查：
-// 1. 要删除的文件是否仍然存在
-// 2. 新文件的 key 范围是否与已有文件冲突
-// 3. 如果冲突，从最新 snapshot 重新扫描并重试
-```
-
-**冲突检查的必要性**:
-- 多个 Writer 可能同时写入同一 partition+bucket
-- 冲突检查确保不会覆盖其他 Writer 的数据
-- 重试机制保证最终一致性
+- **checkpoint 超时**：阶段一可能因 flush + `waitCompaction`（full-compaction/lookup/批模式）很慢，timeout 配太短会让 cp 反复失败、作业卡死。timeout ≥ 5 分钟。
+- **commitUser 漂移**：默认 commitUser 含启动信息，作业以新 ID 重启时旧未提交数据无法被幂等识别，可能在极端时序下重复或残留。生产显式配 `commit.user`。
+- **Committer 单点**：它只做元数据操作，通常不是瓶颈；但海量 committable（分区/桶极多）+ 频繁 cp 时，提交耗时会上升，需控制 cp 频率与分区数。
 
 ---
 
-## 8. 内存管理
+## 9. 共享内存池与抢占机制
 
-### 解决什么问题
+### 9.1 为什么要共享池而非各自分配
 
-**核心业务问题**: 如何在有限的内存下,支持多个 partition+bucket 并发写入,避免 OOM 和内存浪费?
+**① 要解决什么问题**：一个 writer 算子实例可能同时持有成百上千个 `MergeTreeWriter`（每个活跃 partition+bucket 一个）。若每个 writer 独占 `write-buffer-size`（默认 256MB），1600 个 bucket 就要 400GB，必然 OOM。
 
-**没有这个设计的后果**:
-- OOM: 每个 Writer 独立分配内存,总内存超过 JVM 堆大小
-- 内存浪费: 某些 Writer 空闲但占用内存,其他 Writer 内存不足
-- 写入阻塞: 内存不足时无法继续写入,导致反压
-- 性能下降: 频繁的 GC 导致吞吐量下降
+**② 设计原理**：一个算子实例只建**一个** `MemoryPoolFactory`（在 `PrepareCommitOperator.setup` 里），所有 `MergeTreeWriter` 作为 `MemoryOwner` 从它分配 `MemorySegment`。**总内存 = write-buffer-size，与 writer 数量无关**。当池满而某 writer 还要内存时，不阻塞等待（会死锁），而是**抢占**：强制当前内存占用最大的另一个 writer flush 出内存。
 
-**实际场景**:
-```
-场景1: 多分区并发写入
-  - 表有 100 个分区,每个分区 16 个 bucket,共 1600 个 partition+bucket
-  - 如果每个 Writer 分配 256MB,总共需要 400GB 内存,显然不可行
-  - 通过 MemoryPoolFactory 统一管理,总内存只需 4GB(write-buffer-size)
+一句话哲学：**总量恒定、按需流动、抢占最大者**——用一笔固定预算喂养任意多个写入器。
 
-场景2: 热点分区
-  - 当天分区写入频繁,历史分区几乎不写入
-  - 热点分区的 Writer 需要更多内存,历史分区的 Writer 可以释放内存
-  - 通过抢占机制,自动将历史分区的内存分配给热点分区
+> 重要更正：`write-buffer-size` 是**整个算子实例所有 writer 共享的总量**，不是每个 writer 的配额。按"每 writer"理解会严重高估内存（§1.4 陷阱）。
 
-场景3: 内存不足时的抢占
-  - Writer A 占用 1GB 内存,但已经 10 分钟没有新数据
-  - Writer B 需要内存但 MemoryPool 已满
-  - MemoryPoolFactory 强制 Writer A flush,释放内存给 Writer B
-```
-
-### 有什么坑
-
-**误区陷阱**:
-1. **误以为 write-buffer-size 是每个 Writer 的内存**: 实际上是所有 Writer 共享的总内存
-2. **混淆堆内存和 Managed Memory**: 
-   - 堆内存模式: 从 JVM 堆分配,不受 Flink 内存框架管理
-   - Managed Memory 模式: 从 TaskManager 的 Managed Memory 分配,受 Flink 管理
-3. **忽略抢占的副作用**: 频繁抢占会导致频繁 flush,产生大量小文件
-4. **page-size 配置不当**: 过大导致内存浪费,过小导致频繁分配
-
-**错误配置示例**:
-```sql
--- 错误1: write-buffer-size 过大
-WITH ('write-buffer-size' = '10GB')
--- 问题: 如果 TaskManager 堆内存只有 8GB,会 OOM
-
--- 错误2: write-buffer-size 过小
-WITH ('write-buffer-size' = '64MB')
--- 问题: 多个 partition+bucket 并发写入时,频繁抢占,性能差
-
--- 错误3: 启用 Managed Memory 但未配置足够的内存
-SET 'taskmanager.memory.managed.fraction' = '0.1';
-WITH ('sink.use-managed-memory' = 'true')
--- 问题: Managed Memory 只有 10%,可能不足
-
--- 错误4: page-size 过大
-WITH ('page-size' = '64MB')
--- 问题: 每次分配 64MB,内存利用率低
-```
-
-**生产环境注意事项**:
-1. **write-buffer-size 设置**: 建议为 TaskManager 堆内存的 20%-40%
-2. **Managed Memory 模式**: 生产环境建议启用,避免 OOM
-3. **监控内存抢占**: 通过 metrics 监控 `bufferPreemptCount`,过高说明内存不足
-4. **page-size 设置**: 默认 64KB,一般不需要调整
-
-**性能陷阱**:
-1. **频繁抢占**: 内存不足导致频繁抢占,Writer 频繁 flush,产生大量小文件
-2. **内存碎片**: 长时间运行后,内存碎片增多,分配效率下降
-3. **GC 压力**: 堆内存模式下,大量 MemorySegment 对象增加 GC 压力
-
-### 核心概念解释
-
-**术语定义**:
-- **MemoryPoolFactory**: 内存池工厂,管理所有 Writer 的内存分配
-- **MemorySegment**: 内存段,固定大小的内存块(默认 64KB)
-- **OwnerMemoryPool**: 每个 Writer 的内存池,从 MemoryPoolFactory 分配内存
-- **MemoryOwner**: 内存拥有者,即 MergeTreeWriter,实现 flushMemory() 接口
-- **抢占 (Preempt)**: 当内存不足时,强制占用最多内存的 Writer flush,释放内存
-
-**内存管理架构**:
-```
-MemoryPoolFactory (per TaskManager)
-  ├── innerPool (HeapMemorySegmentPool / FlinkMemorySegmentPool)
-  │     ├── totalPages = write-buffer-size / page-size
-  │     └── freePages (空闲内存段列表)
-  │
-  ├── owners: List<MemoryOwner> (所有 MergeTreeWriter)
-  │     ├── Writer A (partition=2026-04-22, bucket=0)
-  │     ├── Writer B (partition=2026-04-22, bucket=1)
-  │     └── Writer C (partition=2026-04-21, bucket=0)
-  │
-  └── OwnerMemoryPool (per Writer)
-        ├── nextSegment()
-        │     ├── segment = innerPool.nextSegment()
-        │     ├── if (segment == null) preemptMemory(owner)
-        │     └── return segment
-        │
-        └── returnAll() (flush 后归还内存)
-```
-
-**抢占机制**:
-```
-Writer B 需要内存,但 innerPool 已满
-  ↓
-MemoryPoolFactory.preemptMemory(Writer B)
-  ↓
-遍历所有 owners,找到内存占用最大的 Writer A (排除 Writer B 自己)
-  ↓
-Writer A.flushMemory()
-  ↓
-Writer A flush SortBuffer,释放所有 MemorySegment
-  ↓
-innerPool.freePages 增加
-  ↓
-Writer B 重新尝试 nextSegment(),成功获取内存
-```
-
-**与其他系统对比**:
-- **RocksDB**: 使用 Block Cache 统一管理内存,类似 MemoryPoolFactory
-- **HBase**: 使用 MemStore + Block Cache,内存管理更复杂
-- **Flink**: 使用 Managed Memory 管理算子内存,Paimon 可以集成
-
-### 设计理念
-
-**为什么这样设计**:
-1. **统一内存池**: 所有 Writer 共享一个内存池,避免内存浪费
-   - 问题: 如果每个 Writer 独立分配内存,总内存 = Writer 数量 × 单个内存
-   - 解决: 统一内存池,总内存 = write-buffer-size,与 Writer 数量无关
-   - 好处: 支持大量 partition+bucket 并发写入,不会 OOM
-
-2. **抢占机制**: 内存不足时,自动抢占占用最多的 Writer
-   - 问题: 如果不抢占,Writer 会阻塞等待,可能死锁
-   - 解决: 抢占占用最多的 Writer,强制 flush 释放内存
-   - 好处: 保证至少有一个 Writer 能推进,避免死锁
-
-3. **LRU 式抢占**: 选择内存占用最大的 Writer 抢占
-   - 原因: 内存占用大说明该 Writer 已经积累了大量数据,flush 的收益最大
-   - 好处: 公平且高效,避免频繁抢占小 Writer
-
-4. **两种内存模式**: 堆内存 vs Managed Memory
-   - 堆内存: 简单直接,适合小规模写入
-   - Managed Memory: 与 Flink 内存框架集成,适合大规模生产环境
-   - 好处: 灵活性,用户可以根据场景选择
-
-**权衡取舍**:
-- **内存利用率 vs 复杂性**: 统一内存池提高了利用率,但增加了复杂性
-- **抢占 vs 小文件**: 抢占避免了死锁,但可能产生小文件
-- **堆内存 vs Managed Memory**: 堆内存简单但可能 OOM,Managed Memory 安全但配置复杂
-
-**架构演进**:
-1. **早期版本**: 每个 Writer 独立分配内存,容易 OOM
-2. **引入 MemoryPoolFactory**: 统一内存池,支持大量 Writer 并发
-3. **引入抢占机制**: 避免死锁,保证写入推进
-4. **引入 Managed Memory 模式**: 与 Flink 内存框架集成,避免 OOM
-
-**业界对比**:
-- **RocksDB 的 Block Cache**: 类似的统一内存池,但不支持抢占
-- **HBase 的 MemStore**: 支持 flush,但内存管理更复杂(需要考虑 Region)
-- **Flink 的 Managed Memory**: Paimon 可以集成,但需要额外配置
-
-### 8.1 MemoryPoolFactory 的内存分配和抢占机制
-
-**源码路径**: `paimon-core/src/main/java/org/apache/paimon/memory/MemoryPoolFactory.java`
-
-```
-┌──────────────────────────────────────────────────────────┐
-│                    MemoryPoolFactory                       │
-│                                                            │
-│  innerPool (HeapMemorySegmentPool / FlinkMemorySegmentPool)│
-│  totalPages = innerPool.freePages()                       │
-│                                                            │
-│  owners: Iterable<MemoryOwner>                            │
-│    → 所有 MergeTreeWriter 实例 (每个 partition+bucket 一个) │
-│                                                            │
-│  OwnerMemoryPool (per writer):                            │
-│    nextSegment():                                          │
-│      segment = innerPool.nextSegment()                    │
-│      if (segment == null):                                │
-│        preemptMemory(owner)  ← 抢占内存                   │
-│        segment = innerPool.nextSegment()                  │
-│      return segment                                       │
-│                                                            │
-│  preemptMemory(owner):                                    │
-│    找到内存占用最大的 other writer (排除自己)               │
-│    → other.flushMemory()  ← 强制 flush 释放内存           │
-│                                                            │
-└──────────────────────────────────────────────────────────┘
-```
-
-### 8.2 内存分配策略
-
-#### 内存来源选择
+### 9.2 两种内存来源
 
 ```java
-// PrepareCommitOperator.java:74-89
+// PrepareCommitOperator.java:67-90（精简）
 if (options.get(SINK_USE_MANAGED_MEMORY)) {
-    // 使用 Flink Managed Memory (从 TaskManager 的 Managed Memory 段分配)
-    memoryPool = new FlinkMemorySegmentPool(computeManagedMemory(this), pageSize, memoryAllocator);
+    // Flink Managed Memory：从 TaskManager 托管内存段分配，受 Flink 统一管控，生产推荐
+    memoryPool = new FlinkMemorySegmentPool(computeManagedMemory(this), memoryManager.getPageSize(), memoryAllocator);
 } else {
-    // 使用堆内存 (默认)
+    // 堆内存（默认）：简单，但不受 Flink 框架管控，配错可能 OOM
     memoryPool = new HeapMemorySegmentPool(coreOptions.writeBufferSize(), coreOptions.pageSize());
 }
 memoryPoolFactory = new MemoryPoolFactory(memoryPool);
 ```
 
-**为什么提供两种内存模式**:
-- **堆内存模式** (默认): 简单直接，适合小规模写入。缺点是不受 Flink 内存框架管理，可能导致 OOM。
-- **Managed Memory 模式**: 与 Flink 的内存管理框架集成，受 TaskManager 统一管控，适合大规模生产环境。
+### 9.3 抢占机制：选最大者 flush
 
-#### 抢占机制详解
+`MemoryPoolFactory` 把内部池包成给每个 owner 用的 `OwnerMemoryPool`：分配 segment 时若池空，就触发抢占——遍历所有 owner，挑**当前内存占用最大的另一个 writer** 强制 flush，腾出内存后重试分配。
 
 ```java
 // MemoryPoolFactory.java:73-93
 private void preemptMemory(MemoryOwner owner) {
-    long maxMemory = 0;
-    MemoryOwner max = null;
+    long maxMemory = 0; MemoryOwner max = null;
     for (MemoryOwner other : owners) {
-        // 不能抢占自己！同时写入和 flush 可能导致状态不一致
+        // 关键：绝不抢占自己——边写边 flush 会破坏自身状态
         if (other != owner && other.memoryOccupancy() > maxMemory) {
-            maxMemory = other.memoryOccupancy();
-            max = other;
+            maxMemory = other.memoryOccupancy(); max = other;
         }
     }
-    if (max != null) {
-        max.flushMemory();  // 强制占用最多的 writer flush
-        ++bufferPreemptCount;
-    }
+    if (max != null) { max.flushMemory(); ++bufferPreemptCount; }  // bufferPreemptCount 是关键监控指标
 }
 ```
 
-**为什么抢占而不是等待**: 在 LSM-tree 架构下，如果所有 writer 都阻塞等待内存，会导致死锁。抢占策略保证至少有一个 writer 能获得内存推进写入，LRU 式地选择最大内存占用者 flush，是公平且高效的。
+被抢占者执行 `flushMemory`（`MergeTreeWriter.java:201-207`）：能部分释放则部分释放，否则整体 `flushWriteBuffer` 落盘。
 
-#### MergeTreeWriter 的 flushMemory 实现
+**为什么抢占而非等待**：LSM 下若所有 writer 都阻塞等内存，谁也释放不了 → 死锁。抢占保证至少有一个 writer 能推进；选"最大者"是因为它积累最多、flush 收益最高。
 
-```java
-// MergeTreeWriter.java:202-207
-public void flushMemory() throws Exception {
-    boolean success = writeBuffer.flushMemory();
-    if (!success) {
-        flushWriteBuffer(false, false);  // SortBuffer 无法部分释放，全量 flush
-    }
-}
-```
-
-### 8.3 内存生命周期
+### 9.4 内存生命周期与风险
 
 ```
-Writer 算子启动
-  │
-  ├── PrepareCommitOperator.setup()  → 创建 MemoryPoolFactory (一个算子实例共享)
-  │
-  ├── 第一次 write(partition_A, bucket_0)
-  │     → AbstractFileStoreWrite.getWriterWrapper()
-  │       → 创建新 MergeTreeWriter
-  │       → MemoryFileStoreWrite.notifyNewWriter()
-  │         → writeBufferPool.notifyNewOwner(writer)
-  │           → writer.setMemoryPool(new OwnerMemoryPool(writer))
-  │             → 创建 SortBufferWriteBuffer
-  │
-  ├── 写入数据
-  │     → writeBuffer.put()  → 从 OwnerMemoryPool 分配 MemorySegment
-  │     → 内存不足时  → preemptMemory()  → 其他 writer flush 释放内存
-  │
-  ├── prepareCommit()  → 所有 writer flush → 内存归还到 innerPool
-  │
-  └── close()  → 关闭所有 writer → 释放全部内存
+PrepareCommitOperator.setup()        建 MemoryPoolFactory（整个算子实例一个）
+  └─ 首次 write(part, bucket)         AbstractFileStoreWrite.getWriterWrapper → 新建 MergeTreeWriter
+       └─ notifyNewWriter             writeBufferPool.notifyNewOwner(writer) → writer.setMemoryPool(OwnerMemoryPool)
+  └─ write 数据                       writeBuffer.put 分配 segment；池空 → preemptMemory（别人 flush 让出）
+  └─ prepareCommit                    所有 writer flush → segment 归还 innerPool
+  └─ close                            释放全部内存
 ```
+
+**④ 风险/陷阱**：
+- **抢占风暴 → 小文件**：内存太紧、活跃 bucket 太多时，writer 互相抢占、被迫小批量 flush，Level 0 小文件激增、compaction 压力大。这是把 §1.4 该陷阱落到机制上的根因。监控 `bufferPreemptCount`，居高不下就调大 `write-buffer-size`、减少同时活跃 bucket、或开 `write-buffer-spillable`。
+- **堆模式 OOM**：堆模式不受 Flink 框架管控，`write-buffer-size` > 实际可用堆会 OOM；生产用 `sink.use-managed-memory=true` 更安全。
+- **page-size**：默认 64KB，一般不动；过大降低利用率、过小增加分配开销。
 
 ---
 
-## 9. 异步 Compaction
+## 10. 异步 Compaction 与写入反压
 
-### 解决什么问题
+> Compaction 的策略本身（UniversalCompaction 选 run、各级触发、record-level expire）由 **01 号文档 §8** 主讲。本节只讲**它如何嵌进 Flink 写入链路**：何时异步触发、何时反压写入与 checkpoint、flush 与 compaction 如何在 `MergeTreeWriter` 里协调。
 
-**核心业务问题**: 如何在不阻塞写入的情况下,持续合并小文件,控制读放大和存储空间?
+### 10.1 异步触发：写入与合并并行
 
-**没有这个设计的后果**:
-- 读放大严重: Level 0 文件越来越多,每次读取需要合并大量文件
-- 存储空间浪费: 同一 key 的多个版本占用大量空间
-- 写入阻塞: 文件数量过多导致写入无法继续
-- 性能下降: 大量小文件导致 HDFS NameNode 压力大
-
-**实际场景**:
-```
-场景1: 高频更新场景
-  - 每秒写入 10000 条更新,每分钟 flush 一次
-  - 1 小时产生 60 个 Level 0 文件
-  - 如果不 compaction,读取时需要合并 60 个文件,性能极差
-  - 通过异步 compaction,Level 0 文件数量控制在 10 个以内
-
-场景2: 写入反压
-  - Level 0 文件数量达到 numSortedRunStopTrigger (默认 10)
-  - 写入被阻塞,等待 compaction 完成
-  - Compaction 完成后,Level 0 文件减少,写入继续
-  - 这是 LSM-tree 的自然反压机制
-
-场景3: Full Compaction
-  - changelog-producer=full-compaction 模式
-  - 每隔 deltaCommits 个 checkpoint,触发全局 Full Compaction
-  - 合并所有 level 的文件,生成完整的 changelog
-  - 用于下游消费完整的变更数据
-```
-
-### 有什么坑
-
-**误区陷阱**:
-1. **误以为 Compaction 是同步的**: 实际上是异步执行,写入和 compaction 并行
-2. **忽略反压机制**: 当 sorted run 数量超过阈值时,写入会被阻塞
-3. **Full Compaction 的性能开销**: 全局 Full Compaction 会合并所有文件,IO 开销巨大
-4. **Compaction 线程数配置不当**: 过少导致 compaction 跟不上写入,过多导致 CPU 和 IO 竞争
-
-**错误配置示例**:
-```sql
--- 错误1: num-sorted-run.stop-trigger 过大
-WITH ('num-sorted-run.stop-trigger' = '100')
--- 问题: Level 0 文件过多,读放大严重,且 compaction 压力大
-
--- 错误2: num-sorted-run.stop-trigger 过小
-WITH ('num-sorted-run.stop-trigger' = '2')
--- 问题: 频繁触发反压,写入吞吐量低
-
--- 错误3: compaction.max-file-num 过大
-WITH ('compaction.max-file-num' = '100')
--- 问题: 单次 compaction 合并过多文件,IO 和内存开销大
-
--- 错误4: Full Compaction 间隔过短
-WITH ('full-compaction.delta-commits' = '1')
--- 问题: 每个 checkpoint 都触发 Full Compaction,性能极差
-```
-
-**生产环境注意事项**:
-1. **监控 sorted run 数量**: 通过 metrics 监控,接近 stop-trigger 说明 compaction 跟不上
-2. **Compaction 线程数**: 默认与 CPU 核数相关,高吞吐场景建议增加
-3. **Full Compaction 间隔**: 建议至少 10 个 checkpoint,避免频繁触发
-4. **Compaction 策略**: Universal Compaction 适合写多读少,Tiered Compaction 适合读多写少
-
-**性能陷阱**:
-1. **Compaction 追不上写入**: 写入速度过快,compaction 无法及时合并,导致反压
-2. **Full Compaction 阻塞 Checkpoint**: waitCompaction=true 时,Checkpoint 会等待 compaction 完成
-3. **Compaction IO 竞争**: Compaction 和写入共享磁盘 IO,可能相互影响
-
-### 核心概念解释
-
-**术语定义**:
-- **Sorted Run**: LSM-tree 中的一组有序文件,Level 0 的每个文件是一个 sorted run
-- **Compaction**: 合并多个 sorted run,生成更大的文件,减少文件数量
-- **Full Compaction**: 合并所有 level 的文件,生成单个文件
-- **Universal Compaction**: 基于文件大小的 compaction 策略,适合写多读少
-- **Tiered Compaction**: 基于 level 的 compaction 策略,适合读多写少
-- **反压 (Backpressure)**: 当 sorted run 数量过多时,阻塞写入,等待 compaction
-
-**Compaction 触发条件**:
-```
-每次 flush 后检查:
-  ├── sorted run 数量 >= numSortedRunCompactTrigger
-  │     → 触发 compaction
-  │
-  ├── sorted run 数量 >= numSortedRunStopTrigger
-  │     → 写入被阻塞,等待 compaction 完成
-  │
-  └── Full Compaction 条件:
-        ├── changelog-producer = full-compaction
-        ├── checkpointId % deltaCommits == 0
-        └── 触发全局 Full Compaction
-```
-
-**Compaction 流程**:
-```
-MergeTreeWriter.flushWriteBuffer()
-  ↓
-compactManager.addNewFile(fileMeta)  (新文件注册到 levels)
-  ↓
-compactManager.triggerCompaction(forcedFullCompaction)
-  ↓
-strategy.pick(numberOfLevels, runs)  (选择要合并的文件)
-  ↓
-submitCompaction(unit)  (提交到线程池异步执行)
-  ↓
-CompactTask.call()  (读取旧文件 + 排序合并 + 写入新文件)
-  ↓
-trySyncLatestCompaction()  (获取 compaction 结果)
-  ↓
-levels.update(compactBefore, compactAfter)  (更新 levels)
-```
-
-**与其他系统对比**:
-- **RocksDB**: 也使用 LSM-tree + 异步 compaction,策略类似
-- **HBase**: 使用 Major Compaction 和 Minor Compaction,概念类似
-- **Cassandra**: 使用 Size-Tiered Compaction 和 Leveled Compaction,策略更多样
-
-### 设计理念
-
-**为什么这样设计**:
-1. **异步执行**: Compaction 在后台线程池执行,不阻塞写入
-   - 问题: 如果同步执行,写入会被长时间阻塞
-   - 解决: 异步执行,写入和 compaction 并行
-   - 好处: 写入吞吐量高,延迟低
-
-2. **反压机制**: 当 sorted run 过多时,阻塞写入
-   - 问题: 如果不限制,Level 0 文件会无限增长
-   - 解决: 通过 numSortedRunStopTrigger 做反压
-   - 好处: 保证系统稳定,避免读放大和存储空间爆炸
-
-3. **分层触发**: compactTrigger < stopTrigger < stopTrigger+1
-   - compactTrigger: 开始 compaction,但不阻塞写入
-   - stopTrigger: 阻塞写入,等待 compaction 完成
-   - stopTrigger+1: checkpoint 也被阻塞,更严格的等待条件
-   - 好处: 分层控制,避免过早或过晚触发
-
-4. **Full Compaction 的全局同步**: 所有 Writer 在同一 checkpoint 触发
-   - 问题: 如果每个 Writer 独立触发,生成的 changelog 不一致
-   - 解决: 通过 GlobalFullCompactionSinkWrite 全局同步
-   - 好处: 生成完整一致的 changelog
-
-**权衡取舍**:
-- **写入吞吐量 vs 读放大**: 异步 compaction 提高了写入吞吐量,但增加了读放大
-- **反压 vs 稳定性**: 反压降低了写入吞吐量,但保证了系统稳定
-- **Full Compaction vs 性能**: Full Compaction 生成完整 changelog,但 IO 开销大
-
-**架构演进**:
-1. **早期版本**: 同步 compaction,写入性能差
-2. **引入异步 compaction**: 写入和 compaction 并行,性能提升
-3. **引入反压机制**: 避免 Level 0 文件无限增长
-4. **引入 Full Compaction**: 支持 changelog-producer=full-compaction
-
-**业界对比**:
-- **RocksDB**: 也使用异步 compaction + 反压,策略类似
-- **HBase**: Major Compaction 通常是手动触发或定时触发,不如 Paimon 自动化
-- **Cassandra**: 支持多种 compaction 策略,更灵活但更复杂
-
-### 9.1 CompactManager 触发机制
-
-**源码路径**: `paimon-core/src/main/java/org/apache/paimon/mergetree/compact/MergeTreeCompactManager.java`
-
-```
-MergeTreeCompactManager 继承 CompactFutureManager
-  │
-  ├── triggerCompaction(fullCompaction)
-  │     │
-  │     ├── fullCompaction = true:
-  │     │     → CompactStrategy.pickFullCompaction()
-  │     │     → 选择所有 level 的文件进行合并
-  │     │
-  │     └── fullCompaction = false (常规 compaction):
-  │           → strategy.pick(numberOfLevels, runs)
-  │           → 根据 UniversalCompaction / TieredCompaction 策略选择文件
-  │           → 提交异步 CompactTask
-  │
-  ├── shouldWaitForLatestCompaction()
-  │     → levels.numberOfSortedRuns() > numSortedRunStopTrigger
-  │     → 当 sorted run 数量超过停止阈值时，写入必须等待 compaction 完成
-  │     → 这是写入反压的核心机制
-  │
-  ├── shouldWaitForPreparingCheckpoint()
-  │     → levels.numberOfSortedRuns() > numSortedRunStopTrigger + 1
-  │     → checkpoint 准备阶段更严格的等待条件
-  │
-  └── getCompactionResult(blocking)
-        → 从 Future 获取 compaction 结果
-        → blocking=true 时同步等待
-```
-
-### 9.2 反压机制
-
-```
-                          写入速度 ──────────────────>
-                          │
-sorted run 数量  ─────────┤
-                          │
-  numSortedRunStopTrigger─┤─────────── 写入被阻塞,等待 compaction
-                          │            (shouldWaitForLatestCompaction = true)
-  numSortedRunStopTrigger+1│─────────── checkpoint 也被阻塞
-                          │            (shouldWaitForPreparingCheckpoint = true)
-                          │
-  numSortedRunCompactTrigger─────────── 触发 compaction
-                          │            (strategy.pick 返回 CompactUnit)
-                          │
-```
-
-**为什么这样设计反压**: 如果不限制 sorted run 数量，Level 0 文件会无限增长，导致：
-1. 读放大严重（每次读要合并更多文件）
-2. compaction 追不上写入，形成恶性循环
-
-通过 `numSortedRunStopTrigger` 做背压，当 compaction 跟不上写入速度时，自动降低写入速率，保证系统稳定。
-
-### 9.3 异步执行模型
+**① 要解决什么问题**：compaction 是重 IO 操作（读旧文件+排序合并+写新文件），若同步执行会卡住写入路径。**② 设计**：每次 flush 后 `compactManager.triggerCompaction()` 把任务提交到线程池异步跑，写入继续推进，只在"文件堆太多"时才同步等。
 
 ```java
-// MergeTreeCompactManager.java:208-235
+// MergeTreeCompactManager.java:208 起 submitCompaction（精简）
 private void submitCompaction(CompactUnit unit, boolean dropDelete) {
-    CompactTask task;
-    if (unit.fileRewrite()) {
-        task = new FileRewriteCompactTask(rewriter, unit, dropDelete, metricsReporter);
-    } else {
-        task = new MergeTreeCompactTask(
-            keyComparator, compactionFileSize, rewriter, unit,
-            dropDelete, levels.maxLevel(), metricsReporter,
-            compactDfSupplier, recordLevelExpire, forceRewriteAllFiles);
-    }
-    // 提交到线程池异步执行
-    taskFuture = executor.submit(task);
+    CompactTask task = unit.fileRewrite()
+        ? new FileRewriteCompactTask(rewriter, unit, dropDelete, metricsReporter)
+        : new MergeTreeCompactTask(keyComparator, compactionFileSize, rewriter, unit, dropDelete,
+                levels.maxLevel(), metricsReporter, compactDfSupplier, recordLevelExpire, forceRewriteAllFiles);
+    taskFuture = executor.submit(task);                     // 异步
 }
 ```
 
-**为什么 Compaction 异步执行**: Compaction 涉及大量 IO（读取旧文件 + 排序合并 + 写入新文件），同步执行会严重阻塞写入路径。异步执行让写入和 compaction 并行进行，只在必要时（sorted run 过多）才同步等待。
+### 10.2 写入反压：三档阈值
 
-### 9.4 flush 和 compaction 的协调
+**① 要解决什么问题**：compaction 异步跑，万一追不上写入速度，Level 0 的 sorted run 会无限堆积——读放大爆炸，且越堆越合不动，形成恶性循环。**② 设计（按 sorted run 数三档刹车）**：
 
-```java
-// MergeTreeWriter.java:209-249 (flushWriteBuffer)
-flushWriteBuffer(waitForLatestCompaction, forcedFullCompaction):
-    // 1. 如果 sorted run 过多，强制等待
-    if (compactManager.shouldWaitForLatestCompaction())
-        waitForLatestCompaction = true;
-
-    // 2. 将 WriteBuffer 数据写入 Level 0 文件
-    writeBuffer.forEach(keyComparator, mergeFunction, changelogWriter, dataWriter);
-    writeBuffer.clear();
-
-    // 3. 新文件注册到 levels
-    for (DataFileMeta fileMeta : dataWriter.result())
-        compactManager.addNewFile(fileMeta);
-
-    // 4. 尝试获取 compaction 结果
-    trySyncLatestCompaction(waitForLatestCompaction);
-
-    // 5. 触发新的 compaction
-    compactManager.triggerCompaction(forcedFullCompaction);
 ```
+sorted run 数量 ↑
+  numSortedRunStopTrigger + 1  ── checkpoint 也被阻塞（shouldWaitForPreparingCheckpoint，MergeTreeWriter.prepareCommit）
+  numSortedRunStopTrigger      ── 写入被阻塞，等 compaction（shouldWaitForLatestCompaction，flushWriteBuffer 内）
+  numSortedRunCompactTrigger   ── 触发 compaction（strategy.pick），但不阻塞写入
+```
+
+三档的意义：先尽量异步消化（compactTrigger）→ 实在追不上就反压写入（stopTrigger）→ 连 checkpoint 都先等等（stopTrigger+1），避免反复 failover 把 L0 越堆越高。`shouldWaitForLatestCompaction` / `shouldWaitForPreparingCheckpoint` 的判定在 `MergeTreeCompactManager`，阈值默认值与三参数的连带影响见 **01 号文档 §1.3 陷阱 2/7**。
+
+### 10.3 flush 与 compaction 的协调点
+
+`MergeTreeWriter.flushWriteBuffer`（§7.4 已列）是二者唯一交汇点，每次都按序做四件事：① 若 `shouldWaitForLatestCompaction()` 则把本次 flush 升级为"等上一轮 compaction 完成"；② 写出 Level 0 文件；③ `addNewFile` 注册进 Levels；④ `trySyncLatestCompaction` 取回已完成结果、`triggerCompaction` 触发新一轮。
+
+**④ 风险**：
+- `num-sorted-run.stop-trigger` 太大 → L0 堆积、读放大；太小 → 频繁反压、写吞吐低。
+- `full-compaction.delta-commits=1` → 每个 cp 都全量 compact，IO 爆炸（§6.2）。
+- compaction 与写入争抢磁盘/CPU IO；线程数过少追不上、过多互相竞争。
+- full-compaction 的全局同步由 `GlobalFullCompactionSinkWrite` 在 Flink 侧保证（§6.2），不是存储层自己决定的。
 
 ---
 
-## 10. CDC 写入场景
+## 11. CDC / RowKind 在写入侧的处理
 
-### 解决什么问题
+> CDC 数据源的接入与同步动作（MySQL/Kafka → Paimon、整库同步）由 **14 号文档**主讲。本节只讲 RowKind 在**写入链路里**怎么被取出、过滤、嵌进 KeyValue，以及各 merge-engine 的语义差异在写入侧的体现。
 
-**核心业务问题**: 如何正确处理 CDC 数据流中的 INSERT/UPDATE/DELETE 操作,保证数据的最终一致性?
+### 11.1 RowKind 在写入侧的四步
 
-**没有这个设计的后果**:
-- 数据不一致: UPDATE_BEFORE 和 UPDATE_AFTER 处理不当,导致数据重复或丢失
-- 无法撤回: AGGREGATE merge engine 需要 UPDATE_BEFORE 做撤回,否则聚合结果错误
-- 性能浪费: 不必要的 UPDATE_BEFORE 传输,增加网络开销
-- 语义错误: 不同 MergeEngine 对 RowKind 的处理不同,配置错误导致语义错误
+CDC 流里每条记录带 RowKind（+I/-U/+U/-D）。写入侧对它做四步处理（都在 §7.3 的 `writeAndReturn` 内）：
 
-**实际场景**:
-```sql
--- 场景1: MySQL Binlog 同步 (deduplicate)
-CREATE TABLE paimon_user (
-    id BIGINT PRIMARY KEY NOT ENFORCED,
-    name STRING,
-    age INT
-) WITH ('merge-engine' = 'deduplicate');
-
--- Flink CDC 产生的数据流:
--- +I[1, "Alice", 25]  (INSERT)
--- +U[1, "Alice", 26]  (UPDATE_AFTER, 无 UPDATE_BEFORE)
--- -D[1, "Alice", 26]  (DELETE)
-
--- Paimon 处理:
--- +I: 写入 KeyValue{key=[1], value=[1,"Alice",25], valueKind=INSERT}
--- +U: 写入 KeyValue{key=[1], value=[1,"Alice",26], valueKind=UPDATE_AFTER}
--- -D: 写入 KeyValue{key=[1], value=[1,"Alice",26], valueKind=DELETE}
--- Compaction 时,只保留最新的 DELETE 标记
-
--- 场景2: 聚合场景 (aggregate)
-CREATE TABLE paimon_order_stats (
-    user_id BIGINT PRIMARY KEY NOT ENFORCED,
-    total_amount DECIMAL(10,2)
-) WITH (
-    'merge-engine' = 'aggregate',
-    'fields.total_amount.aggregate-function' = 'sum'
-);
-
--- Flink 产生的数据流:
--- +I[1, 100.00]  (用户1首次下单)
--- -U[1, 100.00]  (UPDATE_BEFORE, 撤回旧值)
--- +U[1, 150.00]  (UPDATE_AFTER, 新值)
-
--- Paimon 处理:
--- +I: total_amount = 100.00
--- -U: total_amount = 100.00 - 100.00 = 0.00 (撤回)
--- +U: total_amount = 0.00 + 150.00 = 150.00 (累加)
-
--- 场景3: 部分更新 (partial-update)
-CREATE TABLE paimon_user_profile (
-    user_id BIGINT PRIMARY KEY NOT ENFORCED,
-    name STRING,
-    age INT,
-    city STRING
-) WITH ('merge-engine' = 'partial-update');
-
--- 数据流:
--- +I[1, "Alice", 25, "Beijing"]  (完整记录)
--- +U[1, null, 26, null]          (只更新 age)
-
--- Paimon 处理:
--- +I: 写入完整记录
--- +U: 只更新 age=26,name 和 city 保持不变
-```
-
-### 有什么坑
-
-**误区陷阱**:
-1. **混淆 UPDATE_BEFORE 和 UPDATE_AFTER**: 
-   - deduplicate: 只需要 UPDATE_AFTER,UPDATE_BEFORE 会被过滤
-   - aggregate: 需要 UPDATE_BEFORE 做撤回,不能过滤
-2. **RowKind 来源混淆**: 
-   - 可以从 Flink RowData 的 RowKind 获取
-   - 也可以从表配置的 rowkind-field 字段解析
-3. **partial-update 的 null 语义**: null 表示不更新该字段,而不是更新为 null
-4. **first-row 的 RowKind 过滤**: 只保留首次出现的行,UPDATE 和 DELETE 会被忽略
-
-**错误配置示例**:
-```sql
--- 错误1: aggregate 模式过滤 UPDATE_BEFORE
-CREATE TABLE t (
-    id INT PRIMARY KEY NOT ENFORCED,
-    amount DECIMAL(10,2)
-) WITH (
-    'merge-engine' = 'aggregate',
-    'fields.amount.aggregate-function' = 'sum',
-    'changelog-mode' = 'upsert'  -- 错误!会过滤 UPDATE_BEFORE
-);
-
--- 错误2: partial-update 期望更新为 null
-INSERT INTO paimon_user_profile VALUES (1, null, 26, null);
--- 期望: 将 name 和 city 更新为 null
--- 实际: name 和 city 保持不变,只更新 age
-
--- 错误3: first-row 表接收 UPDATE
-CREATE TABLE t (
-    id INT PRIMARY KEY NOT ENFORCED,
-    name STRING
-) WITH ('merge-engine' = 'first-row');
--- UPDATE 操作会被忽略,只保留首次 INSERT 的值
-```
-
-**生产环境注意事项**:
-1. **ChangelogMode 协商**: 确保 Flink Planner 和 Paimon Sink 的 ChangelogMode 一致
-2. **CDC 格式**: 不同的 CDC 工具(Debezium/Canal/Maxwell)产生的 RowKind 可能不同
-3. **rowkind-field 配置**: 如果 CDC 数据中 RowKind 存储在字段中,需要配置 rowkind-field
-4. **聚合函数选择**: aggregate 模式支持 sum/max/min/last_value/last_non_null_value 等
-
-**性能陷阱**:
-1. **不必要的 UPDATE_BEFORE**: deduplicate 模式下,UPDATE_BEFORE 会被过滤,但仍然占用网络带宽
-2. **频繁的撤回**: aggregate 模式下,频繁的 UPDATE_BEFORE 会增加计算开销
-3. **partial-update 的读取开销**: 需要读取旧值才能合并,增加了读放大
-
-### 核心概念解释
-
-**术语定义**:
-- **RowKind**: 行类型,描述数据的操作类型(INSERT/UPDATE_BEFORE/UPDATE_AFTER/DELETE)
-- **ChangelogMode**: 数据流包含哪些 RowKind 的描述
-- **MergeEngine**: 定义如何合并同一 key 的多个版本
-- **MergeFunction**: MergeEngine 的具体实现,定义 merge 逻辑
-- **RowKindGenerator**: 从数据行中提取 RowKind 的工具
-- **RowKindFilter**: 过滤特定 RowKind 的工具
-
-**RowKind 映射**:
-```
-Flink RowKind          Paimon RowKind
-  INSERT          →      INSERT
-  UPDATE_BEFORE   →      UPDATE_BEFORE
-  UPDATE_AFTER    →      UPDATE_AFTER
-  DELETE          →      DELETE
-```
-
-**MergeEngine 对 RowKind 的处理**:
-```
-deduplicate (默认):
-  INSERT:         写入新值
-  UPDATE_BEFORE:  忽略 (Upsert 模式过滤)
-  UPDATE_AFTER:   覆盖旧值
-  DELETE:         删除记录
-
-partial-update:
-  INSERT:         写入新值
-  UPDATE_BEFORE:  忽略
-  UPDATE_AFTER:   部分字段更新 (null 表示不更新)
-  DELETE:         可选支持 (配置 partial-update.remove-record-on-delete)
-
-aggregate:
-  INSERT:         聚合累加
-  UPDATE_BEFORE:  撤回 (减去旧值)
-  UPDATE_AFTER:   聚合累加
-  DELETE:         撤回 (减去旧值)
-
-first-row:
-  INSERT:         写入 (仅首次)
-  UPDATE_BEFORE:  忽略
-  UPDATE_AFTER:   忽略
-  DELETE:         忽略
-```
-
-**与其他系统对比**:
-- **Hudi**: 支持 UPSERT/INSERT/DELETE,但没有 UPDATE_BEFORE 的概念
-- **Iceberg**: 通过 Equality Delete 实现更新,不区分 UPDATE_BEFORE 和 UPDATE_AFTER
-- **Delta Lake**: 支持 MERGE INTO 语法,但底层是 CoW,不区分 RowKind
-
-### 设计理念
-
-**为什么这样设计**:
-1. **ChangelogMode 协商**: 让 Sink 告诉 Planner 自己能接受哪些 RowKind
-   - 问题: 如果 Planner 产生 UPDATE_BEFORE,但 Sink 不需要,会浪费网络带宽
-   - 解决: Sink 在 getChangelogMode 中声明只接受 INSERT/UPDATE_AFTER/DELETE
-   - 好处: Planner 会自动过滤 UPDATE_BEFORE,减少数据传输
-
-2. **多种 MergeEngine**: 不同场景有不同的 merge 语义
-   - deduplicate: 最简单,只保留最新值,适合 CDC 同步
-   - partial-update: 支持部分字段更新,适合宽表场景
-   - aggregate: 支持聚合计算,适合实时统计
-   - first-row: 只保留首次值,适合维度表
-
-3. **RowKind 存储在 KeyValue 中**: valueKind 字段
-   - 问题: 如何在 LSM-tree 中表示不同的操作类型?
-   - 解决: KeyValue 包含 valueKind 字段,compaction 时根据 valueKind 决定如何 merge
-   - 好处: 统一的存储格式,支持多种 merge 语义
-
-4. **RowKindGenerator 的灵活性**: 支持从字段解析 RowKind
-   - 问题: 某些 CDC 工具将 RowKind 存储在字段中(如 op_type='I'/'U'/'D')
-   - 解决: 通过 rowkind-field 配置,从字段解析 RowKind
-   - 好处: 兼容不同的 CDC 格式
-
-**权衡取舍**:
-- **灵活性 vs 复杂性**: 多种 MergeEngine 提供了灵活性,但增加了理解和配置的复杂性
-- **性能 vs 功能**: partial-update 需要读取旧值,增加了读放大,但提供了部分更新功能
-- **一致性 vs 性能**: aggregate 需要 UPDATE_BEFORE 做撤回,增加了网络开销,但保证了聚合结果的正确性
-
-**架构演进**:
-1. **早期版本**: 只支持 deduplicate,不支持 UPDATE_BEFORE
-2. **引入 partial-update**: 支持部分字段更新
-3. **引入 aggregate**: 支持聚合计算和撤回
-4. **引入 RowKindGenerator**: 支持从字段解析 RowKind
-
-**业界对比**:
-- **Hudi 的 MergeOnRead**: 类似 Paimon 的 deduplicate,但不支持 aggregate
-- **Iceberg 的 Equality Delete**: 通过 Delete File 实现更新,不区分 RowKind
-- **Flink Table API 的 ChangelogMode**: Paimon 的 ChangelogMode 协商机制是 Flink 生态的标准做法
-
-### 10.1 RowKind 的来源
-
-Paimon 的 `RowKind` 有两种来源：
-
-1. **Flink RowData 自带的 RowKind**: 通过 `FlinkRowWrapper.getRowKind()` → `fromFlinkRowKind()` 转换
-2. **表配置的 rowkind-field**: 通过 `RowKindGenerator` 从某个字符串字段解析
-
+1. **取**：`RowKindGenerator.getRowKind`——优先从行自带的 RowKind 取；若配了 `rowkind-field` 则从该字段解析（兼容 Debezium/Canal 把操作类型放在字段里的格式）。
 ```java
 // RowKindGenerator.java:66-68
 public static RowKind getRowKind(@Nullable RowKindGenerator rowKindGenerator, InternalRow row) {
-    return rowKindGenerator == null
-        ? row.getRowKind()                     // 直接从行获取
-        : rowKindGenerator.generate(row);      // 从指定字段解析
+    return rowKindGenerator == null ? row.getRowKind() : rowKindGenerator.generate(row);
 }
 ```
+2. **滤**：`rowKindFilter.test(rowKind)`（`TableWriteImpl.java:187`）——按配置丢弃某些 RowKind，如 `first-row` 丢掉 UPDATE/DELETE 只留首次 INSERT。
+3. **嵌**：`recordExtractor.extract` 把 RowKind 写进 `KeyValue.valueKind`（与 key/seq/value 一起）。
+4. **合**：compaction/读取时 `MergeFunction` 据 `valueKind` 决定如何合并同 key 多版本。
 
-### 10.2 不同 MergeEngine 对 RowKind 的处理
+### 11.2 各 merge-engine 对 RowKind 的处理差异
 
-| MergeEngine | INSERT | UPDATE_BEFORE | UPDATE_AFTER | DELETE | 说明 |
+| merge-engine | INSERT | UPDATE_BEFORE | UPDATE_AFTER | DELETE | 写入侧要点 |
 |---|---|---|---|---|---|
-| **deduplicate** (默认) | 写入 | 忽略 (Upsert 模式过滤) | 覆盖旧值 | 删除记录 | 主键表默认行为，去重保留最新值 |
-| **partial-update** | 写入 | 忽略 | 部分字段更新 | 可选支持 | 只更新非 null 字段 |
-| **aggregate** | 聚合累加 | 需要 (撤回) | 聚合累加 | 需要 (撤回) | 聚合函数处理，支持 retract |
-| **first-row** | 写入（仅首次） | 忽略 | 忽略 | 忽略 | 只保留首次出现的行 |
+| **deduplicate**（默认） | 写入 | 忽略（upsert 过滤掉） | 覆盖旧值 | 删除 | 只需最新值，可过滤 UPDATE_BEFORE |
+| **partial-update** | 写入 | 忽略 | 仅更新非 null 字段 | 可选（`partial-update.remove-record-on-delete`） | **null = 不更新该字段，不是更新为 null** |
+| **aggregate** | 累加 | **撤回（需要！）** | 累加 | **撤回（需要！）** | 必须保留 UPDATE_BEFORE，否则聚合偏大 |
+| **first-row** | 写入（仅首次） | 忽略 | 忽略 | 忽略 | UPDATE/DELETE 被 RowKindFilter 丢弃 |
 
-### 10.3 Upsert 模式下 UPDATE_BEFORE 的过滤
+这张表与 §3.1 的 ChangelogMode 协商是一体两面：协商决定**上游是否传** UPDATE_BEFORE，merge-engine 决定**收到后怎么用**。aggregate 必须两头都保留 UPDATE_BEFORE，所以 §3.1 把它列为不过滤的例外。各 merge-engine 的存储层合并算法见 **08 号文档**（PartialUpdate/Aggregation 主讲）。
 
-```java
-// FlinkTableSinkBase.java:71-99 (getChangelogMode)
-// 对于主键表（非 INPUT/AGGREGATE），过滤 UPDATE_BEFORE
-for (RowKind kind : requestedMode.getContainedKinds()) {
-    if (kind != RowKind.UPDATE_BEFORE) {
-        builder.addContainedKind(kind);
-    }
-}
-```
-
-**为什么过滤 UPDATE_BEFORE**: 在 deduplicate/partial-update 场景下，主键保证了唯一性，UPDATE_AFTER 足以确定最新值，不需要旧值（UPDATE_BEFORE）。过滤掉可以减少一半的更新数据传输。
-
-### 10.4 RowKindFilter 机制
-
-```java
-// TableWriteImpl.java:187-189
-if (rowKindFilter != null && !rowKindFilter.test(rowKind)) {
-    return null;  // 被过滤，不写入
-}
-```
-
-`RowKindFilter` 根据 `CoreOptions` 配置决定哪些 RowKind 需要写入。例如 `first-row` merge engine 可以过滤掉 UPDATE/DELETE。
-
-### 10.5 KeyValue 中的 RowKind 存储
-
-在 LSM-tree 存储层面，RowKind 被转换为 `KeyValue` 的 `valueKind`：
-
-```
-KeyValue = {
-    key: BinaryRow (主键),
-    sequenceNumber: long (单调递增),
-    valueKind: RowKind (INSERT/UPDATE_BEFORE/UPDATE_AFTER/DELETE),
-    value: BinaryRow (完整行数据)
-}
-```
-
-Compaction 时，`MergeFunction` 根据 `valueKind` 决定如何合并同一 key 的多条记录。
+**④ 常见事故**：
+- aggregate 表把 changelog 配成 upsert/过滤了 UPDATE_BEFORE → 撤回失效，sum 越加越大。
+- partial-update 用户期望"写 null 清空字段"，实际 null 被当作"不更新" → 字段没被清掉。
+- first-row 表期望 UPDATE 生效 → 被静默忽略。
 
 ---
 
-## 11. 批写入 vs 流写入的差异
+## 12. 批写入 vs 流写入的差异
 
-### 解决什么问题
+**① 要解决什么问题**：同一套写入框架既要跑无界流（持续、靠 checkpoint 提交、exactly-once），又要跑有界批（一次性、靠 `endInput` 提交、可幂等重试）。如果流批分开实现，代码两套、行为不一致，且没法在同一张表上流式写当天 + 批式回填历史。
 
-**核心业务问题**: 如何用统一的写入框架同时支持流式和批式两种执行模式,满足不同场景的需求?
+**② 设计原理**：流批共用所有 Sink/Writer/Committer，只用 `isBounded` 和 `streamingCheckpointEnabled` 两个开关分流行为。差异集中在三处——发货时机、`waitCompaction`、提交方式。
 
-**没有这个设计的后果**:
-- 代码重复: 流式和批式需要维护两套代码,增加维护成本
-- 行为不一致: 流式和批式的语义不同,容易出错
-- 无法流批一体: 无法在同一张表上同时进行流式写入和批量回填
-- 性能浪费: 批式场景无法利用批处理的优化(如 Clustering)
+### 12.1 核心差异对比
 
-**实际场景**:
-```sql
--- 场景1: 流式实时写入
-SET 'execution.runtime-mode' = 'streaming';
-SET 'execution.checkpointing.interval' = '1min';
-INSERT INTO paimon_orders SELECT * FROM kafka_source;
--- 特点: 持续运行,通过 checkpoint 提交,支持 Exactly-Once
-
--- 场景2: 批量历史回填
-SET 'execution.runtime-mode' = 'batch';
-INSERT INTO paimon_orders 
-SELECT * FROM hive_orders WHERE dt < '2026-01-01';
--- 特点: 一次性执行,通过 endInput 提交,支持幂等重试
-
--- 场景3: 批量覆盖分区
-SET 'execution.runtime-mode' = 'batch';
-INSERT OVERWRITE paimon_dim_user PARTITION (dt='2026-04-22')
-SELECT * FROM hive_user_snapshot WHERE dt='2026-04-22';
--- 特点: 覆盖指定分区,ignorePreviousFiles=true
-
--- 场景4: 流批混合
--- 流式作业持续写入当天数据
-INSERT INTO paimon_events SELECT * FROM kafka_stream;
--- 批作业每天凌晨回填历史数据
-INSERT INTO paimon_events SELECT * FROM hive_history WHERE dt = '${yesterday}';
--- 特点: 同一张表,流批共存,互不影响
-```
-
-### 有什么坑
-
-**误区陷阱**:
-1. **流式作业使用 INSERT OVERWRITE**: 会直接抛异常,OVERWRITE 只支持批模式
-2. **批作业未配置足够的内存**: 批作业通常数据量大,需要更多的 write-buffer-size
-3. **批作业的 Clustering 配置错误**: Clustering 只在批模式 + BUCKET_UNAWARE 时生效
-4. **批作业重启后重复提交**: 需要依赖幂等性检查,避免重复写入
-
-**错误配置示例**:
-```sql
--- 错误1: 流式作业使用 OVERWRITE
-SET 'execution.runtime-mode' = 'streaming';
-INSERT OVERWRITE paimon_table SELECT * FROM kafka_source;
--- 报错: Paimon doesn't support streaming INSERT OVERWRITE
-
--- 错误2: 批作业未开启 waitCompaction
-SET 'execution.runtime-mode' = 'batch';
-WITH ('prepare-commit.wait-compaction' = 'false')
--- 问题: 批作业结束时可能有大量未 compact 的小文件
-
--- 错误3: 批作业配置 checkpoint
-SET 'execution.runtime-mode' = 'batch';
-SET 'execution.checkpointing.interval' = '1min';
--- 无效配置,批作业不支持 checkpoint
-
--- 错误4: POSTPONE_MODE 批作业未启用 fixed-bucket 优化
-WITH ('bucket' = '-2', 'postpone-batch-write-fixed-bucket' = 'false')
--- 问题: 批作业无法利用已知桶数的优化,性能较差
-```
-
-**生产环境注意事项**:
-1. **批作业的内存配置**: write-buffer-size 建议设置为流式的 2-4 倍
-2. **批作业的并行度**: 建议根据数据量动态调整,避免数据倾斜
-3. **批作业的 Compaction**: 建议开启 waitCompaction,避免产生大量小文件
-4. **流批混合场景**: 确保 commitUser 不冲突,避免互相覆盖
-
-**性能陷阱**:
-1. **批作业频繁 flush**: write-buffer-size 过小导致频繁 flush,性能差
-2. **Clustering 排序开销**: clustering.columns 配置不当导致全局排序,严重影响性能
-3. **批作业的 Checkpoint 开销**: 批作业不需要 checkpoint,配置了反而增加开销
-
-### 核心概念解释
-
-**术语定义**:
-- **RuntimeExecutionMode**: Flink 的执行模式,STREAMING 或 BATCH
-- **isBounded**: 数据流是否有界,流式为 false,批式为 true
-- **endInput**: 批作业结束时的回调,用于触发最终提交
-- **ignorePreviousFiles**: 是否忽略已有文件,INSERT OVERWRITE 时为 true
-- **waitCompaction**: 是否等待 compaction 完成,批作业建议为 true
-- **Clustering**: 批作业的数据排序优化,提升查询性能
-
-**流式 vs 批式对比**:
-```
-维度                  流式 (Streaming)              批式 (Batch)
-─────────────────────────────────────────────────────────────────
-执行模式              RuntimeExecutionMode.STREAMING  RuntimeExecutionMode.BATCH
-数据流                无界 (unbounded)                有界 (bounded)
-Checkpoint            必须开启 (EXACTLY_ONCE)         不需要
-提交触发              notifyCheckpointComplete        endInput
-Compaction            异步持续执行                    commit 时 waitCompaction=true
-ignorePreviousFiles   false                          true (OVERWRITE 时)
-内存抢占              持续发生                        较少
-Clustering            不支持                          支持 (BUCKET_UNAWARE)
-POSTPONE_MODE         PostponeBucketSink             PostponeFixedBucketSink (已知桶数)
-```
-
-**提交路径对比**:
-```
-流式提交:
-  prepareSnapshotPreBarrier(cpId)
-    → emitCommittables(false, cpId)  (waitCompaction=false)
-    → Writer flush 但不等 compaction
-  notifyCheckpointComplete(cpId)
-    → CommitterOperator.commitUpToCheckpoint(cpId)
-    → StoreCommitter.commit()
-
-批式提交:
-  endInput()
-    → PrepareCommitOperator.emitCommittables(true, Long.MAX_VALUE)  (waitCompaction=true)
-    → Writer flush 并等 compaction 完成
-  CommitterOperator.endInput()
-    → if (!streamingCheckpointEnabled)
-    →   commitUpToCheckpoint(END_INPUT_CHECKPOINT_ID)
-    → StoreCommitter.filterAndCommit()  (幂等提交)
-```
-
-**与其他系统对比**:
-- **Hive**: 只支持批式,无流式概念
-- **Iceberg**: 支持流批一体,但批式优化较少
-- **Hudi**: 支持流批一体,但流批行为差异较大
-
-### 设计理念
-
-**为什么这样设计**:
-1. **统一的写入框架**: 流式和批式共享相同的 Sink 实现
-   - 问题: 如果流批分开实现,代码重复,维护成本高
-   - 解决: 通过 isBounded 和 streamingCheckpointEnabled 区分流批行为
-   - 好处: 代码复用,行为一致,易于维护
-
-2. **批式的 waitCompaction**: 批作业结束时等待 compaction 完成
-   - 问题: 批作业产生大量小文件,影响后续读取性能
-   - 解决: endInput 时 waitCompaction=true,等待 compaction 完成
-   - 好处: 批作业结束后,文件已经合并,读取性能好
-
-3. **批式的幂等提交**: 通过 filterAndCommit 检查 snapshot 是否已存在
-   - 问题: Flink 新版本中,批作业失败后可能从中间算子重启,导致 endInput 被多次调用
-   - 解决: 提交前检查 snapshot 是否已存在,避免重复提交
-   - 好处: 支持批作业的故障恢复,保证 Exactly-Once
-
-4. **Clustering 优化**: 批作业支持数据排序,提升查询性能
-   - 问题: 追加表(BUCKET_UNAWARE)无法利用 bucket 做数据排序
-   - 解决: 批模式下,通过 Clustering 对数据排序后写入
-   - 好处: 查询时可以利用排序跳过不相关的文件,性能提升
-
-**权衡取舍**:
-- **统一 vs 优化**: 统一的框架保证了一致性,但某些批式优化(如 Clustering)只在特定模式下生效
-- **waitCompaction vs 延迟**: 批式等待 compaction 增加了延迟,但避免了小文件问题
-- **幂等 vs 性能**: 幂等检查增加了开销,但保证了批作业的正确性
-
-**架构演进**:
-1. **早期版本**: 流批分开实现,代码重复
-2. **统一写入框架**: 流批共享相同的 Sink,通过 isBounded 区分
-3. **引入 Clustering**: 支持批式数据排序优化
-4. **引入幂等提交**: 支持批作业的故障恢复
-
-**业界对比**:
-- **Iceberg**: 也支持流批一体,但批式优化较少(无 Clustering)
-- **Hudi**: 流批行为差异较大,批式使用 BulkInsert,流式使用 Upsert
-- **Delta Lake**: 主要面向批处理,流式支持较弱
-
-### 11.1 核心差异对比
-
-| 维度 | 流写入 (Streaming) | 批写入 (Batch) |
+| 维度 | 流写入 | 批写入 |
 |---|---|---|
-| **执行模式** | `RuntimeExecutionMode.STREAMING` | `RuntimeExecutionMode.BATCH` |
-| **Checkpoint** | 必须开启，EXACTLY_ONCE | 不需要 Checkpoint |
-| **提交触发** | `notifyCheckpointComplete` | `endInput` |
-| **Compaction** | 异步持续执行 | commit 时 waitCompaction=true |
-| **ignorePreviousFiles** | false (需要恢复已有文件) | true (overwrite=true 时) |
-| **内存抢占** | 持续发生 | 通常数据量较小，抢占较少 |
-| **Clustering** | 不支持 | 支持 (BUCKET_UNAWARE 模式) |
-| **POSTPONE_MODE 行为** | 使用 PostponeBucketSink | 可选使用 PostponeFixedBucketSink (已知桶数) |
+| 数据流 | 无界 | 有界 |
+| Checkpoint | 必须开 EXACTLY_ONCE | 不需要 |
+| 发货时机 | `prepareSnapshotPreBarrier`（barrier 前） | `endInput`（结尾） |
+| `waitCompaction` | false（不等 compaction） | **true**（等 compaction 完，避免遗留小文件） |
+| 提交触发 | `notifyCheckpointComplete` | `endInput` → `commitUpToCheckpoint(END_INPUT_CHECKPOINT_ID)` |
+| 提交方式 | `commit`（直接） | `filterAndCommit`（幂等，先查 snapshot 存在性） |
+| ignorePreviousFiles | false | true（仅 OVERWRITE 时） |
+| 内存抢占 | 持续发生 | 较少 |
+| Clustering | 不支持 | 支持（BUCKET_UNAWARE） |
+| OVERWRITE | 禁止（抛异常） | 支持 |
+| POSTPONE_MODE | `PostponeBucketSink` | 桶数已知时 `PostponeFixedBucketSink` |
 
-### 11.2 提交路径差异
-
-#### 流式提交
-
-```
-prepareSnapshotPreBarrier(cpId)
-  → emitCommittables(false, cpId)
-  → Writer 侧 flush 但不等 compaction (waitCompaction=false)
-
-notifyCheckpointComplete(cpId)
-  → CommitterOperator.commitUpToCheckpoint(cpId)
-  → StoreCommitter.commit()
-```
-
-**流式模式的 streamingCheckpointEnabled 标志**:
-- 当 Flink 启用了 checkpoint 时，`streamingCheckpointEnabled=true`
-- 此时 CommitterOperator 在 `notifyCheckpointComplete` 时提交
-- 如果 checkpoint 禁用，则在 `endInput` 时提交
-
-#### 批式提交
+### 12.2 提交路径差异
 
 ```
-endInput()
-  → PrepareCommitOperator.emitCommittables(true, Long.MAX_VALUE)
-  → Writer 侧 flush 并等 compaction 完成 (waitCompaction=true)
+流式：prepareSnapshotPreBarrier(cpId) → emitCommittables(false, cpId)  // 不等 compaction
+      notifyCheckpointComplete(cpId)  → commitUpToCheckpoint(cpId) → StoreCommitter.commit
 
-CommitterOperator.endInput()
-  → if (!streamingCheckpointEnabled)
-  →   commitUpToCheckpoint(END_INPUT_CHECKPOINT_ID)
-  → StoreCommitter.filterAndCommit()  // 幂等提交，检查已提交的 snapshot
+批式：endInput() → emitCommittables(true, Long.MAX_VALUE)              // 等 compaction
+      CommitterOperator.endInput() → if (!streamingCheckpointEnabled)
+        commitUpToCheckpoint(END_INPUT_CHECKPOINT_ID) → StoreCommitter.filterAndCommit  // 幂等
 ```
 
-### 11.3 批写入幂等检查
+`streamingCheckpointEnabled` 标志的作用：启用了 checkpoint 的流作业在 `notifyCheckpointComplete` 提交；否则（含批作业）在 `endInput` 提交。
+
+### 12.3 批写入幂等检查
 
 ```java
 // CommitterOperator.java:205-213
@@ -2844,297 +835,112 @@ if (checkpointId == END_INPUT_CHECKPOINT_ID) {
 }
 ```
 
-**为什么批写入需要幂等检查**: Flink 新版本中，批作业失败后可能从中间算子重启（而不是从头），导致 `endInput()` 被多次调用。幂等提交通过检查 snapshot 是否已存在来避免重复写入。
+**为什么批写入需要幂等检查**: Flink 新版本中，批作业失败后可能从中间算子重启（而不是从头），导致 `endInput()` 被多次调用。`filterAndCommit` 先检查对应 snapshot 是否已存在——存在则跳过、不存在才提交——避免重复写入（与 §8.5 的故障恢复呼应）。
 
-### 11.4 AppendTableSink 的流式额外拓扑
+### 12.4 AppendTableSink 的流式额外拓扑
 
 ```java
-// AppendTableSink.java:98-131
+// AppendTableSink 流式场景（精简）
 if (enableCompaction && isStreamingMode) {
-    // 流式追加表需要额外的 compaction 拓扑
     written.transform("Compact Coordinator: " + table.name(), ...)  // 单并行度协调器
            .forceNonParallel()
            .transform("Compact Worker: " + table.name(), ...);      // 多并行度 worker
 }
 ```
 
-**为什么追加表需要单独的 compaction 拓扑**: 追加表（BUCKET_UNAWARE）没有固定的 partition+bucket 到 writer 的映射，因此不能在 writer 内部做 compaction。需要一个独立的协调器来调度跨 writer 的 compaction 任务。
+**为什么追加表需要单独的 compaction 拓扑**: 追加表（BUCKET_UNAWARE）没有固定的 partition+bucket → writer 映射，无法像主键表那样在 writer 内部就地 compaction。所以单独挂一个**协调器（单并行度）+ worker（多并行度）**拓扑，由协调器统一调度跨 writer 的 compaction 任务。这是 §4.2 中 BUCKET_UNAWARE "需独立 compact 拓扑"的落地。
+
+
 
 ---
 
-## 12. 与 Iceberg Flink Sink 写入流程的详细对比
+## 13. 与 Iceberg Flink Sink 的对比
 
-### 解决什么问题
+**一句话差异**：Paimon 在写入路径里用 LSM 内存缓冲 + 异步 compaction，把更新做成"追加新版本、后台合并"；Iceberg 直接写文件，更新靠 Delete File（MoR）或重写整文件（CoW）。这导致两者的 Flink Sink 拓扑、内存模型、更新代价都不同。
 
-**核心业务问题**: 如何选择合适的 Lakehouse 方案(Paimon vs Iceberg),理解两者的设计差异和适用场景?
-
-**没有这个设计的后果**:
-- 选型错误: 选择了不适合业务场景的方案,导致性能差或功能不满足
-- 迁移困难: 后期发现问题需要迁移,成本高昂
-- 资源浪费: 不了解两者差异,无法充分利用各自的优势
-- 运维复杂: 不了解底层机制,遇到问题无法快速定位
-
-**实际场景**:
+**Sink 拓扑对比**：
 ```
-场景1: 高频实时更新 (推荐 Paimon)
-  - 业务: 用户画像实时更新,每秒数万次更新
-  - Paimon: LSM-tree 写入性能优异,原生支持 CDC
-  - Iceberg: 需要写 Delete File,写入性能较差
-
-场景2: 低频批量覆盖 (推荐 Iceberg CoW)
-  - 业务: 每天凌晨全量覆盖维度表
-  - Paimon: 需要 compaction 清理旧数据
-  - Iceberg CoW: 直接重写文件,读取零开销
-
-场景3: 跨分区 Upsert (推荐 Paimon)
-  - 业务: 用户行为表,主键是 user_id,按日期分区
-  - Paimon: KEY_DYNAMIC 模式支持跨分区 upsert
-  - Iceberg: 不原生支持,需要手动处理
-
-场景4: 已有 Iceberg 生态 (推荐 Iceberg)
-  - 业务: 已有大量 Iceberg 表和工具链
-  - Paimon: 需要迁移,成本高
-  - Iceberg: 兼容性好,无需迁移
+Paimon:   RowData → mapToInternalRow → [LocalMerge] → [Partitioner] → Writer ↔ Compaction(异步) → Committer(1)
+Iceberg:  RowData → IcebergStreamWriter → [Equality Delete Writer] → IcebergFilesCommitter
 ```
+关键区别：Paimon 有内存写缓冲、共享内存池抢占、writer 内异步 compaction、动态桶两次 shuffle；Iceberg 直写文件、无跨 writer 内存抢占、compaction 靠独立作业/maintenance API。两者的 checkpoint 两阶段提交骨架相似（都 `prepareSnapshotPreBarrier` + `notifyCheckpointComplete` + 原子提交），但 Paimon 的提交还叠了 commitUser 幂等 + 冲突重试（§8.4）。
 
-### 有什么坑
+**整体权衡**：
 
-**误区陷阱**:
-1. **误以为 Iceberg 不支持更新**: Iceberg 支持更新,但通过 Delete File 实现,性能不如 Paimon
-2. **误以为 Paimon 不支持批处理**: Paimon 支持流批一体,批处理性能也很好
-3. **忽略 Compaction 的差异**: 
-   - Paimon: Writer 内异步 compaction,自动化
-   - Iceberg: 需要独立的 compaction 作业或 maintenance API
-4. **忽略小文件问题**: 
-   - Paimon: 通过 LSM-tree 自动合并小文件
-   - Iceberg: 需要手动触发 compaction
+| 维度 | Paimon (LSM) | Iceberg (Delete File) |
+|---|---|---|
+| 写入/更新性能 | 优（内存缓冲 + 追加） | 中（MoR）/ 差（CoW 重写整文件） |
+| 读取性能 | 中（需 merge sorted run） | 优（CoW 零开销）/ 中（MoR apply delete） |
+| compaction | writer 内异步自动 + 反压 | 独立作业 / maintenance |
+| 小文件 | 自动收敛 | 需手动治理 |
+| 跨分区 upsert | 支持（KEY_DYNAMIC） | 不原生支持 |
+| 选型倾向 | 高频实时更新、CDC、流批一体 | 低频批量覆盖、读多写少、已有 Iceberg 生态 |
 
-**错误配置示例**:
-```sql
--- Paimon 错误配置: 期望 Iceberg 的 Delete File 行为
-CREATE TABLE paimon_table (id INT PRIMARY KEY NOT ENFORCED, name STRING)
-WITH ('merge-engine' = 'deduplicate');
--- 误解: Paimon 不会生成 Delete File,而是通过 LSM merge 处理删除
 
--- Iceberg 错误配置: 期望 Paimon 的自动 compaction
-CREATE TABLE iceberg_table (id INT, name STRING)
-TBLPROPERTIES ('write.merge-mode' = 'merge-on-read');
--- 问题: Iceberg 不会自动 compaction,需要手动触发
 
--- Paimon 错误配置: 期望 Iceberg 的 hidden partition
-CREATE TABLE paimon_table (id INT, name STRING, dt STRING)
-PARTITIONED BY (dt);
--- 误解: Paimon 的分区是显式的,不支持 hidden partition
-```
-
-**生产环境注意事项**:
-1. **Paimon 的 Compaction 监控**: 监控 sorted run 数量,避免反压
-2. **Iceberg 的 Compaction 调度**: 需要定期触发 compaction,避免小文件堆积
-3. **Paimon 的内存配置**: write-buffer-size 需要根据并发 partition+bucket 数量调整
-4. **Iceberg 的 Delete File 清理**: 需要定期清理过期的 Delete File
-
-**性能陷阱**:
-1. **Paimon 的读放大**: Level 0 文件过多导致读放大,需要及时 compaction
-2. **Iceberg 的写放大**: 频繁更新导致大量 Delete File,写入性能差
-3. **Paimon 的内存抢占**: 多个 partition+bucket 并发写入时,频繁抢占影响性能
-4. **Iceberg 的小文件**: 高频写入导致大量小文件,需要频繁 compaction
-
-### 核心概念解释
-
-**术语定义**:
-- **LSM-tree**: Log-Structured Merge-tree,Paimon 的存储引擎,写入优先
-- **Copy-on-Write (CoW)**: Iceberg 的写入模式,更新时重写整个文件
-- **Merge-on-Read (MoR)**: Iceberg 的写入模式,更新时写 Delete File,读取时合并
-- **Delete File**: Iceberg 的删除文件,记录被删除或更新的行
-- **Equality Delete**: Iceberg 的相等删除,通过主键删除
-- **Position Delete**: Iceberg 的位置删除,通过文件路径+行号删除
-
-**存储引擎对比**:
-```
-Paimon LSM-tree:
-  Partition → Bucket → Levels → Sorted Runs → Data Files
-  - 写入: 先进入 SortBuffer,flush 到 Level 0,后台 compaction
-  - 更新: 写入新 KeyValue,compaction 时 merge
-  - 删除: 写入 DELETE 标记,compaction 时清除
-
-Iceberg CoW:
-  Partition → Data Files
-  - 写入: 直接写入新文件
-  - 更新: 重写整个文件
-  - 删除: 重写整个文件
-  - 读取: 无额外开销
-
-Iceberg MoR:
-  Partition → Data Files + Delete Files
-  - 写入: 直接写入新文件
-  - 更新: 写入 Equality Delete + 新 Data File
-  - 删除: 写入 Position Delete 或 Equality Delete
-  - 读取: 需要 apply delete files
-```
-
-**Sink 算子拓扑对比**:
-```
-Paimon:
-  RowData → mapToInternalRow → [LocalMerge] → [Partitioner] → Writer → Committer
-                                                                  ↕
-                                                          Compaction (异步)
-
-Iceberg:
-  RowData → IcebergStreamWriter → [Equality Delete Writer] → IcebergFilesCommitter
-```
-
-**与其他系统对比**:
-- **Hudi**: 也支持 MoR 和 CoW,但架构更复杂,运维成本高
-- **Delta Lake**: 主要面向 Spark,Flink 集成较弱
-- **Hive**: 不支持更新,只能追加或覆盖
-
-### 设计理念
-
-**为什么 Paimon 选择 LSM-tree**:
-1. **写入性能优先**: LSM-tree 的写入性能远超 CoW 和 MoR
-   - 原因: 写入先进入内存,批量 flush,避免随机 IO
-   - 适用场景: 高频实时更新,CDC 同步
-
-2. **原生 CDC 支持**: LSM-tree 天然支持多版本,适合 CDC
-   - 原因: 同一 key 的多个版本通过 sequenceNumber 排序,compaction 时 merge
-   - 适用场景: 实时数仓,流式 ETL
-
-3. **自动化 Compaction**: Writer 内异步 compaction,无需额外作业
-   - 原因: Compaction 是 LSM-tree 的核心机制,与写入紧密耦合
-   - 适用场景: 流式场景,持续写入
-
-**为什么 Iceberg 选择 Delete File**:
-1. **简单直接**: 写入路径简单,易于理解和调试
-   - 原因: 数据直接写入文件,无额外缓冲层
-   - 适用场景: 批处理,低频更新
-
-2. **读取优化**: CoW 模式读取零开销
-   - 原因: 更新时重写文件,读取时无需 merge
-   - 适用场景: 读多写少,查询性能优先
-
-3. **灵活性**: 支持 CoW 和 MoR 两种模式
-   - 原因: 用户可以根据场景选择
-   - 适用场景: 需要灵活配置的场景
-
-**权衡取舍**:
-```
-维度              Paimon (LSM-tree)        Iceberg (Delete File)
-─────────────────────────────────────────────────────────────────
-写入性能          优秀 (内存写入)           中等 (直接写文件)
-更新性能          优秀 (追加写入)           差 (CoW) / 中等 (MoR)
-读取性能          中等 (需要 merge)         优秀 (CoW) / 中等 (MoR)
-存储空间          中等 (需要 compaction)    差 (CoW) / 中等 (MoR)
-运维复杂度        低 (自动 compaction)      中等 (需要手动 compaction)
-流式支持          优秀 (原生支持)           中等 (需要额外配置)
-批式支持          优秀 (流批一体)           优秀 (原生支持)
-跨分区 Upsert     支持 (KEY_DYNAMIC)        不支持
-小文件问题        自动解决 (compaction)     需要手动解决
-```
-
-**架构演进**:
-- **Paimon**: 从 Flink Table Store 演进而来,专注于流批一体和实时更新
-- **Iceberg**: 从 Netflix 开源,专注于批处理和数据湖标准化
-
-**业界对比**:
-- **RocksDB**: 也使用 LSM-tree,Paimon 借鉴了其设计
-- **HBase**: 也使用 LSM-tree,但是分布式存储,架构更复杂
-- **Cassandra**: 也使用 LSM-tree,但是 NoSQL 数据库,场景不同
-
-### 12.1 架构层面对比
+### 13.1 架构与机制对比
 
 | 维度 | Paimon | Iceberg |
 |---|---|---|
 | **存储引擎** | LSM-tree (Merge-tree) | Copy-on-Write / Merge-on-Read |
-| **数据组织** | Partition → Bucket → Sorted Runs → Data Files | Partition → Data Files (无 bucket 概念) |
-| **更新机制** | LSM merge (写入+后台 compaction) | 行级 Delete File + Equality Delete 或 Position Delete |
-| **文件格式** | ORC/Parquet/Avro (可配置) | Parquet/ORC/Avro |
-| **元数据管理** | Snapshot → ManifestList → ManifestFile | Snapshot → ManifestList → ManifestFile (相似但不同实现) |
+| **数据组织** | Partition → Bucket → Sorted Runs → Data Files | Partition → Data Files（无 bucket） |
+| **更新机制** | LSM merge（写入 + 后台 compaction） | 行级 Delete File（Equality / Position） |
+| **数据分区 shuffle** | partition+bucket hash；动态桶两次 shuffle | 通常按 partition 或不分区 |
+| **写入缓冲** | SortBufferWriteBuffer 内存排序 | 直写文件，无缓冲 |
+| **内存管理** | MemoryPoolFactory 共享池 + 抢占 | 依赖 JVM 堆，无跨 writer 抢占 |
+| **compaction** | writer 内异步 + 反压 | 独立作业 / maintenance |
+| **本地预合并** | LocalMergeOperator（可选） | 无 |
+| **CDC** | 原生 RowKind → MergeFunction | Equality Delete + Upsert |
+| **exactly-once** | commitUser + cpId + 冲突重试 | Flink 快照协议 + commit 幂等 |
 
-### 12.2 Sink 算子拓扑对比
-
-#### Paimon 拓扑
-
-```
-RowData → mapToInternalRow → [LocalMerge] → [Partitioner] → Writer → Committer
-                                                                ↕
-                                                        Compaction (异步)
-```
-
-#### Iceberg 拓扑
+### 13.2 写入路径与更新代价
 
 ```
-RowData → IcebergStreamWriter → [Equality Delete Writer] → IcebergFilesCommitter
+Paimon: InternalRow → KeyAndBucketExtractor → FileStoreWrite → MergeTreeWriter
+        → SortBufferWriteBuffer.put（内存排序）→ flush merge → DataFileMeta → 异步 compaction
+        按 bucket 隔离独立 LSM、写缓冲预合并、流式友好
+
+Iceberg: RowData → PartitionedFanoutWriter → BaseTaskWriter → AppendWriter 直写
+        →（有主键）EqualityDeleteWriter 写 delete file → close flush → DataFile
+        直写无缓冲、写后不合并、批式优先
 ```
-
-### 12.3 核心机制对比
-
-| 机制 | Paimon | Iceberg |
-|---|---|---|
-| **数据分区 (Shuffle)** | 按 partition+bucket hash 分区；动态桶模式两次 shuffle | 通常按 partition 分区或不分区 |
-| **写入缓冲** | SortBufferWriteBuffer (内存排序缓冲区) | 直接写入文件 (每个 partition 一个 writer) |
-| **内存管理** | MemoryPoolFactory 统一管理 + 抢占机制 | 依赖 JVM 堆内存，无跨 writer 内存抢占 |
-| **Compaction** | Writer 内异步执行，背压机制 | 独立的 compaction 作业或 maintenance API |
-| **本地预合并** | LocalMergeOperator (可选) | 无类似机制 |
-| **CDC 支持** | 原生支持 RowKind → MergeFunction | 通过 Equality Delete + Upsert 处理 |
-| **Checkpoint 提交** | prepareSnapshotPreBarrier → notifyCheckpointComplete → atomic snapshot | prepareSnapshotPreBarrier → notifyCheckpointComplete → atomic commit |
-| **Exactly-Once** | 通过 commitUser + checkpoint ID 保证 | 通过 Flink 快照协议 + commit 幂等保证 |
-
-### 12.4 写入路径深度对比
-
-#### Paimon 的 Write Path
-
-```
-InternalRow
-  → KeyAndBucketExtractor 提取 partition/bucket/key
-  → FileStoreWrite.write(partition, bucket, keyValue)
-  → WriterContainer 路由到具体 MergeTreeWriter
-  → SortBufferWriteBuffer.put() (内存排序)
-  → flush: forEach(merge) → RollingFileWriter → DataFileMeta
-  → 异步触发 Compaction
-```
-
-**特点**:
-1. **写放大控制**: 数据先进入排序缓冲区，flush 时做预合并，减少 Level 0 文件大小
-2. **按 bucket 隔离**: 每个 partition+bucket 有独立的 MergeTreeWriter 和 Levels
-3. **流式友好**: LSM 结构天然支持流式写入，compaction 在后台异步进行
-
-#### Iceberg 的 Write Path
-
-```
-RowData
-  → PartitionedFanoutWriter / UnpartitionedWriter
-  → 按 partition 路由到 BaseTaskWriter
-  → Parquet/ORC AppendWriter 直接写文件
-  → (如有主键) EqualityDeleteWriter 写 delete file
-  → close() 时 flush 所有 writer → DataFile 列表
-```
-
-**特点**:
-1. **简单直接**: 数据直接写入目标文件，无额外缓冲层
-2. **写后不合并**: 每次写入产生新的数据文件，不在写入路径做 merge
-3. **批式优先**: 设计哲学偏向批处理，流式需要额外的 maintenance 来清理小文件
-
-### 12.5 更新操作对比
 
 | 操作 | Paimon | Iceberg (MoR) | Iceberg (CoW) |
 |---|---|---|---|
-| **INSERT** | 写入 SortBuffer → flush 到 Level 0 | 写入新 Data File | 写入新 Data File |
-| **UPDATE** | 写入新 KV (相同 key) → compaction 时 merge | 写入 Equality Delete + 新 Data File | 重写整个 Data File |
-| **DELETE** | 写入 DELETE 标记的 KV → compaction 时清除 | 写入 Position Delete 或 Equality Delete | 重写整个 Data File |
-| **读取代价** | 需要 merge 多个 sorted run | 需要 apply delete files | 无额外代价 |
-| **写入代价** | 低（只追加） | 中（追加 + delete file） | 高（重写整个文件） |
-| **Compaction 代价** | 后台异步，可调节 | 独立作业 | 写入时已完成 |
+| INSERT | 写 SortBuffer → flush L0 | 写新 Data File | 写新 Data File |
+| UPDATE | 写新 KV → compaction 合并 | Equality Delete + 新文件 | 重写整文件 |
+| DELETE | 写 DELETE 标记 → compaction 清除 | Position/Equality Delete | 重写整文件 |
+| 读取代价 | merge 多 sorted run | apply delete files | 无 |
+| 写入代价 | 低（只追加） | 中 | 高 |
 
-### 12.6 适用场景总结
+### 13.3 选型建议
 
-| 场景 | 推荐方案 | 原因 |
+| 场景 | 推荐 | 原因 |
 |---|---|---|
-| **高频实时更新** | Paimon | LSM-tree 写入性能优异，原生 CDC 支持 |
-| **低频批量覆盖** | Iceberg | Copy-on-Write 模式读取零开销 |
-| **流批一体 Lakehouse** | Paimon | 统一的流批读写路径，实时 changelog 生成 |
-| **已有 Iceberg 生态** | Iceberg | 兼容性好，工具链成熟 |
-| **大规模追加写入** | 两者均可 | 追加场景两者性能接近 |
-| **跨分区 Upsert** | Paimon (KEY_DYNAMIC) | Iceberg 不原生支持跨分区 upsert |
+| 高频实时更新 / CDC | Paimon | LSM 写入优异、原生 CDC |
+| 低频批量覆盖、读多写少 | Iceberg | CoW 读取零开销 |
+| 流批一体 Lakehouse | Paimon | 统一流批读写、实时 changelog |
+| 跨分区 Upsert | Paimon | KEY_DYNAMIC 支持，Iceberg 不原生支持 |
+| 已有 Iceberg 生态 | Iceberg | 兼容、工具链成熟 |
+
+---
+
+## 14. 设计决策总结
+
+| 决策点 | 选择 | 取舍 / 代价 | 收益 |
+|---|---|---|---|
+| 写入与提交分离 | Writer 多并行度备货 + Committer 单并行度过账 | Committer 单点 | 原子可见、冲突可控、exactly-once 只实现一遍 |
+| 提交时机 | `notifyCheckpointComplete` 才提交 | 提交延后一个 cp | 提交与恢复点一致，failover 不丢不重 |
+| exactly-once 兜底 | 强制 EXACTLY_ONCE + commitUser 幂等 + 单 Committer + 冲突重试 | 禁用 AT_LEAST_ONCE、配置门槛 | 文件级不丢不重 |
+| BucketMode 自动推导 | 由 bucket 数 + 主键/分区关系推导 | 跨分区需 bootstrap、动态桶两次 shuffle | 用户只配桶数；正确路由 |
+| LSM 写缓冲 + 预合并 | SortBufferWriteBuffer flush 时 merge | 占内存、增写入延迟 | 高吞吐、降写放大与小文件 |
+| 共享内存池 + 抢占 | 全 writer 共享 write-buffer-size，满则抢占最大者 flush | 抢占可能产小文件 | 固定预算撑海量 bucket，避免 OOM/死锁 |
+| 异步 compaction + 三档反压 | 后台合并，run 超阈值才反压写入/checkpoint | run 多时反压、读放大 | 写入不被 compaction 阻塞 |
+| LocalMerge（可选） | shuffle 前本地预合并 | 多一层算子、占内存 | 削主键热点、减 shuffle 量 |
+| ChangelogMode 协商 | 主键表默认过滤 UPDATE_BEFORE | aggregate 等需例外保留 | 减半更新数据传输 |
+| 零拷贝 FlinkRowWrapper | 代理 RowData 不深拷贝 | 引用期不可复用底层行 | 高吞吐省 CPU/内存 |
+| FullCompaction 全局同步 | `GlobalFullCompactionSinkWrite` 按 deltaCommits 统一触发 | 那一次 cp 变慢 | 产出时间线一致的完整 changelog |
+| 批写幂等 | `endInput` 走 `filterAndCommit` | 多一次 snapshot 存在性检查 | 批作业中途重启不重复提交 |
 
 ---
 

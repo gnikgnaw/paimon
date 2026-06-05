@@ -1,0 +1,69 @@
+---
+title: "序列与 RowKind"
+sidebar_position: 6
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# 序列与 RowKind {#sequence-and-rowkind}
+
+在创建表时，你可以通过指定字段来设置 `'sequence.field'`，以确定更新的顺序；也可以指定 `'rowkind.field'` 来确定记录的 changelog（变更日志）类型。
+
+## 序列字段（Sequence Field） {#sequence-field}
+
+默认情况下，主键表会根据输入顺序来确定合并顺序（最后输入的记录将最后合并）。然而，在分布式计算中，有些情况会导致数据乱序。此时，你可以使用一个时间字段作为 `sequence.field`，例如：
+
+<Tabs groupId="sequence-field">
+
+<TabItem value="flink" label="Flink">
+
+```sql
+CREATE TABLE my_table (
+    pk BIGINT PRIMARY KEY NOT ENFORCED,
+    v1 DOUBLE,
+    v2 BIGINT,
+    update_time TIMESTAMP
+) WITH (
+    'sequence.field' = 'update_time'
+);
+```
+
+</TabItem>
+
+</Tabs>
+
+`sequence.field` 值最大的记录将最后合并；如果值相同，则使用输入顺序来确定哪一条是最后一条。`sequence.field` 支持所有数据类型的字段。
+
+你可以为 `sequence.field` 定义多个字段，例如 `'update_time,flag'`，多个字段将按顺序进行比较。
+
+:::info
+
+用户定义的序列字段与 `first_row`、`first_value` 等特性存在冲突，可能导致非预期的结果。
+
+:::
+
+## RowKind 字段（Row Kind Field） {#row-kind-field}
+
+默认情况下，主键表会根据输入行来确定 RowKind。你也可以定义 `'rowkind.field'`，使用某个字段来提取 RowKind。
+
+有效的 RowKind 字符串应为 `'+I'`、`'-U'`、`'+U'` 或 `'-D'`。

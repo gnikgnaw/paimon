@@ -1,0 +1,614 @@
+---
+title: "聚合"
+sidebar_position: 3
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# 聚合 {#aggregation}
+
+:::info
+
+注意：在 Flink SQL TableConfig 中始终将 `table.exec.sink.upsert-materialize` 设置为 `NONE`。
+
+:::
+
+有时用户只关心聚合后的结果。`aggregation` 合并引擎会按照聚合函数，在同一主键下将每个值字段与最新数据逐个聚合。
+
+每个不属于主键的字段都可以指定一个聚合函数，通过表属性 `fields.<field-name>.aggregate-function` 指定，否则默认使用 `last_non_null_value` 聚合。例如，考虑以下表定义。
+
+<Tabs groupId="aggregation-merge-engine-example">
+
+<TabItem value="flink" label="Flink">
+
+```sql
+CREATE TABLE my_table (
+    product_id BIGINT,
+    price DOUBLE,
+    sales BIGINT,
+    PRIMARY KEY (product_id) NOT ENFORCED
+) WITH (
+    'merge-engine' = 'aggregation',
+    'fields.price.aggregate-function' = 'max',
+    'fields.sales.aggregate-function' = 'sum'
+);
+```
+
+</TabItem>
+
+</Tabs>
+
+字段 `price` 将使用 `max` 函数聚合，字段 `sales` 将使用 `sum` 函数聚合。给定两条输入记录 `<1, 23.0, 15>` 和 `<1, 30.2, 20>`，最终结果将是 `<1, 30.2, 35>`。
+
+## 聚合函数 {#aggregation-functions}
+
+当前支持的聚合函数和数据类型如下：
+
+### sum {#sum}
+
+  sum 函数对多行的值进行聚合求和。
+  它支持 DECIMAL、TINYINT、SMALLINT、INTEGER、BIGINT、FLOAT 和 DOUBLE 数据类型。
+
+### product {#product}
+  product 函数可以计算多行的乘积值。
+  它支持 DECIMAL、TINYINT、SMALLINT、INTEGER、BIGINT、FLOAT 和 DOUBLE 数据类型。
+
+### count {#count}
+  在需要统计满足特定条件的行数的场景中，你可以使用 SUM 函数来实现。通过将条件表达为布尔值（TRUE 或 FALSE）并将其转换为数值，你可以有效地统计行数。在这种方式中，TRUE 被转换为 1，FALSE 被转换为 0。
+
+  例如，如果你有一个表 orders，想要统计满足特定条件的行数，可以使用以下查询：
+  ```sql
+  SELECT SUM(CASE WHEN condition THEN 1 ELSE 0 END) AS count
+  FROM orders;
+  ```
+
+
+### max {#max}
+  max 函数识别并保留最大值。
+  它支持 CHAR、VARCHAR、DECIMAL、TINYINT、SMALLINT、INTEGER、BIGINT、FLOAT、DOUBLE、DATE、TIME、TIMESTAMP 和 TIMESTAMP_LTZ 数据类型。
+
+### min {#min}
+  min 函数识别并保留最小值。
+  它支持 CHAR、VARCHAR、DECIMAL、TINYINT、SMALLINT、INTEGER、BIGINT、FLOAT、DOUBLE、DATE、TIME、TIMESTAMP 和 TIMESTAMP_LTZ 数据类型。
+
+### last_value {#last_value}
+  last_value 函数用最近导入的值替换之前的值。
+  它支持所有数据类型。
+
+### last_non_null_value {#last_non_null_value}
+  last_non_null_value 函数用最新的非 null 值替换之前的值。
+  它支持所有数据类型。
+
+### listagg {#listagg}
+  listagg 函数将多个字符串值拼接成单个字符串。
+  它支持 STRING 数据类型。
+  每个不属于主键的字段都可以指定一个 list agg 分隔符，通过表属性 fields.\<field-name>.list-agg-delimiter 指定，否则默认使用 "," 作为分隔符。
+  你可以使用 `fields.<field-name>.distinct=true` 对按 `fields.<field-name>.list-agg-delimiter` 拆分后的值进行去重。
+
+### bool_and {#bool_and}
+  bool_and 函数评估布尔集合中的所有值是否都为 true。
+  它支持 BOOLEAN 数据类型。
+
+### bool_or {#bool_or}
+  bool_or 函数检查布尔集合中是否至少有一个值为 true。
+  它支持 BOOLEAN 数据类型。
+
+### first_value {#first_value}
+  first_value 函数从数据集中检索第一个 null 值。
+  它支持所有数据类型。
+
+### first_non_null_value {#first_non_null_value}
+  first_non_null_value 函数选取数据集中的第一个非 null 值。
+  它支持所有数据类型。
+
+### rbm32 {#rbm32}
+  rbm32 函数将多个序列化的 32 位 RoaringBitmap 聚合为单个 RoaringBitmap。
+  它支持 VARBINARY 数据类型，且该数据必须是序列化的 32 位 RoaringBitmap。
+
+  RoaringBitmap 是一种压缩位图，可以高效地表示整数集合。rbm32 聚合器适用于需要合并多个位图集合，或对大型整数数据集执行集合并集操作的场景。
+
+  **示例：**
+
+  ```sql
+  -- Create a table to store user visit data with bitmap aggregation
+  CREATE TABLE user_visits (
+    user_id INT PRIMARY KEY NOT ENFORCED,
+    visit_bitmap VARBINARY
+  ) WITH (
+    'merge-engine' = 'aggregation',
+    'fields.visit_bitmap.aggregate-function' = 'rbm32'
+  );
+
+  -- Register a UDF to create RoaringBitmap from user IDs
+  -- CREATE TEMPORARY FUNCTION TO_BITMAP AS 'BitmapUDF';
+
+  -- Insert data with bitmap representations
+  INSERT INTO user_visits VALUES
+    (1, TO_BITMAP(100, 101, 102)),  -- User 1 visited pages 100, 101, 102
+    (2, TO_BITMAP(101, 103)),       -- User 2 visited pages 101, 103
+    (3, TO_BITMAP(102, 104));       -- User 3 visited pages 102, 104
+
+  -- When the same user_id is inserted again, the bitmaps will be merged
+  INSERT INTO user_visits VALUES
+    (1, TO_BITMAP(103, 105)),       -- User 1 also visited pages 103, 105
+    (2, TO_BITMAP(104, 106));       -- User 2 also visited pages 104, 106
+
+  -- The final result will have merged bitmaps for each user
+  -- User 1: pages 100, 101, 102, 103, 105
+  -- User 2: pages 101, 103, 104, 106
+  -- User 3: pages 102, 104
+  ```
+
+### rbm64 {#rbm64}
+  rbm64 函数将多个序列化的 64 位 Roaring64Bitmap 聚合为单个 Roaring64Bitmap。
+  它支持 VARBINARY 数据类型，且该数据必须是序列化的 64 位 RoaringBitmap。
+
+  与 rbm32 类似，但支持 64 位整数，使其适用于整数值非常大的场景，
+  或者当你需要表示超出 32 位范围（最高 2^31-1）的值集合时。
+
+  **示例：**
+
+  ```sql
+  -- Create a table to store large-scale user interaction data
+  CREATE TABLE user_interactions (
+    session_id BIGINT PRIMARY KEY NOT ENFORCED,
+    interaction_bitmap VARBINARY
+  ) WITH (
+    'merge-engine' = 'aggregation',
+    'fields.interaction_bitmap.aggregate-function' = 'rbm64'
+  );
+
+  -- Register a UDF to create Roaring64Bitmap from large user IDs
+  -- CREATE TEMPORARY FUNCTION TO_BITMAP64 AS 'Bitmap64UDF';
+
+  -- Insert data with 64-bit bitmap representations
+  INSERT INTO user_interactions VALUES
+    (1001, TO_BITMAP64(1000000001L, 1000000002L, 1000000003L)),
+    (1002, TO_BITMAP64(1000000002L, 1000000004L)),
+    (1003, TO_BITMAP64(1000000003L, 1000000005L));
+
+  -- Merge additional interactions
+  INSERT INTO user_interactions VALUES
+    (1001, TO_BITMAP64(1000000004L, 1000000006L)),
+    (1002, TO_BITMAP64(1000000005L, 1000000007L));
+
+  -- The final result will have merged 64-bit bitmaps for each session
+  ```
+
+`rbm32` 和 `rbm64` 聚合器的工作方式如下：
+1. 将输入的 VARBINARY 数据反序列化为 RoaringBitmap 对象
+2. 执行按位 OR 操作以合并位图
+3. 将结果重新序列化为 VARBINARY 格式
+
+**使用 RoaringBitmap 函数：**
+
+Paimon 目前不提供用于创建位图的内置 Flink UDF。你有两种选择：
+
+1. 以编程方式创建位图：在你的应用代码中创建并插入序列化后的字节
+2. 创建自定义 Flink UDF：将原始整数转换为序列化的位图格式
+
+下面是这两种方式的示例：
+
+**选项 1：以编程方式创建位图（Java/Scala）**
+
+```java
+// Create bitmaps programmatically
+RoaringBitmap32 bitmap1 = RoaringBitmap32.bitmapOf(100, 101, 102);
+RoaringBitmap32 bitmap2 = RoaringBitmap32.bitmapOf(101, 103);
+RoaringBitmap32 bitmap3 = RoaringBitmap32.bitmapOf(102, 104);
+
+byte[] serialized1 = bitmap1.serialize();
+byte[] serialized2 = bitmap2.serialize();
+byte[] serialized3 = bitmap3.serialize();
+
+INSERT INTO user_page_visits VALUES
+    (1, CAST(x'...' AS VARBINARY)),  -- serialized1 bytes
+    (2, CAST(x'...' AS VARBINARY)),  -- serialized2 bytes
+    (3, CAST(x'...' AS VARBINARY));  -- serialized3 bytes
+```
+
+**选项 2：自定义 Flink UDF**
+
+```sql
+-- Create the aggregation table
+CREATE TABLE user_page_visits (
+    user_id INT PRIMARY KEY NOT ENFORCED,
+    page_visits VARBINARY
+) WITH (
+    'merge-engine' = 'aggregation',
+    'fields.page_visits.aggregate-function' = 'rbm32'
+);
+
+-- Register custom UDFs (you need to implement these)
+
+-- Use the UDFs
+INSERT INTO user_page_visits VALUES
+    (1, TO_BITMAP(100, 101, 102)),
+    (2, TO_BITMAP(101, 103)),
+    (3, TO_BITMAP(102, 104));
+
+-- Query with UDFs
+SELECT user_id, FROM_BITMAP(page_visits) as unique_pages
+FROM user_page_visits;
+
+SELECT user_id,
+       BITMAP_CONTAINS(page_visits, 101) as visited_page_101
+FROM user_page_visits
+WHERE user_id = 1;
+```
+
+**示例 UDF 实现（Java）：**
+
+```java
+// BitmapUDF - Converts integers to serialized RoaringBitmap
+public static class BitmapUDF extends ScalarFunction {
+    public byte[] eval(Integer... values) {
+        RoaringBitmap32 bitmap = new RoaringBitmap32();
+        for (Integer value : values) {
+            if (value != null) {
+                bitmap.add(value);
+            }
+        }
+        return bitmap.serialize();
+    }
+}
+
+// BitmapCountUDF - Gets cardinality from serialized RoaringBitmap
+public static class BitmapCountUDF extends ScalarFunction {
+    public Long eval(byte[] bitmapBytes) {
+        if (bitmapBytes == null) {
+            return 0L;
+        }
+        try {
+            RoaringBitmap32 bitmap = new RoaringBitmap32();
+            bitmap.deserialize(ByteBuffer.wrap(bitmapBytes));
+            return bitmap.getCardinality();
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to deserialize bitmap", e);
+        }
+    }
+}
+
+// BitmapContainsUDF - Checks if value exists in bitmap
+public static class BitmapContainsUDF extends ScalarFunction {
+    public Boolean eval(byte[] bitmapBytes, Integer value) {
+        if (bitmapBytes == null || value == null) {
+            return false;
+        }
+        try {
+            RoaringBitmap32 bitmap = new RoaringBitmap32();
+            bitmap.deserialize(ByteBuffer.wrap(bitmapBytes));
+            return bitmap.contains(value);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to deserialize bitmap", e);
+        }
+    }
+}
+```
+
+### nested_update {#nested_update}
+  nested_update 函数将多行收集到一个 array\<row>（即所谓的「嵌套表」）中。它支持 ARRAY\<ROW> 数据类型。
+
+  使用 `fields.<field-name>.nested-key=pk0,pk1,...` 来指定嵌套表的主键。如果没有指定键，行将被追加到 array\<row> 中。
+
+  使用 `fields.<field-name>.count-limit=<Integer>` 来指定嵌套表中的最大行数。当没有 nested-key 时，它将顺序地选取数据
+  直到达到上限；但如果指定了 nested-key，它无法保证聚合结果的正确性。此配置项可用于
+  避免异常输入。
+
+  一个示例：
+
+  <Tabs groupId="nested-update-example">
+
+<TabItem value="flink" label="Flink">
+
+```sql
+  -- orders table
+  CREATE TABLE orders (
+    order_id BIGINT PRIMARY KEY NOT ENFORCED,
+    user_name STRING,
+    address STRING
+  );
+  
+  -- sub orders that have the same order_id 
+  -- belongs to the same order
+  CREATE TABLE sub_orders (
+    order_id BIGINT,
+    sub_order_id INT,
+    product_name STRING,
+    price BIGINT,
+    PRIMARY KEY (order_id, sub_order_id) NOT ENFORCED
+  );
+  
+  -- wide table
+  CREATE TABLE order_wide (
+    order_id BIGINT PRIMARY KEY NOT ENFORCED,
+    user_name STRING,
+    address STRING,
+    sub_orders ARRAY<ROW<sub_order_id BIGINT, product_name STRING, price BIGINT>>
+  ) WITH (
+    'merge-engine' = 'aggregation',
+    'fields.sub_orders.aggregate-function' = 'nested_update',
+    'fields.sub_orders.nested-key' = 'sub_order_id'
+  );
+  
+  -- widen
+  INSERT INTO order_wide
+  
+  SELECT 
+    order_id, 
+    user_name,
+    address, 
+    CAST (NULL AS ARRAY<ROW<sub_order_id BIGINT, product_name STRING, price BIGINT>>) 
+  FROM orders
+  
+  UNION ALL 
+    
+  SELECT 
+    order_id, 
+    CAST (NULL AS STRING), 
+    CAST (NULL AS STRING), 
+    ARRAY[ROW(sub_order_id, product_name, price)] 
+  FROM sub_orders;
+  
+  -- query using UNNEST
+  SELECT order_id, user_name, address, sub_order_id, product_name, price 
+  FROM order_wide, UNNEST(sub_orders) AS so(sub_order_id, product_name, price)
+  ```
+
+</TabItem>
+
+</Tabs>
+
+### nested_partial_update {#nested_partial_update}
+  nested_partial_update 函数将多行收集到一个 array\<row\>（即所谓的「嵌套表」）中。它支持
+  ARRAY\<ROW\> 数据类型。你需要使用 `fields.<field-name>.nested-key=pk0,pk1,...` 来指定
+  嵌套表的主键。每行中的值通过对部分列进行部分更新来写入。
+
+### collect {#collect}
+  collect 函数将元素收集到一个 Array 中。你可以设置 `fields.<field-name>.distinct=true` 来对元素去重。
+  它仅支持 ARRAY 类型。
+
+### merge_map {#merge_map}
+  merge_map 函数合并输入的 map。它仅支持 MAP 类型。
+
+### merge_map_with_keytime {#merge_map_with_keytime}
+
+  merge_map_with_keytime 函数基于时间戳合并输入的 map，并按 key 级别进行部分更新。
+  map 中的每个 key 都携带自己的时间戳，在合并时，每个 key 仅保留具有最新时间戳的值。
+  它仅支持 `MAP<key_type, ROW<value_field, ts_field>>` 类型，其中 ROW 必须至少有 2 个字段。
+
+  使用 `fields.<field-name>.ts-field=<field_name_in_row>` 来指定 ROW 类型中的时间戳字段名。
+  如果未指定，默认使用 ROW 的最后一个字段作为时间戳。
+
+  当某个 key 的值为 null 时，该 key 将从 map 中移除。
+  当时间戳字段为 null 时，该条目将被跳过。
+
+  一个示例：
+
+  <Tabs groupId="merge-map-with-keytime-example">
+
+<TabItem value="flink" label="Flink">
+
+```sql
+  CREATE TABLE my_table (
+      biz_order_id STRING,
+      key_value_map MAP\<STRING, ROW\<`value` STRING, `ts` STRING>>,
+      PRIMARY KEY (biz_order_id) NOT ENFORCED
+  ) WITH (
+      'merge-engine' = 'aggregation',
+      'fields.key_value_map.aggregate-function' = 'merge_map_with_keytime',
+      'fields.key_value_map.ts-field' = 'ts'
+  );
+  ```
+
+</TabItem>
+
+</Tabs>
+
+  给定以下输入记录：
+
+  | biz_order_id | key_value_map |
+  |---|---|
+  | 1 | {'\{'}"product_name": ("iPhone", "100"), "color": ("Black", "100"){'\}'} |
+  | 1 | {'\{'}"product_name": ("iPad", "200"), "price": ("999", "200"){'\}'} |
+  | 1 | {'\{'}"color": ("White", "50"){'\}'} |
+
+  最终结果将是：
+  `{"product_name": ("iPad", "200"), "color": ("Black", "100"), "price": ("999", "200")}` 
+  注意，`color` 仍保持为 "Black"，因为它现有的时间戳 "100" 大于传入的 "50"。
+
+### 基数草图的类型 {#types-of-cardinality-sketches}
+
+ Paimon 使用 [Apache DataSketches](https://datasketches.apache.org/) 这一随机流式算法库来实现草图模块。DataSketches 库包含多种类型的草图，每一种都用于解决不同类型的问题。Paimon 支持 HyperLogLog (HLL) 和 Theta 基数草图。
+
+#### HyperLogLog {#hyperloglog}
+
+ HyperLogLog (HLL) 草图聚合器是一种非常紧凑的草图算法，用于近似去重计数。你还可以使用 HLL 聚合器来计算 HLL 草图的并集。
+
+#### Theta {#theta}
+
+ Theta 草图是一种用于带集合运算的近似去重计数的草图算法。Theta 草图可让你统计集合之间的重叠，从而可以在草图对象之间计算并集、交集或差集。
+
+#### 选择草图类型 {#choosing-a-sketch-type}
+
+  HLL 和 Theta 草图都支持近似去重计数；不过，HLL 草图产生的结果更准确，且占用的存储空间更少。Theta 草图更灵活，但需要显著更多的内存。
+
+在为你的使用场景选择近似算法时，请考虑以下几点：
+
+如果你的使用场景涉及去重计数和合并草图对象，请使用 HLL 草图。
+如果你需要评估并集、交集或差集运算，请使用 Theta 草图。
+你不能将 HLL 草图与 Theta 草图合并。
+
+#### hll_sketch {#hll_sketch}
+
+hll_sketch 函数将多个序列化的 Sketch 对象聚合为单个 Sketch。
+它支持 VARBINARY 数据类型。
+
+一个示例：
+
+<Tabs groupId="hll-sketch-example">
+
+<TabItem value="flink" label="Flink">
+
+```sql
+  -- source table
+  CREATE TABLE VISITS (
+    id INT PRIMARY KEY NOT ENFORCED,
+    user_id STRING
+  );
+  
+  -- agg table
+  CREATE TABLE UV_AGG (
+    id INT PRIMARY KEY NOT ENFORCED,
+    uv VARBINARY
+  ) WITH (
+    'merge-engine' = 'aggregation',
+    'fields.uv.aggregate-function' = 'hll_sketch'
+  );
+  
+  -- Register the following class as a Flink function with the name "HLL_SKETCH" 
+  -- for example: create TEMPORARY function HLL_SKETCH as  'HllSketchFunction';
+  -- which is used to transform input to sketch bytes array:
+  --
+  -- public static class HllSketchFunction extends ScalarFunction {
+  --   public byte[] eval(String user_id) {
+  --     HllSketch hllSketch = new HllSketch();
+  --     hllSketch.update(user_id);
+  --     return hllSketch.toCompactByteArray();
+  --   }
+  -- }
+  --
+  INSERT INTO UV_AGG SELECT id, HLL_SKETCH(user_id) FROM VISITS;
+
+  -- Register the following class as a Flink function with the name "HLL_SKETCH_COUNT"
+  -- for example: create TEMPORARY function HLL_SKETCH_COUNT as  'HllSketchCountFunction';
+  -- which is used to get cardinality from sketch bytes array:
+  -- 
+  -- public static class HllSketchCountFunction extends ScalarFunction { 
+  --   public Double eval(byte[] sketchBytes) {
+  --     if (sketchBytes == null) {
+  --       return 0d; 
+  --     } 
+  --     return HllSketch.heapify(sketchBytes).getEstimate(); 
+  --   } 
+  -- }
+  --
+  -- Then we can get user cardinality based on the aggregated field.
+  SELECT id, HLL_SKETCH_COUNT(UV) as uv FROM UV_AGG;
+  ```
+
+</TabItem>
+
+</Tabs>
+
+
+#### theta_sketch {#theta_sketch}
+  theta_sketch 函数将多个序列化的 Sketch 对象聚合为单个 Sketch。
+  它支持 VARBINARY 数据类型。
+
+  一个示例：
+
+  <Tabs groupId="theta-sketch-example">
+
+<TabItem value="flink" label="Flink">
+
+```sql
+  -- source table
+  CREATE TABLE VISITS (
+    id INT PRIMARY KEY NOT ENFORCED,
+    user_id STRING
+  );
+  
+  -- agg table
+  CREATE TABLE UV_AGG (
+    id INT PRIMARY KEY NOT ENFORCED,
+    uv VARBINARY
+  ) WITH (
+    'merge-engine' = 'aggregation',
+    'fields.uv.aggregate-function' = 'theta_sketch'
+  );
+  
+  -- Register the following class as a Flink function with the name "THETA_SKETCH" 
+  -- for example: create TEMPORARY function THETA_SKETCH as  'ThetaSketchFunction';
+  -- which is used to transform input to sketch bytes array:
+  --
+  -- public static class ThetaSketchFunction extends ScalarFunction {'\{'}
+  --   public byte[] eval(String user_id) {'\{'}
+  --     UpdateSketch updateSketch = UpdateSketch.builder().build();
+  --     updateSketch.update(user_id);
+  --     return updateSketch.compact().toByteArray();
+  --   {'\}'}
+  -- {'\}'}
+  --
+  INSERT INTO UV_AGG SELECT id, THETA_SKETCH(user_id) FROM VISITS;
+
+  -- Register the following class as a Flink function with the name "THETA_SKETCH_COUNT"
+  -- for example: create TEMPORARY function THETA_SKETCH_COUNT as  'ThetaSketchCountFunction';
+  -- which is used to get cardinality from sketch bytes array:
+  -- 
+  -- public static class ThetaSketchCountFunction extends ScalarFunction {'\{'} 
+  --   public Double eval(byte[] sketchBytes) {'\{'}
+  --     if (sketchBytes == null) {'\{'}
+  --       return 0d; 
+  --     {'\}'} 
+  --     return Sketches.wrapCompactSketch(Memory.wrap(sketchBytes)).getEstimate(); 
+  --   {'\}'} 
+  -- {'\}'}
+  --
+  -- Then we can get user cardinality based on the aggregated field.
+  SELECT id, THETA_SKETCH_COUNT(UV) as uv FROM UV_AGG;
+  ```
+
+</TabItem>
+
+</Tabs>
+
+
+:::info
+
+对于流式查询，`aggregation` 合并引擎必须与 `lookup` 或 `full-compaction`
+[changelog producer](../changelog-producer) 一起使用。（也支持 'input' changelog producer，但它只返回输入记录。）
+
+:::
+
+## 回撤 {#retraction}
+
+只有 `sum`、`product`、`collect`、`merge_map`、`nested_update`、`last_value` 和 `last_non_null_value` 支持回撤（`UPDATE_BEFORE` 和 `DELETE`），其他聚合函数不支持回撤。
+如果你希望某些函数忽略回撤消息，可以配置：
+`'fields.${field_name}.ignore-retract'='true'`。
+
+`last_value` 和 `last_non_null_value` 在接收到回撤消息时仅将字段设置为 null。
+
+当累加器为 null 时，`product` 对回撤消息将返回 null。
+
+`collect` 和 `merge_map` 会尽力处理回撤消息，但不保证结果
+准确。在处理回撤消息时可能出现以下行为：
+
+1. 如果记录乱序，它可能无法处理回撤消息。例如，表使用 `collect`，
+   上游分别发送 `+I['A', 'B']` 和 `-U['A']`。如果表先收到 `-U['A']`，则它什么也做不了；然后它收到
+   `+I['A', 'B']`，合并结果将是 `+I['A', 'B']` 而不是 `+I['B']`。
+
+2. 来自某个上游的回撤消息会回撤从多个上游合并得到的结果。例如，表
+   使用 `merge_map`，一个上游发送 `+I[1->A]`，另一个上游随后发送 `+I[1->B]`、`-D[1->B]`。表将
+   先把两个插入值合并为 `+I[1->B]`，然后 `-D[1->B]` 将回撤整个结果，因此最终结果
+   是一个空 map 而不是 `+I[1->A]`

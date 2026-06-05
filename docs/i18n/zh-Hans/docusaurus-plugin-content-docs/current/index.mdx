@@ -1,0 +1,133 @@
+---
+title: "Apache Paimon"
+hide_table_of_contents: true
+slug: /
+displayed_sidebar: docs
+---
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+<div className="hero-section">
+<h1>Apache Paimon</h1>
+<p className="hero-subtitle">
+数据湖平台 —— 在单一湖格式中统一批式、流式与多模态 AI。
+</p>
+</div>
+
+<div className="card-grid">
+
+<a className="nav-card" href="concepts/overview">
+  <div className="nav-card-icon">📖</div>
+  <div className="nav-card-body">
+    <h3>概念</h3>
+    <p>核心架构、数据类型、Catalog 与系统表</p>
+  </div>
+</a>
+
+<a className="nav-card" href="primary-key-table/overview">
+  <div className="nav-card-icon">🔑</div>
+  <div className="nav-card-body">
+    <h3>主键表</h3>
+    <p>合并引擎、changelog producer、Compaction 与流式更新</p>
+  </div>
+</a>
+
+<a className="nav-card" href="append-table/overview">
+  <div className="nav-card-icon">📋</div>
+  <div className="nav-card-body">
+    <h3>无主键表</h3>
+    <p>Append 表、增量聚簇、Blob 与向量支持</p>
+  </div>
+</a>
+
+<a className="nav-card" href="flink/quick-start">
+  <div className="nav-card-icon">⚡</div>
+  <div className="nav-card-body">
+    <h3>Flink</h3>
+    <p>快速开始、SQL DDL/DML、流式读/写、存储过程</p>
+  </div>
+</a>
+
+<a className="nav-card" href="spark/quick-start">
+  <div className="nav-card-icon">✨</div>
+  <div className="nav-card-body">
+    <h3>Spark</h3>
+    <p>快速开始、SQL 操作、DataFrame、结构化流</p>
+  </div>
+</a>
+
+<a className="nav-card" href="pypaimon/overview">
+  <div className="nav-card-icon">🐍</div>
+  <div className="nav-card-body">
+    <h3>PyPaimon 与 AI</h3>
+    <p>面向 AI 与多模态工作负载的 Python SDK，及 Ray、PyTorch、Pandas 集成</p>
+  </div>
+</a>
+
+<a className="nav-card" href="ecosystem/overview">
+  <div className="nav-card-icon">🔗</div>
+  <div className="nav-card-body">
+    <h3>生态系统</h3>
+    <p>StarRocks、Doris、Hive、Trino、Presto 集成</p>
+  </div>
+</a>
+
+<a className="nav-card" href="cdc-ingestion/overview">
+  <div className="nav-card-icon">🔄</div>
+  <div className="nav-card-body">
+    <h3>CDC 接入</h3>
+    <p>MySQL、PostgreSQL、Kafka、MongoDB、Pulsar CDC 数据管道</p>
+  </div>
+</a>
+
+<a className="nav-card" href="maintenance/configurations">
+  <div className="nav-card-icon">⚙️</div>
+  <div className="nav-card-body">
+    <h3>运维</h3>
+    <p>配置、快照、标签（Tag）、指标（Metrics）与性能调优</p>
+  </div>
+</a>
+
+</div>
+
+---
+
+## 为什么选择 Paimon？ {#why-paimon}
+
+<div className="feature-grid">
+<div className="feature-item">
+
+### 大规模分析 {#large-scale-analytics}
+PB 级表，支持时间旅行、快速扫描规划、schema 演进与增量聚簇。
+
+</div>
+<div className="feature-item">
+
+### 实时流式 {#realtime-streaming}
+基于 LSM 的流式更新，支持多种合并引擎（去重、部分更新、聚合）与 changelog producer。
+
+</div>
+<div className="feature-item">
+
+### 多模态 AI {#multimodal-ai}
+在 Blob 表中存储图像、视频与 embedding。向量检索（DiskANN）、全文检索，以及面向 ML 管道的原生 Python SDK。
+
+</div>
+</div>

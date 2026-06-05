@@ -1,2824 +1,827 @@
 # Apache Paimon Compaction 全链路深度分析
 
-> 基于 Paimon 1.5-SNAPSHOT 源码（commit: 55f4fd175），全面剖析 Compaction 机制的架构设计、策略选择、执行流程与工程细节。
-> 分析日期: 2026-04-21
+> **版本**：1.5-SNAPSHOT　**源码模块**：`paimon-core`（`org.apache.paimon.compact` 抽象层、`org.apache.paimon.mergetree.compact` 主键表、`org.apache.paimon.append` 追加表；配置项已上移至 `paimon-api`）　**核对日期**：2026-06
+
+**一句话定位**：Compaction 是 LSM 把"写得快"换成"读得对、存得省"的后台代偿机制——它用**可控的、可异步收敛的写放大**，去压住读放大（归并路数）和空间放大（旧版本/删除标记堆积）这两座随写入持续增长的山。
+
+读完本文你应能回答：
+- ① full compaction 与 minor（增量）compaction 的触发条件、入口和输出 level 各有什么不同？为什么 full compaction 必须断言 `taskFuture==null`？
+- ② UniversalCompaction 的 `pickForSizeAmp` / `pickForSizeRatio` / `pickForFileNum` 三级各自在权衡哪个"放大"？`maxSizeAmp`、`sizeRatio` 配错分别会怎样？
+- ③ 同步 compaction 与异步 compaction 的边界在哪里？反压（stop-trigger）和 checkpoint 等待阈值为什么要差 1？
+- ④ `dropDelete` 那个三元判断背后的不变量是什么？为什么输出到最高层或启用 DV 才能丢删除标记？
+- ⑤ 大文件 `upgrade`（只改 level 元数据，零 I/O）和小文件 `rewrite` 的分界线在哪？哪三种情况下大文件也必须被重写？
+- ⑥ Lookup 模式为什么要 `ForceUpLevel0Compaction` 强清 L0？RADICAL 与 GENTLE 在权衡什么？
+- ⑦ dedicated（专用/离线）compaction 与写入端内联 compaction 的取舍是什么？record-level expire 如何"搭车" full compaction 清理过期行？
+- ⑧ Append 表为什么不需要 merge sort 却仍要 compaction？Unaware-Bucket 的 Age 机制解决什么死角？
+
+> 阅读约定：本文每个机制按"① 要解决什么问题 → ② 设计原理与取舍 → ③ 关键源码（精选片段 + `路径:行号`）→ ④ 风险/陷阱/边界 → ⑤ 收益与代价"组织。源码行号以本次核对（commit 基线之上、1.5-SNAPSHOT）为准；与旧稿不符处用 `（已修正）` 标注。
+>
+> **与其他文档的边界**：LSM 数据结构（Levels/SortedRun）与 compaction 的"概览级"内容详见 [01-核心存储引擎分析 §3、§8](01-核心存储引擎分析.md)，本文是 compaction 机制的**主讲**，深入到策略算法与执行层；小文件治理的成因与运维处方详见 [11 小文件治理](11-小文件治理机制.md)，compaction 的运维调优（监控/手动触发/资源配比）详见 [10 运维](10-运维优化方案.md)，本文只在交叉点点到为止，不重复展开。Changelog 的四种 producer 详见 [24 Changelog 产生](24-Changelog机制全链路分析.md)，本文只讲 compaction 阶段如何"顺带"生成 changelog。
 
 ---
 
 ## 目录
 
-- [1. Compaction 概述与设计哲学](#1-compaction-概述与设计哲学)
-  - [1.1 为什么需要 Compaction](#11-为什么需要-compaction)
-  - [1.2 Paimon 的 Compaction 分类体系](#12-paimon-的-compaction-分类体系)
-  - [1.3 核心设计原则](#13-核心设计原则)
+- [1. 快速理解（核心问题 / 概念速查 / 高频陷阱）](#1-快速理解核心问题--概念速查--高频陷阱)
+  - [1.1 核心问题：Compaction 在偿还什么"债"](#11-核心问题compaction-在偿还什么债)
+  - [1.2 核心概念速查表](#12-核心概念速查表)
+  - [1.3 高频生产陷阱](#13-高频生产陷阱)
+  - [1.4 Compaction 分类体系](#14-compaction-分类体系)
 - [2. 核心抽象层：CompactManager 体系](#2-核心抽象层compactmanager-体系)
-  - [2.1 CompactManager 接口](#21-compactmanager-接口)
-  - [2.2 CompactFutureManager 基类](#22-compactfuturemanager-基类)
-  - [2.3 CompactTask 执行单元](#23-compacttask-执行单元)
-  - [2.4 CompactUnit 与 CompactResult](#24-compactunit-与-compactresult)
-- [3. LSM-Tree 数据结构基础](#3-lsm-tree-数据结构基础)
-  - [3.1 Levels：多层文件管理](#31-levels多层文件管理)
-  - [3.2 SortedRun 与 LevelSortedRun](#32-sortedrun-与-levelsortedrun)
-  - [3.3 IntervalPartition：区间分区算法](#33-intervalpartition区间分区算法)
+  - [2.1 CompactManager 接口：生命周期协议](#21-compactmanager-接口生命周期协议)
+  - [2.2 CompactFutureManager：异步与取消](#22-compactfuturemanager异步与取消)
+  - [2.3 CompactTask / CompactUnit / CompactResult](#23-compacttask--compactunit--compactresult)
+- [3. LSM 数据结构基础（交叉引用 01）](#3-lsm-数据结构基础交叉引用-01)
+  - [3.1 Levels 与 numberOfSortedRuns](#31-levels-与-numberofsortedruns)
+  - [3.2 IntervalPartition：区间分区](#32-intervalpartition区间分区)
 - [4. 主键表 Compaction：MergeTreeCompactManager](#4-主键表-compactionmergetreecompactmanager)
-  - [4.1 整体架构](#41-整体架构)
-  - [4.2 触发机制：triggerCompaction](#42-触发机制triggercompaction)
-  - [4.3 反压控制：shouldWaitForLatestCompaction](#43-反压控制shouldwaitforlatestcompaction)
-  - [4.4 结果收集与 Levels 更新](#44-结果收集与-levels-更新)
-  - [4.5 Deletion Vector 集成](#45-deletion-vector-集成)
-- [5. CompactStrategy 策略体系](#5-compactstrategy-策略体系)
-  - [5.1 策略接口设计](#51-策略接口设计)
-  - [5.2 UniversalCompaction：核心策略](#52-universalcompaction核心策略)
-  - [5.3 ForceUpLevel0Compaction：Lookup 模式策略](#53-forceuplevel0compaction-lookup-模式策略)
-  - [5.4 EarlyFullCompaction：提前全量压缩](#54-earlyfullcompaction提前全量压缩)
-  - [5.5 OffPeakHours：低峰期自适应策略](#55-offpeakhours低峰期自适应策略)
-  - [5.6 Full Compaction：全量压缩](#56-full-compaction全量压缩)
-- [6. Compact Task 执行层](#6-compact-task-执行层)
-  - [6.1 MergeTreeCompactTask：主压缩任务](#61-mergetreecompacttask主压缩任务)
-  - [6.2 FileRewriteCompactTask：文件级重写任务](#62-filerewritecompacttask文件级重写任务)
-  - [6.3 upgrade 与 rewrite 的区分逻辑](#63-upgrade-与-rewrite-的区分逻辑)
-- [7. CompactRewriter 重写器体系](#7-compactrewriter-重写器体系)
-  - [7.1 继承层次总览](#71-继承层次总览)
-  - [7.2 MergeTreeCompactRewriter：标准重写器](#72-mergetreecompactrewriter标准重写器)
-  - [7.3 ChangelogMergeTreeRewriter：变更日志重写器](#73-changelogmergetreerewriter变更日志重写器)
-  - [7.4 LookupMergeTreeCompactRewriter：Lookup 重写器](#74-lookupmergetreecompactrewriter-lookup-重写器)
-  - [7.5 FullChangelogMergeTreeCompactRewriter](#75-fullchangelogmergetreecompactrewriter)
+  - [4.1 triggerCompaction：full vs minor 两条路](#41-triggercompactionfull-vs-minor-两条路)
+  - [4.2 dropDelete：丢删除标记的不变量](#42-dropdelete丢删除标记的不变量)
+  - [4.3 同步 vs 异步：反压与 checkpoint 双阈值](#43-同步-vs-异步反压与-checkpoint-双阈值)
+  - [4.4 结果回收与 Deletion Vector 集成](#44-结果回收与-deletion-vector-集成)
+- [5. CompactStrategy 策略体系：写/读/空间三角](#5-compactstrategy-策略体系写读空间三角)
+  - [5.1 UniversalCompaction 三级决策](#51-universalcompaction-三级决策)
+  - [5.2 ForceUpLevel0Compaction：Lookup 强清 L0](#52-forceuplevel0compactionlookup-强清-l0)
+  - [5.3 EarlyFullCompaction：提前全量的三种触发](#53-earlyfullcompaction提前全量的三种触发)
+  - [5.4 OffPeakHours：低峰期放宽阈值](#54-offpeakhours低峰期放宽阈值)
+  - [5.5 Full Compaction 的入口与"空操作"优化](#55-full-compaction-的入口与空操作优化)
+- [6. Compact Task 执行层：upgrade vs rewrite](#6-compact-task-执行层upgrade-vs-rewrite)
+- [7. CompactRewriter：标准 / Changelog / Lookup 三系](#7-compactrewriter标准--changelog--lookup-三系)
 - [8. Append-Only 表 Compaction](#8-append-only-表-compaction)
-  - [8.1 BucketedAppendCompactManager](#81-bucketedappendcompactmanager)
-  - [8.2 AppendCompactCoordinator：Unaware-Bucket 协调器](#82-appendcompactcoordinatorunaware-bucket-协调器)
-  - [8.3 AppendCompactTask：独立压缩任务](#83-appendcompacttask独立压缩任务)
-  - [8.4 AppendPreCommitCompactCoordinator](#84-appendprecommitcompactcoordinator)
+  - [8.1 BucketedAppendCompactManager：滑动窗口](#81-bucketedappendcompactmanager滑动窗口)
+  - [8.2 AppendCompactCoordinator：Unaware-Bucket 与 Age 机制](#82-appendcompactcoordinatorunaware-bucket-与-age-机制)
+  - [8.3 AppendCompactTask 与 pre-commit 预压缩](#83-appendcompacttask-与-pre-commit-预压缩)
 - [9. Clustering Compaction：聚簇压缩](#9-clustering-compaction聚簇压缩)
-  - [9.1 ClusteringCompactManager 整体设计](#91-clusteringcompactmanager-整体设计)
-  - [9.2 Phase 1：排序重写](#92-phase-1排序重写)
-  - [9.3 Phase 2：合并重写](#93-phase-2合并重写)
-  - [9.4 ClusteringFiles 文件管理](#94-clusteringfiles-文件管理)
-  - [9.5 Spill 机制与内存管理](#95-spill-机制与内存管理)
-- [10. Manifest 文件 Compaction](#10-manifest-文件-compaction)
-  - [10.1 MinorCompaction：增量合并](#101-minorcompaction增量合并)
-  - [10.2 FullCompaction：全量压缩](#102-fullcompaction全量压缩)
-- [11. Compaction 配置参数全景](#11-compaction-配置参数全景)
-  - [11.1 主键表核心参数](#111-主键表核心参数)
-  - [11.2 Append 表参数](#112-append-表参数)
-  - [11.3 高级调优参数](#113-高级调优参数)
-- [12. Compaction Metrics 监控体系](#12-compaction-metrics-监控体系)
-- [13. 设计决策深度剖析](#13-设计决策深度剖析)
-- [14. 全链路流程图](#14-全链路流程图)
+- [10. Manifest 文件 Compaction（元数据层）](#10-manifest-文件-compaction元数据层)
+- [11. Dedicated Compaction 与 Record-Level Expire 搭车清理](#11-dedicated-compaction-与-record-level-expire-搭车清理)
+- [12. Compaction 配置参数全景](#12-compaction-配置参数全景)
+- [13. Compaction Metrics 监控体系](#13-compaction-metrics-监控体系)
+- [14. 设计决策总结](#14-设计决策总结)
+- [15. 全链路流程图](#15-全链路流程图)
 
 ---
 
-## 1. Compaction 概述与设计哲学
+## 1. 快速理解（核心问题 / 概念速查 / 高频陷阱）
 
-### 解决什么问题
+### 1.1 核心问题：Compaction 在偿还什么"债"
 
-**核心业务问题:**
-Compaction 解决的是 LSM-Tree 架构下的"三放大"问题:读放大、写放大、空间放大。在实时数据湖场景中,如果不做 Compaction,会导致:
-- 查询需要扫描几百个小文件,延迟从毫秒级退化到秒级
-- 同一条记录的多个版本占用存储空间,成本增加 3-5 倍
-- 删除操作无法真正释放空间,磁盘使用量持续增长
+**① 要解决什么问题**
 
-**没有这个设计的后果:**
-```java
-// 假设一个分区每小时写入 1000 个小文件
-// 查询时需要打开所有文件:
-List<DataFileMeta> files = scan.files(); // 24小时后有 24000 个文件
-for (DataFileMeta file : files) {
-    reader.open(file); // 打开 24000 次,OOM 或超时
-}
+LSM 把所有写入都变成"追加一个新有序文件"，写得极快（详见 [01 §3](01-核心存储引擎分析.md)）。但这是**借债**：每追加一个文件，读取就多一路要归并的 sorted run，旧版本/删除标记也不会自动消失。不还债，三笔账会持续膨胀：
+
+- **读放大**：查询要把所有覆盖该 key 范围的文件归并出最终值。L0 文件 key 范围互相重叠，文件从 5 个涨到 50 个，归并路数同步翻 10 倍，点查从毫秒退化到秒级。
+- **空间放大**：同一主键的 INSERT/UPDATE/DELETE 多版本同时在盘，存储成本翻几倍。
+- **写放大**：Compaction 本身要重写数据——但**不还的债利滚利**，越晚合并，单次要归并的数据量越大。
+
+**② 设计原理与取舍：为什么是 Universal 而不是 Leveled**
+
+Compaction 的本质是"**主动付一笔可控、可异步、可挑时段的写放大，去偿还无界增长的读放大与空间放大**"。问题在于按什么策略付。RocksDB 的两种策略代表两个极端，Paimon 选了写优先的 Universal：
+
+| 维度 | Leveled（RocksDB 默认） | **Universal（Paimon 默认）** | Size-Tiered（HBase/Cassandra） |
+|------|------------------------|------------------------------|--------------------------------|
+| 合并触发 | 每层超阈值就把整层并入下一层 | 合并"大小相近"的相邻 run | 攒够 N 个相近大小的文件就合 |
+| 写放大 | 高（同一数据被反复下推多层） | **低**（只合相近大小，单数据少被重写） | 中 |
+| 读放大 | 低（每层 key 不重叠，定位快） | 中（受 run 数上限约束） | 高（run 数无硬约束） |
+| 空间放大 | 低 | 中（靠 `maxSizeAmp` 兜底） | 高 |
+| 适用 | 读多写少 | **写密集 + 流式更新** | 时序追加 |
+
+一句话设计哲学：**Paimon 面向实时数仓，写吞吐是硬瓶颈，所以默认走写放大最低的 Universal；读放大的窟窿再用 `EarlyFullCompaction`（按需提前全量）、`OffPeakHours`（夜里多合）、`ForceUpLevel0Compaction`（Lookup 强清 L0）这三块补丁按场景补回来。**
+
+**③ 关键链路（与全文各章对应）**
+
+```
+写入 flush → 落 L0 新 sorted run               §2 addNewFile / Levels.update
+   ↓ run 数 > compaction-trigger(默认5)
+触发 minor compaction                           §4.1 triggerCompaction(false)
+   ↓ UniversalCompaction.pick 选 run
+   ↓ EarlyFull > SizeAmp > SizeRatio > FileNum   §5.1 四级决策
+计算 dropDelete                                  §4.2 输出最高层/启用DV才丢删除标记
+   ↓ executor.submit(CompactTask) 异步执行       §2.2 / §6
+IntervalPartition 切 section                     §3.2
+   ↓ 大文件 upgrade(零I/O改level) / 小文件 rewrite(merge sort)  §6
+   ↓ Lookup/full-compaction 模式顺带写 changelog §7
+getCompactionResult → levels.update             §4.4 在Writer线程更新Levels
+   ↓ run 数 > stop-trigger(默认8) → 写入反压      §4.3 同步等待
 ```
 
-**实际场景:**
-某电商公司的订单表,每秒写入 10000 条记录,每次 flush 产生 1 个文件。一天产生 86400 个文件。查询最近 1 小时订单时,需要扫描 3600 个文件,查询耗时从 100ms 增加到 30s,业务不可用。
+### 1.2 核心概念速查表
 
-### 有什么坑
+| 概念 | 一句话定义 | 关键源码 |
+|------|-----------|---------|
+| **CompactManager** | 压缩生命周期协议接口：触发/取结果/反压判断/取消 | `compact/CompactManager.java:29` |
+| **CompactFutureManager** | 用 `Future` 封装异步执行与取消的基类 | `compact/CompactFutureManager.java:29` |
+| **CompactTask** | 实现 `Callable<CompactResult>` 的执行单元，在压缩线程跑 | `compact/CompactTask.java:34` |
+| **CompactUnit** | 一次压缩的输入：输出 level + 文件列表 + 是否 fileRewrite | `compact/CompactUnit.java` |
+| **CompactResult** | 输出：before/after/changelog 文件 + DeletionFile | `compact/CompactResult.java` |
+| **CompactStrategy** | 选哪些文件压缩的策略接口（含静态 `pickFullCompaction`） | `mergetree/compact/CompactStrategy.java:37` |
+| **UniversalCompaction** | 默认策略，SizeAmp/SizeRatio/FileNum 三级决策 | `mergetree/compact/UniversalCompaction.java:42` |
+| **ForceUpLevel0Compaction** | Lookup 模式策略，标准策略不动就强制推 L0 上层 | `mergetree/compact/ForceUpLevel0Compaction.java:31` |
+| **dropDelete** | 安全丢弃删除标记的标志（输出最高层或有 DV 时为真） | `MergeTreeCompactManager.java:179` |
+| **upgrade** | 只把 DataFileMeta 的 level 字段改高，物理文件不动（零 I/O） | `MergeTreeCompactTask.java:123` |
+| **compactionFileSize** | 小文件分界线 = `targetFileSize * compaction.small-file-ratio(0.7)` | `CoreOptions.java:3042` |
+| **numberOfSortedRuns** | L0 文件数 + 各非空高层 run 数，触发与反压都看它 | `Levels.numberOfSortedRuns()` |
+| **BucketedAppendCompactManager** | 有桶 Append 表的滑动窗口压缩管理器 | `append/BucketedAppendCompactManager.java:52` |
+| **AppendCompactCoordinator** | Unaware-Bucket 表的中心化协调器，带 Age 机制 | `append/AppendCompactCoordinator.java:70` |
 
-**误区陷阱:**
-1. **过度压缩**: 设置 `num-sorted-run.compaction-trigger=2` 导致每次 flush 都触发压缩,写放大 10 倍,吞吐量下降 80%
-2. **忽略反压**: 禁用 `num-sorted-run.stop-trigger` 导致 sorted run 数量失控,最终 OOM
-3. **错误的 targetFileSize**: 设置为 1GB 导致单文件读取慢,设置为 1MB 导致文件数爆炸
+### 1.3 高频生产陷阱
 
-**错误配置示例:**
-```sql
--- 错误: 强制每次 commit 都全量压缩
-ALTER TABLE my_table SET ('commit.force-compact' = 'true');
--- 后果: 写入吞吐量从 100MB/s 降到 10MB/s
+**陷阱 1：`num-sorted-run.compaction-trigger` 调大压不住读放大。** 该值默认 5（`CoreOptions.java:756`），它一参三用：触发 minor compaction 的 run 阈值、`pickForSizeAmp/Ratio` 的最小候选数、`num-levels` 默认值 = trigger+1。调大写更快，但查询要归并的 run 更多、单次归并峰值内存更高。和 [01 §1.3 陷阱 7](01-核心存储引擎分析.md) 同源。
 
--- 错误: 关闭反压
-ALTER TABLE my_table SET ('num-sorted-run.stop-trigger' = '2147483647');
--- 后果: sorted run 数量增长到 1000+,查询超时,最终 OOM
-```
+**陷阱 2：把 `num-sorted-run.stop-trigger` 设成极大值关掉反压。** 该项无默认值，缺省 = `compaction-trigger + 3 = 8`（`CoreOptions.java:3068`）。它是写入硬反压闸门（`shouldWaitForLatestCompaction`）；设成 `Integer.MAX_VALUE` 后 run 数无界增长，先读退化再 OOM。源码用 `(long)` 强转防 `+1` 溢出（`MergeTreeCompactManager.java:116`）。
 
-**生产环境注意事项:**
-- 监控 `maxLevel0FileCount` 指标,超过 20 说明压缩跟不上写入
-- 低峰期(凌晨 2-6 点)配置 `compaction.offpeak` 参数,利用闲置资源
-- DV 模式下必须配置 `deletion-vectors.index-file.size`,否则索引文件膨胀
+**陷阱 3：误以为 `compaction.size-ratio` 越小越激进。** 恰恰相反。`size-ratio`（默认 1，即 1%）是"相邻 run 大小差多少以内才合并"的容差，**越小越保守**——只有大小几乎相等的 run 才合，候选集很难扩大，反而压不动。调大才更激进。
 
-**性能陷阱:**
-```java
-// 陷阱: Full Compaction 阻塞写入
-table.newCommit().withFullCompaction(true).commit();
-// 如果表有 100GB 数据,压缩需要 30 分钟,期间写入被阻塞
-```
+**陷阱 4：`commit.force-compact=true` 拖垮流式写吞吐。** 每次 commit 前都强制全量压缩，批处理收尾用合理，常驻流任务上会把写吞吐打到地板。流式想控读放大应改用 `full-compaction.delta-commits`（每 N 次 commit 全量一次）或 `compaction.optimization-interval`（走 EarlyFullCompaction）。
 
-### 核心概念解释
+**陷阱 5：MOW（deletion-vectors）下强行异步 compaction 致数据"刚写查不到"。** Lookup/DV 模式 L0 文件要等 compaction 推到高层、生成 DV 后才对读高效可见，`compactNotCompleted()` 会因 L0 非空返回 true 阻止 commit（`MergeTreeCompactManager.java:279`）。与 [01 §1.3 陷阱 8](01-核心存储引擎分析.md) 同源。
 
-**术语定义:**
-- **Sorted Run**: 一组按主键排序且 key 范围不重叠的文件集合。Level 0 每个文件是一个 run,Level 1+ 每层最多一个 run
-- **Compaction Trigger**: 触发压缩的阈值,默认 5 个 sorted run
-- **Stop Trigger**: 触发写入反压的阈值,默认 8 个 sorted run
-- **dropDelete**: 丢弃删除标记的优化,只有在确认没有更老版本时才能启用
+**陷阱 6：Append 表以为"只追加就不用压缩"。** 无主键也会小文件泛滥。有桶用 `BucketedAppendCompactManager`，无桶（Unaware-Bucket）必须有 `AppendCompactCoordinator`（独立/dedicated 压缩作业）才会自动压，否则文件无限堆积。小文件治理处方详见 [11](11-小文件治理机制.md)。
 
-**概念关系:**
-```
-写入 → MemTable → flush → Level 0 文件(新 Sorted Run)
-                              ↓
-                    sorted run 数量 > trigger
-                              ↓
-                        触发 Compaction
-                              ↓
-                    选择文件 → merge sort → 输出到高层
-                              ↓
-                    sorted run 数量减少 → 读放大降低
-```
+**陷阱 7：`changelog-producer=full-compaction` 不配触发间隔，changelog 数小时才出一次。** 该模式只在输出到最高层时产 changelog，若仅靠默认 `maxSizeAmp=200%` 触发全量，下游延迟极高。需配 `full-compaction.delta-commits` 或 `compaction.optimization-interval`，详见 [24 §full-compaction](24-Changelog机制全链路分析.md)。
 
-**与其他系统对比:**
-| 系统 | Compaction 策略 | 写放大 | 读放大 | 适用场景 |
-|------|----------------|--------|--------|---------|
-| Paimon | Universal Compaction | 低 | 中 | 写密集型实时数仓 |
-| RocksDB | Leveled Compaction | 高 | 低 | 读密集型 KV 存储 |
-| HBase | Size-Tiered | 中 | 高 | 时序数据 |
-| Iceberg | Snapshot-based | 极低 | 高 | 批处理场景 |
+### 1.4 Compaction 分类体系
 
-### 设计理念
+Paimon 按表类型与场景分了五类 compaction，本文逐一展开：
 
-**为什么这样设计:**
-Paimon 选择 Universal Compaction 而非 Leveled Compaction,核心原因是:
-1. **写入优先**: 实时数仓场景写入吞吐量是第一优先级,Universal 的写放大比 Leveled 低 50%
-2. **灵活性**: 通过 `EarlyFullCompaction`、`OffPeakHours` 等策略弥补读放大
-3. **简单性**: 不需要维护每层的大小比例,实现复杂度降低
+| 类别 | 适用场景 | 核心管理器/入口 | 是否 merge sort |
+|------|---------|----------------|-----------------|
+| **MergeTree Compaction** | 主键表（KeyValueFileStore） | `MergeTreeCompactManager` + `UniversalCompaction`/`ForceUpLevel0Compaction` | 是（按主键归并） |
+| **Bucketed Append** | 有桶 Append 表 | `BucketedAppendCompactManager` | 否（拼接小文件） |
+| **Unaware-Bucket Append** | 无桶 Append 表 | `AppendCompactCoordinator`（中心化协调，常作为 dedicated 作业） | 否 |
+| **Clustering Compaction** | 主键表聚簇列优化 | `ClusteringCompactManager` | 两阶段：排序 + 多路归并 |
+| **Manifest Compaction** | 元数据层（manifest 文件） | `ManifestFileMerger` | Minor + Full，ADD/DELETE 对消 |
 
-**权衡取舍:**
-```java
-// 权衡 1: 写放大 vs 读放大
-// 选择: 允许 5-8 个 sorted run 存在,降低写放大
-// 代价: 查询需要合并 5-8 路数据
-int numSortedRunCompactionTrigger = 5; // 不是 2,也不是 10
-
-// 权衡 2: 空间放大 vs 写放大
-// 选择: 允许增量数据达到基线的 2 倍
-// 代价: 存储成本增加,但避免频繁全量压缩
-int maxSizeAmp = 200; // 200%
-```
-
-**架构演进:**
-- **v0.4**: 只有基础的 MergeTree Compaction
-- **v0.6**: 引入 Deletion Vector,支持 merge-on-read
-- **v0.8**: 引入 Clustering Compaction,优化聚簇列查询
-- **v1.0**: 引入 Lookup 模式,支持高性能点查
-- **v1.5**: 引入 OffPeakHours 和 EarlyFullCompaction,自适应压缩
-
-**业界对比:**
-Paimon 的创新点在于:
-1. **策略组合**: Universal + ForceUpLevel0 + EarlyFull + OffPeakHours 的四层决策
-2. **DV 集成**: Deletion Vector 与 Compaction 深度集成,支持 merge-on-read
-3. **Changelog 生成**: Compaction 过程中生成 changelog,支持 CDC 场景
-
-### 1.1 为什么需要 Compaction
-
-Paimon 的存储引擎基于 LSM-Tree（Log-Structured Merge-Tree）架构。这种架构的核心特征是：写入操作首先进入内存中的 Write Buffer（MemTable），当 MemTable 写满后 flush 到磁盘上形成一个新的有序文件（SSTable/Sorted Run）。随着写入不断进行，磁盘上会积累大量文件。
-
-**不做 Compaction 会产生三个问题：**
-
-1. **读放大（Read Amplification）**：查询时需要扫描所有层级的文件，合并出最终结果。文件越多，读取开销越大。
-2. **空间放大（Space Amplification）**：同一条记录可能在多个文件中存在不同版本（INSERT、UPDATE、DELETE），占用额外存储空间。
-3. **写放大（Write Amplification）**：Compaction 本身会重写数据，但不做 Compaction 会导致后续的合并代价更大。
-
-**Compaction 的本质是以可控的写放大换取读放大和空间放大的降低。**
-
-### 1.2 Paimon 的 Compaction 分类体系
-
-Paimon 根据表类型和使用场景，设计了四大类 Compaction：
-
-| 类别 | 适用场景 | 核心管理器 | 策略 |
-|------|---------|-----------|------|
-| **MergeTree Compaction** | 主键表（KeyValueFileStore） | `MergeTreeCompactManager` | `UniversalCompaction` / `ForceUpLevel0Compaction` |
-| **Append Compaction** | Append-Only 表（有 Bucket） | `BucketedAppendCompactManager` | 基于文件数/大小的 BestEffort |
-| **Unaware-Bucket Compaction** | Append-Only 表（无 Bucket） | `AppendCompactCoordinator` | 基于分区的协调式压缩 |
-| **Clustering Compaction** | 主键表（聚簇列优化） | `ClusteringCompactManager` | 两阶段：排序 + 合并 |
-| **Manifest Compaction** | 元数据层 | `ManifestFileMerger` | Minor + Full Compaction |
-
-### 1.3 核心设计原则
-
-**为什么采用异步执行模型？**
-
-Paimon 的 Compaction 全部通过 `ExecutorService` 提交到独立线程执行。这样做的好处是：
-- 写入线程不会被 Compaction 阻塞（除非触发反压）
-- 可以控制并发度，避免资源争用
-- 支持取消正在执行的任务（`cancelCompaction()`）
-
-**为什么采用策略模式？**
-
-`CompactStrategy` 接口允许不同场景使用不同的文件选择逻辑，而执行层（`CompactTask`）和管理层（`CompactManager`）保持不变。这种解耦使得添加新策略（如 `EarlyFullCompaction`、`OffPeakHours`）不需要修改已有代码。
+异步执行是共性：所有压缩都通过 `ExecutorService` 提交到独立线程，写入线程不被阻塞（除非触发反压）。策略与执行解耦（`CompactStrategy` 选文件、`CompactTask` 执行）使得新增 `EarlyFullCompaction`/`OffPeakHours` 无需改动执行层。
 
 ---
 
-## 2. 核心抽象层:CompactManager 体系
+## 2. 核心抽象层：CompactManager 体系
 
-### 解决什么问题
+**① 要解决什么问题**
 
-**核心业务问题:**
-CompactManager 解决的是"谁来管理 Compaction 的生命周期"的问题。在多线程环境下,需要协调:
-- Writer 线程触发压缩
-- CompactTask 线程执行压缩
-- Checkpoint 线程等待压缩完成
-- 反压机制阻塞写入
+多线程下 compaction 必须协调四方：Writer 线程触发、CompactTask 线程执行、commit/checkpoint 线程等待完成、反压机制阻塞写入。如果没有统一的管理器，每个 Writer 各自 `compact()` 会重复压同一批文件、commit 提交了未完成的状态导致丢文件。`CompactManager` 把这套生命周期收敛成一个接口协议，并通过"每个 manager 同时只跑一个任务"的约束把并发控制压到最简。
 
-**没有这个设计的后果:**
-```java
-// 没有 CompactManager 的混乱场景:
-// Thread 1: Writer 直接调用 compact(),阻塞写入
-compact(files); // 阻塞 30 秒
+**② 设计原理与取舍**
 
-// Thread 2: 另一个 Writer 也触发 compact(),重复压缩同一批文件
-compact(files); // 浪费资源
+三个关键决策：
 
-// Thread 3: Checkpoint 不知道压缩是否完成,提交了不一致的状态
-checkpoint(); // 数据不一致
-```
+- **接口抽象**：主键表/Append 表/聚簇表实现各异，但对外协议统一，写入侧只认 `CompactManager`。
+- **异步 + Future（不是 Callback）**：`ExecutorService` 解耦写入与压缩线程；用 `Future` 而非回调，让调用方自己选阻塞还是轮询——commit 前用阻塞保一致，flush 后用非阻塞不挡写。
+- **单任务串行**：`if (taskFuture != null) return;` 保证一个 manager 同时只有一个压缩任务在跑，避免多任务抢同一批文件。压缩吞吐受限，但通过多 bucket（每桶一个独立 LSM 和 manager）横向并行补回来。
 
-**实际场景:**
-某金融公司的交易表,10 个并发 Writer 同时写入。没有 CompactManager 时,每个 Writer 独立触发压缩,导致同一批文件被压缩 10 次,集群 CPU 打满,写入吞吐量下降 90%。
+### 2.1 CompactManager 接口：生命周期协议
 
-### 有什么坑
+`compact/CompactManager.java:29` 定义了完整协议。每个方法对应一个明确职责：
 
-**误区陷阱:**
-1. **忘记调用 getCompactionResult()**: 压缩完成后不获取结果,导致 Levels 数据结构不更新,sorted run 数量一直增长
-2. **blocking=false 的误用**: 在 commit 前用 `getCompactionResult(false)`,可能获取不到结果导致数据不一致
-3. **cancelCompaction() 的孤儿文件**: 取消后新文件已写入但未注册到 Levels,成为孤儿文件
+| 方法 | 行号 | 职责 / 为什么需要 |
+|------|------|------------------|
+| `shouldWaitForLatestCompaction()` | `:32` | 写入**硬反压**判断：run 数超 stop-trigger 必须等压缩 |
+| `shouldWaitForPreparingCheckpoint()` | `:34` | checkpoint 前等待判断，阈值比硬反压多 1（留缓冲） |
+| `addNewFile(file)` | — | flush 后注册新 L0 文件 |
+| `triggerCompaction(fullCompaction)` | `:46` | 由 flush 或 commit 驱动触发 |
+| `getCompactionResult(blocking)` | `:49` | 取结果，阻塞/非阻塞两种模式 |
+| `cancelCompaction()` | — | 优雅停机/任务切换时取消 |
+| `compactNotCompleted()` | `:59` | 完成状态检查；Lookup 模式下用它确保 L0 被消费 |
 
-**错误使用示例:**
-```java
-// 错误 1: 触发后不获取结果
-compactManager.triggerCompaction(false);
-// 忘记调用 getCompactionResult(),Levels 永远不更新
+### 2.2 CompactFutureManager：异步与取消
 
-// 错误 2: commit 前用非阻塞模式
-compactManager.triggerCompaction(false);
-Optional<CompactResult> result = compactManager.getCompactionResult(false);
-if (result.isEmpty()) {
-    commit(); // 危险! 压缩未完成就提交,可能丢失文件
-}
-
-// 错误 3: 取消后立即触发新压缩
-compactManager.cancelCompaction();
-compactManager.triggerCompaction(false); // taskFuture 还未清理,触发失败
-```
-
-**生产环境注意事项:**
-- 必须在 commit 前调用 `getCompactionResult(true)` 确保压缩完成
-- 监控 `compactionQueuedCount` 指标,持续非零说明压缩线程池不够
-- 优雅停机时必须调用 `cancelCompaction()` 避免资源泄漏
-
-**性能陷阱:**
-```java
-// 陷阱: 频繁轮询 getCompactionResult(false)
-while (true) {
-    Optional<CompactResult> result = compactManager.getCompactionResult(false);
-    if (result.isPresent()) break;
-    Thread.sleep(100); // 浪费 CPU
-}
-// 应该直接用 blocking=true
-```
-
-### 核心概念解释
-
-**术语定义:**
-- **CompactManager**: 压缩管理器接口,定义了压缩的完整生命周期协议
-- **CompactFutureManager**: 基于 Future 的管理器基类,封装了异步执行逻辑
-- **CompactTask**: 压缩任务执行单元,实现 Callable 接口
-- **CompactResult**: 压缩结果,包含 before/after 文件列表和 changelog
-
-**概念关系:**
-```
-CompactManager (接口)
-    ↓ 继承
-CompactFutureManager (抽象类)
-    ↓ 继承
-MergeTreeCompactManager (主键表实现)
-BucketedAppendCompactManager (Append 表实现)
-ClusteringCompactManager (聚簇压缩实现)
-
-CompactTask (抽象类)
-    ↓ 继承
-MergeTreeCompactTask (merge sort 任务)
-FileRewriteCompactTask (文件重写任务)
-AppendCompactTask (Append 表任务)
-```
-
-**与其他系统对比:**
-| 系统 | 管理模式 | 异步执行 | 反压机制 |
-|------|---------|---------|---------|
-| Paimon | CompactManager 接口 | ✓ ExecutorService | ✓ shouldWaitForLatestCompaction |
-| RocksDB | ColumnFamilyOptions | ✓ 后台线程 | ✓ level0_slowdown_writes_trigger |
-| HBase | CompactionManager | ✓ CompactionExecutor | ✓ hbase.hstore.blockingStoreFiles |
-| Iceberg | 无(外部调度) | ✗ 同步执行 | ✗ 无 |
-
-### 设计理念
-
-**为什么这样设计:**
-1. **接口抽象**: CompactManager 接口使得不同表类型(主键表/Append 表/聚簇表)可以有不同实现,但对外协议统一
-2. **异步执行**: 通过 ExecutorService 解耦写入线程和压缩线程,避免阻塞写入
-3. **Future 模式**: 使用 Future 而非 Callback,调用者可以选择阻塞或轮询,更灵活
-
-**权衡取舍:**
-```java
-// 权衡 1: 阻塞 vs 非阻塞
-// 选择: 提供 blocking 参数,由调用者决定
-Optional<CompactResult> getCompactionResult(boolean blocking);
-// 好处: commit 时用 true 确保一致性,flush 后用 false 不阻塞
-
-// 权衡 2: 单任务 vs 多任务并发
-// 选择: 每个 CompactManager 同时只运行一个任务
-if (taskFuture != null) return; // 已有任务运行中
-// 好处: 避免多个任务竞争同一批文件,简化并发控制
-// 代价: 压缩吞吐量受限,但可以通过多 bucket 并行
-```
-
-**架构演进:**
-- **v0.4**: 直接在 Writer 中同步执行压缩,阻塞写入
-- **v0.5**: 引入 CompactManager 接口,支持异步执行
-- **v0.7**: 引入 shouldWaitForLatestCompaction 反压机制
-- **v1.0**: 引入 shouldWaitForPreparingCheckpoint,优化 checkpoint 性能
-- **v1.2**: 引入 compactNotCompleted,支持 Lookup 模式的特殊判断
-
-**业界对比:**
-Paimon 的创新点:
-1. **统一接口**: 不同表类型共享同一套管理协议,降低学习成本
-2. **双阈值反压**: compaction-trigger 和 stop-trigger 分离,给压缩留出追赶时间
-3. **Checkpoint 感知**: shouldWaitForPreparingCheckpoint 避免 checkpoint 时阻塞过久
-
-### 2.1 CompactManager 接口
-
-**源码位置**：`paimon-core/src/main/java/org/apache/paimon/compact/CompactManager.java`
+`compact/CompactFutureManager.java:29` 用一个 `Future<CompactResult> taskFuture` 字段封装异步执行。核心是 `innerGetCompactionResult(blocking)`（`:47`）：
 
 ```java
-public interface CompactManager extends Closeable {
-    boolean shouldWaitForLatestCompaction();
-    boolean shouldWaitForPreparingCheckpoint();
-    void addNewFile(DataFileMeta file);
-    Collection<DataFileMeta> allFiles();
-    void triggerCompaction(boolean fullCompaction);
-    Optional<CompactResult> getCompactionResult(boolean blocking)
-            throws ExecutionException, InterruptedException;
-    void cancelCompaction();
-    boolean compactNotCompleted();
-}
-```
-
-**为什么这样设计？**
-
-这个接口定义了 Compaction 管理器的完整生命周期协议。每个方法都有明确的职责：
-
-| 方法 | 职责 | 为什么需要 |
-|------|------|-----------|
-| `shouldWaitForLatestCompaction()` | 写入反压判断 | 防止 sorted run 数量失控导致读性能退化 |
-| `shouldWaitForPreparingCheckpoint()` | Checkpoint 前的等待判断 | 确保数据一致性，避免 checkpoint 时有过多未压缩文件 |
-| `addNewFile()` | 新文件注册 | flush 后告知 CompactManager 有新文件需要参与压缩 |
-| `triggerCompaction()` | 触发压缩 | 由外部（Writer 的 flush 或 commit）驱动 |
-| `getCompactionResult()` | 获取结果 | 支持阻塞/非阻塞两种模式，灵活适配不同场景 |
-| `cancelCompaction()` | 取消任务 | 支持优雅停机和任务切换 |
-| `compactNotCompleted()` | 完成状态检查 | 用于 Lookup 模式下确保 level 0 文件被消费 |
-
-### 2.2 CompactFutureManager 基类
-
-**源码位置**：`paimon-core/src/main/java/org/apache/paimon/compact/CompactFutureManager.java`
-
-```java
-public abstract class CompactFutureManager implements CompactManager {
-    protected Future<CompactResult> taskFuture;
-
-    @Override
-    public void cancelCompaction() {
-        if (taskFuture != null && !taskFuture.isCancelled()) {
-            taskFuture.cancel(true);
-        }
-    }
-
-    @Override
-    public boolean compactNotCompleted() {
-        return taskFuture != null;
-    }
-
-    protected final Optional<CompactResult> innerGetCompactionResult(boolean blocking)
-            throws ExecutionException, InterruptedException {
-        if (taskFuture != null) {
-            if (blocking || taskFuture.isDone()) {
-                CompactResult result;
-                try {
-                    result = obtainCompactResult();
-                } catch (CancellationException e) {
-                    return Optional.empty();
-                } finally {
-                    taskFuture = null;
-                }
-                return Optional.of(result);
+protected final Optional<CompactResult> innerGetCompactionResult(boolean blocking) {
+    if (taskFuture != null) {
+        if (blocking || taskFuture.isDone()) {
+            try {
+                result = obtainCompactResult();      // 阻塞或已完成才取
+            } catch (CancellationException e) {
+                return Optional.empty();              // 被取消，吞掉
+            } finally {
+                taskFuture = null;                    // 只有取到结果才清空
             }
-        }
-        return Optional.empty();
-    }
-}
-```
-
-**为什么设计 `blocking` 参数？**
-
-- **blocking=true**：用于 commit 前、checkpoint 前等必须等待压缩完成的场景。
-- **blocking=false**：用于 triggerCompaction 后的轮询检查，不阻塞写入线程。
-
-**为什么 `cancelCompaction()` 后 `taskFuture` 不立即置 null？**
-
-这是一个值得注意的设计：取消后 `taskFuture` 仍然非 null，只有在 `innerGetCompactionResult()` 中 catch 到 `CancellationException` 后才清理。这确保了不会丢失正在执行中（已完成但未获取结果）的 CompactResult。源码中的 TODO 注释也指出了潜在的孤儿文件问题。
-
-### 2.3 CompactTask 执行单元
-
-**源码位置**：`paimon-core/src/main/java/org/apache/paimon/compact/CompactTask.java`
-
-```java
-public abstract class CompactTask implements Callable<CompactResult> {
-    @Override
-    public CompactResult call() throws Exception {
-        MetricUtils.safeCall(this::startTimer, LOG);
-        try {
-            long startMillis = System.currentTimeMillis();
-            CompactResult result = doCompact();
-            // 上报 metrics：耗时、输入/输出大小、完成计数
-            MetricUtils.safeCall(() -> {
-                if (metricsReporter != null) {
-                    metricsReporter.reportCompactionTime(System.currentTimeMillis() - startMillis);
-                    metricsReporter.increaseCompactionsCompletedCount();
-                    metricsReporter.reportCompactionInputSize(...);
-                    metricsReporter.reportCompactionOutputSize(...);
-                }
-            }, LOG);
-            return result;
-        } finally {
-            MetricUtils.safeCall(this::stopTimer, LOG);
-            MetricUtils.safeCall(this::decreaseCompactionsQueuedCount, LOG);
+            return Optional.of(result);
         }
     }
-
-    protected abstract CompactResult doCompact() throws Exception;
+    return Optional.empty();
 }
 ```
 
-**为什么实现 `Callable<CompactResult>` 而非 `Runnable`？**
+**④ 风险 / 陷阱 / 边界**
 
-`Callable` 支持返回值和异常传播。CompactTask 需要返回 `CompactResult`（包含压缩前后的文件列表），并且执行中的异常需要传播给调用者以触发重试或失败处理。
+- **`blocking` 参数误用**：commit/checkpoint 前必须 `blocking=true`，否则可能拿不到结果就提交、丢失已压缩文件。flush 后的轮询才用 `false`。
+- **取消后 `taskFuture` 不立即置 null**：`cancelCompaction()`（`:34`）只调 `cancel(true)`，`taskFuture` 仍非 null，要等 `innerGetCompactionResult` 捕获 `CancellationException` 后才清。这是刻意的——避免丢失"已执行完但还没取结果"的 `CompactResult`。源码 TODO 也提示了取消后新文件可能已写入但未注册、成为孤儿文件的边界。
 
-**为什么 metrics 上报使用 `MetricUtils.safeCall()`？**
+### 2.3 CompactTask / CompactUnit / CompactResult
 
-metrics 上报不应该因为异常导致压缩任务失败。`safeCall()` 会 catch 异常并仅记录日志，保证核心逻辑不受影响。
+**CompactTask**（`compact/CompactTask.java:34`）实现 `Callable<CompactResult>` 而非 `Runnable`——因为要返回压缩前后文件列表，且执行异常需传播给调用者触发重试。`call()`（`:45`）的骨架是"开计时 → `doCompact()` → 上报 metrics（耗时/输入输出大小/完成计数）→ 关计时 + 队列计数减一"，metrics 全部用 `MetricUtils.safeCall()` 包住，保证监控异常不拖垮压缩本身。子类只实现 `doCompact()`（`:116`）。
 
-### 2.4 CompactUnit 与 CompactResult
+**CompactUnit**（输入）三要素：`outputLevel`（输出到哪层）、`files`（参与的文件）、`fileRewrite`（是否文件级重写而非 merge sort）。`fileRewrite=true` 时走 `FileRewriteCompactTask`（逐文件重写，免排序），用于 full compaction 中只需单独重写过期/带 DV 的最高层文件的场景（见 §5.5、§6）。
 
-**CompactUnit** 描述了一次压缩任务的输入：
-
-```java
-public class CompactUnit {
-    private final int outputLevel;        // 输出到哪个 level
-    private final List<DataFileMeta> files; // 参与压缩的文件列表
-    private final boolean fileRewrite;     // 是否是文件级重写（非 merge sort）
-}
-```
-
-**为什么需要 `fileRewrite` 标志？**
-
-Full Compaction 中某些文件只需要单独重写（例如清理过期记录或 Deletion Vector），不需要与其他文件做 merge sort。`fileRewrite=true` 时会创建 `FileRewriteCompactTask` 而非 `MergeTreeCompactTask`，避免不必要的排序开销。
-
-**CompactResult** 描述了压缩的输出：
-
-```java
-public class CompactResult {
-    private final List<DataFileMeta> before;   // 被压缩的原始文件
-    private final List<DataFileMeta> after;    // 压缩产生的新文件
-    private final List<DataFileMeta> changelog; // 压缩产生的 changelog 文件
-    @Nullable private CompactDeletionFile deletionFile; // Deletion Vector 变更
-}
-```
-
-**为什么 `before` 和 `after` 都用 mutable List？**
-
-`CompactResult` 支持 `merge()` 方法，将多个结果合并。`MergeTreeCompactTask.doCompact()` 中，多个 section 的 rewrite 结果会逐步 merge 到一个 CompactResult 中，因此需要 mutable list。
+**CompactResult**（输出）四要素：`before`（被压文件）、`after`（新文件）、`changelog`（顺带产的 changelog 文件）、`deletionFile`（DV 变更）。`before`/`after` 用 mutable List 是因为 `MergeTreeCompactTask.doCompact()` 里多个 section 的结果要逐步 `merge()` 进同一个 result。
 
 ---
 
-## 3. LSM-Tree 数据结构基础
+## 3. LSM 数据结构基础（交叉引用 01）
 
-### 解决什么问题
+Levels / SortedRun / LevelSortedRun / Level 0 用 TreeSet（按 maxSequenceNumber 降序）等数据结构的设计取舍，详见 [01 §3 LSM 数据结构](01-核心存储引擎分析.md)，本文不重复展开，只补两个**直接驱动 compaction 的点**。
 
-**核心业务问题:**
-Levels 数据结构解决的是"如何高效管理多层文件"的问题。在 LSM-Tree 中,需要:
-- 快速查找某个 key 在哪些文件中(读取路径)
-- 快速选择需要压缩的文件(压缩路径)
-- 原子更新文件列表(并发安全)
-- 维护 Level 0 的有序性(按 sequence number)
+### 3.1 Levels 与 numberOfSortedRuns
 
-**没有这个设计的后果:**
-```java
-// 没有 Levels 的混乱场景:
-List<DataFileMeta> allFiles = new ArrayList<>(); // 所有文件扁平存储
-
-// 读取时需要扫描所有文件
-for (DataFileMeta file : allFiles) {
-    if (keyInRange(key, file.minKey(), file.maxKey())) {
-        read(file); // 无法利用层级信息优化
-    }
-}
-
-// 压缩时无法判断哪些文件需要合并
-// 无法保证 Level 1+ 每层只有一个 SortedRun 的不变量
-```
-
-**实际场景:**
-某物流公司的轨迹表,每秒写入 50000 条记录。没有 Levels 管理时,查询某个订单的轨迹需要扫描 10000 个文件,耗时 5 秒。引入 Levels 后,通过层级信息快速定位到 3 个文件,耗时降到 50ms。
-
-### 有什么坑
-
-**误区陷阱:**
-1. **误以为 Level 0 是无序的**: Level 0 按 maxSequenceNumber 降序排列,不是随机顺序
-2. **忽略 DropFileCallback**: Lookup 模式下不注册 callback,导致缓存未清理,查询返回旧数据
-3. **直接修改 level0 TreeSet**: TreeSet 不是线程安全的,并发修改导致 ConcurrentModificationException
-
-**错误使用示例:**
-```java
-// 错误 1: 直接修改 level0
-TreeSet<DataFileMeta> level0 = levels.level0();
-level0.add(newFile); // 危险! 应该通过 update() 方法
-
-// 错误 2: 忘记注册 DropFileCallback
-Levels levels = new Levels(keyComparator, ...);
-// 没有调用 levels.addDropFileCallback(callback)
-// Lookup 缓存永远不会被清理
-
-// 错误 3: 误判 numberOfSortedRuns
-int runs = levels.level0().size(); // 错误! 没有加上高层的 run
-// 应该用 levels.numberOfSortedRuns()
-```
-
-**生产环境注意事项:**
-- 监控 `numberOfSortedRuns()`,超过 stop-trigger 说明压缩跟不上
-- Lookup 模式必须注册 DropFileCallback,否则内存泄漏
-- update() 方法不是原子的,必须在单线程(Writer 线程)中调用
-
-**性能陷阱:**
-```java
-// 陷阱: 频繁调用 levelSortedRuns()
-for (int i = 0; i < 1000; i++) {
-    List<LevelSortedRun> runs = levels.levelSortedRuns(); // 每次都重新构建列表
-    strategy.pick(numLevels, runs);
-}
-// 应该缓存 runs 列表
-```
-
-### 核心概念解释
-
-**术语定义:**
-- **Levels**: 多层文件管理器,维护 Level 0 到 Level N 的所有文件
-- **SortedRun**: 一组按 key 排序且 key 范围不重叠的文件集合
-- **LevelSortedRun**: 带层级信息的 SortedRun
-- **IntervalPartition**: 区间分区算法,将重叠文件划分为独立的 section
-
-**概念关系:**
-```
-Levels
-├── level0: TreeSet<DataFileMeta>  (每个文件一个 run)
-└── levels: List<SortedRun>         (每层最多一个 run)
-
-SortedRun
-├── files: List<DataFileMeta>       (不可变列表)
-└── totalSize: long                 (总大小)
-
-LevelSortedRun
-├── level: int                      (层级)
-└── run: SortedRun                  (文件集合)
-```
-
-**与其他系统对比:**
-| 系统 | Level 0 结构 | Level 1+ 结构 | 不变量 |
-|------|-------------|--------------|--------|
-| Paimon | TreeSet(按 seqNum) | List<SortedRun> | 每层最多 1 个 run |
-| RocksDB | vector<FileMetaData*> | vector<FileMetaData*> | 每层文件 key 范围不重叠 |
-| HBase | List<StoreFile> | 无(只有一层) | 无 |
-| Cassandra | List<SSTable> | List<SSTable> | 每层大小是上层的 10 倍 |
-
-### 设计理念
-
-**为什么这样设计:**
-1. **Level 0 用 TreeSet**: 保证文件按 sequence number 有序,方便策略判断。TreeSet 的多级比较器避免了相同 seqNum 的文件被误去重
-2. **Level 1+ 用 List<SortedRun>**: 每层最多一个 run 是 Universal Compaction 的核心不变量,简化读取时的合并逻辑
-3. **不可变 SortedRun**: 所有变更通过创建新实例完成,避免并发修改问题
-
-**权衡取舍:**
-```java
-// 权衡 1: TreeSet vs List for Level 0
-// 选择: TreeSet,自动排序
-TreeSet<DataFileMeta> level0 = new TreeSet<>(comparator);
-// 好处: 插入时自动排序,策略可以依赖顺序
-// 代价: 插入是 O(log n),但 Level 0 文件数量有限(< 10)
-
-// 权衡 2: 可变 vs 不可变 SortedRun
-// 选择: 不可变,所有变更创建新实例
-SortedRun newRun = SortedRun.fromSorted(newFiles);
-// 好处: 线程安全,CompactTask 读取时不会被修改
-// 代价: 每次 update 都创建新对象,但对象很小
-```
-
-**架构演进:**
-- **v0.4**: 简单的 List<List<DataFileMeta>>,无序
-- **v0.5**: 引入 Levels 类,Level 0 用 TreeSet 排序
-- **v0.7**: 引入 DropFileCallback,支持 Lookup 缓存清理
-- **v1.0**: 引入 IntervalPartition 算法,优化 section 划分
-- **v1.3**: 优化 TreeSet 比较器,支持多 Writer 并发写入
-
-**业界对比:**
-Paimon 的创新点:
-1. **TreeSet 的多级比较器**: 通过 maxSeqNum、minSeqNum、creationTime、fileName 四级比较,避免误去重
-2. **DropFileCallback 机制**: 支持外部组件(如 Lookup 缓存)感知文件删除
-3. **upgrade 优化**: update() 方法会排除 upgrade 的文件,避免误触发 drop 通知
-
-### 3.1 Levels:多层文件管理
-
-**源码位置**：`paimon-core/src/main/java/org/apache/paimon/mergetree/Levels.java`
-
-`Levels` 是 LSM-Tree 的核心数据结构，管理所有层级的文件。
-
-```java
-public class Levels {
-    private final Comparator<InternalRow> keyComparator;
-    private final TreeSet<DataFileMeta> level0;   // Level 0：每个文件一个 SortedRun
-    private final List<SortedRun> levels;          // Level 1+：每个 level 一个 SortedRun
-}
-```
-
-**Level 0 的特殊性：**
-
-Level 0 使用 `TreeSet` 存储，排序规则为：
-1. 首先按 `maxSequenceNumber` 降序（新文件在前）
-2. 其次按 `minSequenceNumber` 升序
-3. 再按 `creationTime` 排序
-4. 最后按 `fileName` 排序（确保 TreeSet 唯一性）
-
-**为什么 Level 0 使用 TreeSet 而非 List？**
-
-- 保证文件按 sequence number 有序，方便 Compaction 选择策略判断
-- 多 Writer 并发写入时可能产生相同 maxSequenceNumber 的文件，TreeSet 的多级比较器避免了误去重
-
-**为什么 Level 1+ 每个 level 只有一个 SortedRun？**
-
-这是 Universal Compaction 的核心不变量：除了 Level 0 外，每个 level 最多有一个 SortedRun（内部文件 key 范围不重叠）。这大幅简化了读取时的合并逻辑。
-
-**`numberOfSortedRuns()` 的计算逻辑：**
+`numberOfSortedRuns()` 是 compaction 的"血压计"：
 
 ```java
 public int numberOfSortedRuns() {
-    int numberOfSortedRuns = level0.size();   // 每个 L0 文件算一个 run
+    int n = level0.size();                 // 每个 L0 文件算一个 run（key 范围重叠）
     for (SortedRun run : levels) {
-        if (run.nonEmpty()) {
-            numberOfSortedRuns++;              // 每个非空高层 level 算一个 run
-        }
+        if (run.nonEmpty()) n++;           // 每个非空高层 level 算一个 run（内部不重叠）
     }
-    return numberOfSortedRuns;
+    return n;
 }
 ```
 
-这个值直接关系到触发压缩（`numSortedRunCompactionTrigger`）和写入反压（`numSortedRunStopTrigger`）的判断。
+这个值同时驱动两个阈值：`numberOfSortedRuns() > compaction-trigger(5)` 触发 minor compaction，`> stop-trigger(8)` 触发写入硬反压（§4.3）。**关键不变量**：除 L0 外每层最多一个 SortedRun，这是 Universal Compaction 的核心约束，使读取归并逻辑大幅简化。
 
-**`update()` 方法——原子更新 Levels：**
+`Levels.update(before, after)` 在 **Writer 线程**（非压缩线程）中原子更新层级，并通知 `DropFileCallback`——但会先把同时出现在 before/after 的文件（即 upgrade 只改 level 的）排除，因为物理文件还在、不能通知"已删除"。这个回调是 Lookup 模式清理本地索引缓存的机制（详见 [01 §6 LookupLevels](01-核心存储引擎分析.md)）。
 
-```java
-public void update(List<DataFileMeta> before, List<DataFileMeta> after) {
-    Map<Integer, List<DataFileMeta>> groupedBefore = groupByLevel(before);
-    Map<Integer, List<DataFileMeta>> groupedAfter = groupByLevel(after);
-    for (int i = 0; i < numberOfLevels(); i++) {
-        updateLevel(i, groupedBefore.getOrDefault(i, emptyList()),
-                       groupedAfter.getOrDefault(i, emptyList()));
-    }
-    // 通知 DropFileCallback（用于 Lookup 缓存清理等）
-    if (dropFileCallbacks.size() > 0) {
-        Set<String> droppedFiles = before.stream().map(DataFileMeta::fileName).collect(toSet());
-        // 排除 upgrade 的文件（即同时出现在 before 和 after 中的文件）
-        after.stream().map(DataFileMeta::fileName).forEach(droppedFiles::remove);
-        for (DropFileCallback callback : dropFileCallbacks) {
-            droppedFiles.forEach(callback::notifyDropFile);
-        }
-    }
-}
-```
+> **陷阱**：`update()` 非线程安全，必须只在单一 Writer 线程调用；不要直接操作 `level0()` 的 TreeSet。判断 run 总数要用 `numberOfSortedRuns()` 而非 `level0().size()`（后者漏掉高层）。
 
-**为什么需要 DropFileCallback？**
+### 3.2 IntervalPartition：区间分区
 
-在 Lookup 模式下，`LookupLevels` 会为每个文件维护本地索引缓存。当文件被 Compaction 替换后，需要清理对应的缓存。`DropFileCallback` 提供了这个通知机制。注意，upgrade 操作（只改 level 不改物理文件）不会触发 drop 通知，因为物理文件仍然存在。
+`mergetree/compact/IntervalPartition.java` 是 `MergeTreeCompactTask` 把选中文件切成"互不重叠 section"的算法：按 `(minKey, maxKey)` 排序后遍历，新文件 minKey 超出当前 section 右界就切新 section，section 内用贪心装入最少数量的 SortedRun。
 
-### 3.2 SortedRun 与 LevelSortedRun
-
-**SortedRun** 是一组按 key 排序且 key 范围不重叠的文件集合：
-
-```java
-public class SortedRun {
-    private final List<DataFileMeta> files;  // 不可变列表
-    private final long totalSize;
-}
-```
-
-**为什么 SortedRun 的 files 是不可变的？**
-
-不可变性保证了在 Compaction 读取文件列表的过程中不会被并发修改。所有对 SortedRun 的变更都通过创建新的 SortedRun 实例完成。
-
-**LevelSortedRun** 为 SortedRun 附加了 level 信息：
-
-```java
-public class LevelSortedRun {
-    private final int level;
-    private final SortedRun run;
-}
-```
-
-`Levels.levelSortedRuns()` 方法返回从 Level 0 到最高层的所有 LevelSortedRun 列表，这是 CompactStrategy 的输入。
-
-### 3.3 IntervalPartition：区间分区算法
-
-**源码位置**：`paimon-core/src/main/java/org/apache/paimon/mergetree/compact/IntervalPartition.java`
-
-IntervalPartition 是 `MergeTreeCompactTask` 中将参与压缩的文件分成不重叠 section 的核心算法。
-
-**算法步骤：**
-
-1. 将所有文件按 `(minKey, maxKey)` 排序
-2. 遍历文件，当新文件的 minKey > 当前 section 的右边界时，切分出新 section
-3. 在每个 section 内部，使用贪心算法将文件分配到最少数量的 SortedRun
-
-**为什么需要区间分区？**
-
-同一次 Compaction 选中的文件可能覆盖不同的 key 范围。区间分区将它们划分为独立的 section，每个 section 可以独立进行 merge sort。这有两个好处：
-1. **减少合并规模**：不需要一次性合并所有文件
-2. **支持部分 upgrade**：对于单个 SortedRun 的 section，可以直接 upgrade level 而不需要 rewrite
+**为什么要切 section**：一次 compaction 选中的文件可能覆盖不同 key 范围。例如 A[1,100]、B[50,150]、C[200,300]——C 与 A/B 无重叠。不分区就得三个文件一起 merge sort；分区后 {A,B} 一个 section 做归并、{C} 单独成 section 可直接 upgrade（零 I/O）。当 C 是大文件时，省下的就是整文件重写的代价。这是 §6 大文件 upgrade 优化的前提。
 
 ---
 
-## 4. 主键表 Compaction:MergeTreeCompactManager
+## 4. 主键表 Compaction：MergeTreeCompactManager
 
-### 解决什么问题
+`mergetree/compact/MergeTreeCompactManager.java:54` 是主键表（KeyValueFileStore）的压缩管理器，继承 `CompactFutureManager`。它把策略选择（`CompactStrategy`）、执行（`CompactTask`）、DV 维护（`BucketedDvMaintainer`）、记录级过期（`RecordLevelExpire`）协调起来。关键字段（`:62`–`:71`）：`compactionFileSize`（小文件分界）、`numSortedRunStopTrigger`（反压阈值）、`lazyGenDeletionFile`、`needLookup`、`forceRewriteAllFiles`、`forceKeepDelete`。
 
-**核心业务问题:**
-MergeTreeCompactManager 解决的是"主键表如何高效压缩"的问题。主键表的特点是:
-- 需要按主键 merge sort,保证同一主键只有一条最新记录
-- 需要处理 UPDATE/DELETE 操作,合并多个版本
-- 需要支持 Deletion Vector,实现 merge-on-read
-- 需要生成 changelog,支持 CDC 场景
+### 4.1 triggerCompaction：full vs minor 两条路
 
-**没有这个设计的后果:**
+`triggerCompaction(boolean fullCompaction)`（`:133`）是唯一入口，但按 `fullCompaction` 分成两条完全不同的路：
+
 ```java
-// 没有 MergeTreeCompactManager 的混乱场景:
-// 场景 1: 手动触发压缩,无法控制时机
-while (true) {
-    if (files.size() > 10) {
-        compact(files); // 何时触发? 如何选择文件?
-    }
+if (fullCompaction) {
+    Preconditions.checkState(taskFuture == null,
+        "A compaction task is still running while the user forces a new compaction.");
+    optionalUnit = CompactStrategy.pickFullCompaction(   // 静态方法，选全部/按需文件
+        levels.numberOfLevels(), runs, recordLevelExpire, dvMaintainer, forceRewriteAllFiles);
+} else {
+    if (taskFuture != null) return;                       // minor：已有任务就跳过
+    optionalUnit = strategy.pick(levels.numberOfLevels(), runs)   // 策略选 run
+        .filter(unit -> !unit.files().isEmpty())
+        .filter(unit -> unit.files().size() > 1 || unit.files().get(0).level() != unit.outputLevel());
 }
-
-// 场景 2: 无法处理删除标记
-for (KeyValue kv : mergedData) {
-    writer.write(kv); // DELETE 记录也写入,永远无法删除
-}
-
-// 场景 3: 无法生成 changelog
-// Lookup 模式需要 changelog,但不知道如何生成
 ```
 
-**实际场景:**
-某电商公司的用户表,每天有 1000 万次更新。没有 MergeTreeCompactManager 时,同一用户的 100 个版本都保留在磁盘上,存储成本增加 100 倍。引入后,通过 merge sort 和 dropDelete,只保留最新版本,存储成本降低 99%。
+| 维度 | full compaction | minor（增量）compaction |
+|------|-----------------|-------------------------|
+| 入口 | `fullCompaction=true`（commit.force-compact / delta-commits / 手动 / dedicated 作业） | flush 后或常规驱动 |
+| 选文件 | `CompactStrategy.pickFullCompaction`（静态，与具体策略无关） | `strategy.pick`（Universal 三级决策） |
+| 并发约束 | **`checkState(taskFuture == null)`** —— 必须没有在跑的任务 | `if (taskFuture != null) return;` —— 静默跳过 |
+| 输出 level | 最高层（除"空操作"优化外，见 §5.5） | 由 `createUnit` 算，绝不输出 L0 |
+| 过滤 | 无 | 过滤掉空 unit 和"单文件且 level 未变"的无效 unit |
 
-### 有什么坑
+**为什么 full 必须断言 `taskFuture==null`，minor 却静默跳过？** full compaction 涉及所有文件，不能与一个只动部分文件的 minor 任务并行（会读到不一致的 Levels 视图），所以宁可抛断言失败暴露问题。minor 是"机会性"的，已有任务在跑就跳过、等下次 flush 再来，无需报错。这也意味着上层调 full 前必须先 `getCompactionResult(true)` 把在跑的任务收干净。
 
-**误区陷阱:**
-1. **误以为 dropDelete 总是安全的**: 输出到 Level 0 时不能 dropDelete,否则会丢失删除信息
-2. **Full Compaction 时不检查 taskFuture**: 直接触发 Full Compaction,与正在运行的增量压缩冲突
-3. **忘记处理 DV**: 启用 DV 后不调用 dvMaintainer,导致删除记录无法被清理
+### 4.2 dropDelete：丢删除标记的不变量
 
-**错误配置示例:**
-```sql
--- 错误 1: 强制保留删除标记
-ALTER TABLE my_table SET ('compaction.force-keep-delete' = 'true');
--- 后果: 删除记录永远不会被清理,存储空间持续增长
+选中 unit 后立刻算 `dropDelete`（`:179`），决定这次压缩能否把 DELETE 记录真正扔掉：
 
--- 错误 2: stop-trigger 设置过大
-ALTER TABLE my_table SET ('num-sorted-run.stop-trigger' = '1000');
--- 后果: sorted run 数量失控,查询性能退化,最终 OOM
-
--- 错误 3: Lookup 模式下禁用 ForceUpLevel0
-ALTER TABLE my_table SET ('compaction.force-up-level-0' = 'false');
--- 后果: Level 0 文件堆积,点查性能下降 10 倍
-```
-
-**生产环境注意事项:**
-- 监控 `avgLevel0FileCount`,持续 > 5 说明压缩跟不上写入
-- DV 模式下必须配置 `deletion-vectors.index-file.size`,默认 10MB
-- Lookup 模式下 `compactNotCompleted()` 必须返回 false 才能 commit
-
-**性能陷阱:**
 ```java
-// 陷阱 1: 频繁触发 Full Compaction
-for (int i = 0; i < 100; i++) {
-    compactManager.triggerCompaction(true); // 每次都全量压缩
-    compactManager.getCompactionResult(true); // 阻塞 30 秒
-}
-// 应该用增量压缩,只在必要时全量
-
-// 陷阱 2: 不等待压缩完成就 commit
-compactManager.triggerCompaction(false);
-commit(); // 危险! 压缩未完成,Levels 未更新
-```
-
-### 核心概念解释
-
-**术语定义:**
-- **MergeTreeCompactManager**: 主键表压缩管理器,协调触发、执行、结果收集
-- **compactionFileSize**: 文件大小阈值,等于 targetFileSize * 0.7
-- **dropDelete**: 是否丢弃删除标记的标志
-- **forceRewriteAllFiles**: 是否强制重写所有文件(外部路径同步场景)
-
-**概念关系:**
-```
-MergeTreeCompactManager
-├── levels: Levels                    (多层文件结构)
-├── strategy: CompactStrategy         (文件选择策略)
-├── rewriter: CompactRewriter         (文件重写器)
-├── dvMaintainer: BucketedDvMaintainer (DV 维护器)
-└── recordLevelExpire: RecordLevelExpire (记录级过期)
-
-触发流程:
-triggerCompaction() → strategy.pick() → submitCompaction()
-    → executor.submit(CompactTask) → taskFuture
-
-结果收集:
-getCompactionResult() → innerGetCompactionResult() → levels.update()
-```
-
-**与其他系统对比:**
-| 系统 | 压缩管理器 | 策略选择 | DV 支持 | Changelog 生成 |
-|------|-----------|---------|---------|---------------|
-| Paimon | MergeTreeCompactManager | 可插拔策略 | ✓ | ✓ |
-| RocksDB | DBImpl | 内置 Leveled/Universal | ✗ | ✗ |
-| HBase | CompactionManager | Size-Tiered | ✗ | ✗ |
-| Delta Lake | OptimizeExecutor | Bin-Packing | ✓ | ✗ |
-
-### 设计理念
-
-**为什么这样设计:**
-1. **策略与执行分离**: CompactStrategy 负责选择文件,CompactTask 负责执行,职责清晰
-2. **dropDelete 的复杂判断**: 确保删除标记只在安全时才丢弃,避免数据不一致
-3. **DV 延迟生成**: lazyGenDeletionFile 模式下,DV 在压缩完成后才生成,避免信息过时
-
-**权衡取舍:**
-```java
-// 权衡 1: 何时 dropDelete
-// 选择: outputLevel >= nonEmptyHighestLevel || dvMaintainer != null
 boolean dropDelete = !forceKeepDelete
         && unit.outputLevel() != 0
         && (unit.outputLevel() >= levels.nonEmptyHighestLevel() || dvMaintainer != null);
-// 好处: 确保删除标记只在没有更老数据时才丢弃
-// 代价: 判断逻辑复杂,但保证了正确性
-
-// 权衡 2: 单任务 vs 多任务
-// 选择: 每次只运行一个压缩任务
-if (taskFuture != null) return;
-// 好处: 避免多个任务竞争同一批文件
-// 代价: 压缩吞吐量受限,但可以通过多 bucket 并行
 ```
 
-**架构演进:**
-- **v0.4**: 简单的同步压缩,阻塞写入
-- **v0.6**: 引入 MergeTreeCompactManager,支持异步执行
-- **v0.8**: 引入 DV 支持,实现 merge-on-read
-- **v1.0**: 引入 Lookup 模式,ForceUpLevel0Compaction 策略
-- **v1.2**: 引入 recordLevelExpire,支持记录级过期
-- **v1.5**: 优化 dropDelete 判断,支持 DV 模式下的 dropDelete
+**背后的唯一不变量**：删除标记只有在确认"没有更老的数据版本还需要用这个标记来盖掉"时才能丢。逐条拆：
 
-**业界对比:**
-Paimon 的创新点:
-1. **DV 深度集成**: dvMaintainer 与 Compaction 深度集成,支持 merge-on-read
-2. **Lookup 模式**: compactNotCompleted() 确保 Level 0 为空,优化点查性能
-3. **Changelog 生成**: 通过 ChangelogMergeTreeRewriter 在压缩过程中生成 changelog
+- `outputLevel == 0` → **不能丢**：输出到 L0 意味着下面还压着更老的高层数据，删除标记还得留着盖它们。
+- `outputLevel >= nonEmptyHighestLevel` → **可以丢**：输出就是当前最老的层，没有更老数据需要被这个 DELETE 盖掉了。
+- `dvMaintainer != null`（启用 DV）→ **可以丢**：DV 用 bitmap 在行级精确标记删除，不再依赖数据文件里的 DELETE 记录（DV 机制详见 [04 DeletionVector](04-DeletionVectors与文件索引.md)、[01 §7](01-核心存储引擎分析.md)）。
+- `forceKeepDelete` → 一票否决，强制保留（如下游需要看到 DELETE 的 changelog 场景）。
 
-### 4.1 整体架构
+丢不掉删除标记的代价是空间放大——DELETE 记录占着位置直到能被推到最高层；丢错了的代价是数据错误（删了的记录又"复活"）。所以这个判断宁严勿松。
 
-**源码位置**：`paimon-core/src/main/java/org/apache/paimon/mergetree/compact/MergeTreeCompactManager.java`
+### 4.3 同步 vs 异步：反压与 checkpoint 双阈值
 
-`MergeTreeCompactManager` 是主键表（KeyValueFileStore）的压缩管理器，负责协调 Compaction 的触发、执行和结果收集。
+**异步是常态**：`submitCompaction`（`:208`）最后一句 `taskFuture = executor.submit(task)` 把任务丢进线程池，写入线程立即返回，继续写后续数据。压缩在后台跑。
 
-```
-MergeTreeCompactManager
-├── executor: ExecutorService          -- 压缩任务执行线程池
-├── levels: Levels                     -- 多层文件结构
-├── strategy: CompactStrategy          -- 文件选择策略
-├── keyComparator                      -- key 比较器
-├── compactionFileSize: long           -- 文件大小阈值（targetFileSize * 0.7）
-├── numSortedRunStopTrigger: int       -- 写入反压阈值
-├── rewriter: CompactRewriter          -- 文件重写器
-├── dvMaintainer                       -- Deletion Vector 维护器
-├── recordLevelExpire                  -- 记录级过期处理
-├── needLookup: boolean                -- 是否为 Lookup 模式
-├── forceRewriteAllFiles: boolean      -- 是否强制重写所有文件
-└── forceKeepDelete: boolean           -- 是否强制保留删除标记
-```
-
-### 4.2 触发机制：triggerCompaction
+**同步化的两个时机**靠反压实现（`:109`、`:114`）：
 
 ```java
-public void triggerCompaction(boolean fullCompaction) {
-    Optional<CompactUnit> optionalUnit;
-    List<LevelSortedRun> runs = levels.levelSortedRuns();
-
-    if (fullCompaction) {
-        // 全量压缩：使用静态方法 pickFullCompaction
-        optionalUnit = CompactStrategy.pickFullCompaction(
-                levels.numberOfLevels(), runs, recordLevelExpire,
-                dvMaintainer, forceRewriteAllFiles);
-    } else {
-        if (taskFuture != null) return;  // 已有任务运行中，跳过
-        // 增量压缩：使用策略选择
-        optionalUnit = strategy.pick(levels.numberOfLevels(), runs)
-                .filter(unit -> !unit.files().isEmpty())
-                .filter(unit -> unit.files().size() > 1
-                        || unit.files().get(0).level() != unit.outputLevel());
-    }
-
-    optionalUnit.ifPresent(unit -> {
-        boolean dropDelete = !forceKeepDelete
-                && unit.outputLevel() != 0
-                && (unit.outputLevel() >= levels.nonEmptyHighestLevel()
-                    || dvMaintainer != null);
-        submitCompaction(unit, dropDelete);
-    });
-}
-```
-
-**为什么 `fullCompaction` 不检查 `taskFuture != null`？**
-
-Full Compaction 前有 `Preconditions.checkState(taskFuture == null)` 断言。这意味着 Full Compaction 必须在没有正在运行的任务时才能触发。这是因为 Full Compaction 涉及所有文件，不能与部分文件的增量压缩并行。
-
-**dropDelete 的判断逻辑深度分析：**
-
-```
-dropDelete = !forceKeepDelete                        // 不强制保留删除
-          && outputLevel != 0                        // 不是输出到 L0
-          && (outputLevel >= nonEmptyHighestLevel     // 输出到最高层（无更老数据）
-              || dvMaintainer != null)                // 或启用了 DV（DV 可以表示删除）
-```
-
-**为什么输出到最高层可以 dropDelete？**
-
-如果压缩输出到当前最高的非空层级或更高，意味着没有比这些数据更老的版本存在。此时删除标记可以安全丢弃，因为不再需要标记"这条记录已删除"。
-
-**为什么启用 DV 也可以 dropDelete？**
-
-Deletion Vector 提供了更精确的行级删除语义。即使存在更老的数据，DV 也能正确标记被删除的行，不需要在数据文件中保留 delete 记录。
-
-### 4.3 反压控制：shouldWaitForLatestCompaction
-
-```java
-@Override
 public boolean shouldWaitForLatestCompaction() {
-    return levels.numberOfSortedRuns() > numSortedRunStopTrigger;
+    return levels.numberOfSortedRuns() > numSortedRunStopTrigger;            // 硬反压
 }
-
-@Override
 public boolean shouldWaitForPreparingCheckpoint() {
-    return levels.numberOfSortedRuns() > (long) numSortedRunStopTrigger + 1;
+    return levels.numberOfSortedRuns() > (long) numSortedRunStopTrigger + 1; // checkpoint 前
 }
 ```
 
-**为什么需要两个不同的等待阈值？**
+默认值链：`compaction-trigger=5` → `stop-trigger = trigger+3 = 8`（`CoreOptions.java:3068`）→ checkpoint 阈值 `= stop+1 = 9`。
 
-- `shouldWaitForLatestCompaction()`：当 sorted run 数量超过 stop trigger 时，写入线程必须等待当前压缩完成。这是硬反压。
-- `shouldWaitForPreparingCheckpoint()`：checkpoint 前的阈值比 stop trigger 多 1。这给了一个缓冲，避免频繁在 checkpoint 时阻塞。
+- **为什么要两个阈值、且差 1**：硬反压（`shouldWaitForLatestCompaction`）一旦 run 数 > stop-trigger，写入线程就必须等当前压缩跑完才能继续，这是防 run 数无界增长的硬闸。checkpoint 阈值多 1 是给一个缓冲带：避免每次 checkpoint 都恰好卡在硬反压边界上反复阻塞，让正常 checkpoint 更顺。
+- **为什么 `(long)` 强转**：当用户把 `stop-trigger` 设成 `Integer.MAX_VALUE`（试图关反压）时，`+1` 会整型溢出变负数，强转 long 防溢出。
 
-**默认值关系**：
-- `numSortedRunCompactionTrigger` = 5（触发压缩）
-- `numSortedRunStopTrigger` = `compactionTrigger + 3` = 8（反压写入）
-- checkpoint 阈值 = `stopTrigger + 1` = 9
+**同步 compaction 的强场景**：`commit.force-compact=true` 时 commit 前会触发 full compaction 并阻塞等待；MOW/Lookup 模式下 `compactNotCompleted()` 返回 true 会挡住 commit（§4.4）。同步保证了"提交即可见"，代价是写吞吐被压缩耗时拖住——这正是陷阱 4、5 的根因。
 
-**为什么 `shouldWaitForPreparingCheckpoint()` 用 `(long)` 强转？**
+### 4.4 结果回收与 Deletion Vector 集成
 
-源码注释说明：cast to long to avoid Numeric overflow。当 `numSortedRunStopTrigger` 为 `Integer.MAX_VALUE` 时，+1 会溢出。
-
-### 4.4 结果收集与 Levels 更新
+`getCompactionResult(blocking)`（`:256`）取到结果后**在调用线程（Writer 线程）里**更新 Levels：
 
 ```java
-@Override
-public Optional<CompactResult> getCompactionResult(boolean blocking)
-        throws ExecutionException, InterruptedException {
-    Optional<CompactResult> result = innerGetCompactionResult(blocking);
-    result.ifPresent(r -> {
-        levels.update(r.before(), r.after());      // 更新 Levels 数据结构
-        MetricUtils.safeCall(this::reportMetrics, LOG);
-    });
-    return result;
-}
+result.ifPresent(r -> {
+    levels.update(r.before(), r.after());   // 关键：在 Writer 线程更新，不在压缩线程
+    MetricUtils.safeCall(this::reportMetrics, LOG);
+});
 ```
 
-**为什么在 `getCompactionResult()` 而非 `doCompact()` 中更新 Levels？**
+**为什么不在 `doCompact()` 里更新 Levels**：`doCompact()` 跑在独立压缩线程，而 `Levels`（尤其 level0 的 TreeSet）非线程安全。把 update 收口到 Writer 单线程，就不必给 Levels 加锁。
 
-`doCompact()` 在独立线程中执行，而 `Levels` 不是线程安全的（对 level0 的 TreeSet 操作不加锁）。通过在调用线程（Writer 线程）中更新 Levels，避免了并发问题。
+**DV 延迟生成**：`submitCompaction`（`:208`）里若启用 DV，按 `lazyGenDeletionFile` 决定用 `CompactDeletionFile.lazyGeneration(dvMaintainer)`（压缩完成后才生成）还是 `generateFiles`（立即）。延迟生成避免压缩过程中 DV 信息被其他写入改动而过时。
 
-### 4.5 Deletion Vector 集成
-
-```java
-private void submitCompaction(CompactUnit unit, boolean dropDelete) {
-    Supplier<CompactDeletionFile> compactDfSupplier = () -> null;
-    if (dvMaintainer != null) {
-        compactDfSupplier = lazyGenDeletionFile
-                ? () -> CompactDeletionFile.lazyGeneration(dvMaintainer)
-                : () -> CompactDeletionFile.generateFiles(dvMaintainer);
-    }
-
-    CompactTask task;
-    if (unit.fileRewrite()) {
-        task = new FileRewriteCompactTask(rewriter, unit, dropDelete, metricsReporter);
-    } else {
-        task = new MergeTreeCompactTask(
-                keyComparator, compactionFileSize, rewriter, unit,
-                dropDelete, levels.maxLevel(), metricsReporter,
-                compactDfSupplier, recordLevelExpire, forceRewriteAllFiles);
-    }
-    taskFuture = executor.submit(task);
-}
-```
-
-**为什么 DeletionFile 使用 Supplier 延迟生成？**
-
-`lazyGenDeletionFile` 模式下，DeletionFile 在 Compaction 完成后才生成，而非执行前。这避免了在压缩过程中 DV 信息过时（因为同一时间可能有其他写入修改了 DV）。
-
-**`compactNotCompleted()` 在 Lookup 模式下的特殊处理：**
+**Lookup 模式的特殊完成判断**（`:279`）：
 
 ```java
-@Override
 public boolean compactNotCompleted() {
     return super.compactNotCompleted() || (needLookup && !levels().level0().isEmpty());
 }
 ```
 
-**为什么 Lookup 模式需要确保 L0 为空？**
-
-Lookup 模式下，查询需要通过点查索引快速定位记录。L0 文件的 key 范围可能重叠，不适合构建高效索引。因此必须确保所有 L0 文件都被压缩到高层。
+即使没有在跑的任务，只要 Lookup 模式下 L0 还非空，就认为"压缩未完成"、阻止 commit。**为什么 Lookup 必须清空 L0**：Lookup 靠本地点查索引快速定位记录，而 L0 文件 key 范围互相重叠、无法建高效索引，必须全部推到高层。这就是 §5.2 `ForceUpLevel0Compaction` 存在的理由，也是陷阱 5 的机制根源。
 
 ---
 
-## 5. CompactStrategy 策略体系
+## 5. CompactStrategy 策略体系：写/读/空间三角
 
-### 解决什么问题
+**① 要解决什么问题**
 
-**核心业务问题:**
-CompactStrategy 解决的是"选择哪些文件参与压缩"的问题。不同场景有不同需求:
-- 写密集型场景: 最小化写放大,选择大小相近的 run 合并
-- 读密集型场景: 最小化读放大,尽快减少 sorted run 数量
-- Lookup 场景: 优先推 Level 0 文件到高层,优化点查性能
-- 低峰期场景: 利用闲置资源,更激进地压缩
+`pick()` 的工作是"在写放大、读放大、空间放大这个三角里，每次只付最该付的那笔账"。写密集要少合（低写放大）、读密集要快减 run（低读放大）、存储吃紧要把增量并回基线（低空间放大）、Lookup 要清 L0、低峰期可多合。一个固定算法满足不了，所以 Paimon 用 `CompactStrategy` 接口 + 四级决策 + 可叠加的辅助策略。
 
-**没有这个设计的后果:**
+**② 设计原理与取舍：四级决策的优先级**
+
+`UniversalCompaction.pick` 的优先级是 **EarlyFull > SizeAmp > SizeRatio > FileNum**，每一级对应三角里的一条边：
+
+| 决策级 | 看什么 | 偿还哪个放大 | 不命中就降级 |
+|--------|--------|--------------|--------------|
+| EarlyFullCompaction | 时间/总大小/增量阈值 | 用户显式要的读优化时效性 | → SizeAmp |
+| SizeAmplification | 增量总大小 / 最老 run 大小 > `maxSizeAmp(200%)` | **空间放大**（增量太多，全量并回基线） | → SizeRatio |
+| SizeRatio | 相邻 run 大小是否在 `sizeRatio(1%)` 容差内 | **写放大**（只合大小相近的，少重写数据） | → FileNum |
+| FileNum | run 数 > `numRunCompactionTrigger(5)` | **读放大**兜底（run 太多强制合一部分） | → 不压缩 |
+
+一句话：**先看用户硬需求，再看最贵的空间放大，再用写放大最低的方式合相近 run，最后才用文件数兜底。** 这个顺序保证了默认行为偏向"少写、按需补读"。
+
+### 5.1 策略接口与 pickFullCompaction
+
+`mergetree/compact/CompactStrategy.java:37` 定义 `pick()`（实例方法，各策略不同）和 `pickFullCompaction()`（`:53`，**静态方法**）。
+
+**为什么 full compaction 是静态方法**：全量永远选所有文件，逻辑与具体策略无关，做成静态避免每个策略重复实现。但它有一个**"空操作"优化**（`:66`）：当数据已全在最高层（`runs.size()==1 && level==maxLevel`），本该是空操作，但仍逐文件检查三种必须重写的情况——
+
 ```java
-// 没有策略模式的混乱场景:
-// 场景 1: 硬编码选择逻辑
-if (level0.size() > 5) {
-    compact(level0); // 无法适配不同场景
+for (DataFileMeta file : runs.get(0).run().files()) {
+    if (forceRewriteAllFiles) { ... }                                  // 强制重写（外部路径同步）
+    else if (recordLevelExpire != null && recordLevelExpire.isExpireFile(file)) { ... } // 含过期记录
+    else if (dvMaintainer != null && dvMaintainer.deletionVectorOf(file.fileName()).isPresent()) { ... } // 有 DV 需物化
 }
-
-// 场景 2: 无法控制写放大
-compact(allFiles); // 每次都全量压缩,写放大 10 倍
-
-// 场景 3: 无法利用低峰期
-// 凌晨 2 点集群空闲,但压缩策略与白天相同,浪费资源
+// 若 filesToBeCompacted 为空 → Optional.empty()；否则 fromFiles(maxLevel, files, /*fileRewrite=*/true)
 ```
 
-**实际场景:**
-某社交平台的消息表,白天写入 QPS 10 万,夜间只有 1 万。使用固定策略时,白天写放大过大导致延迟增加,夜间资源闲置。引入 OffPeakHours 策略后,夜间更激进压缩,白天读性能提升 50%。
+注意命中时返回的 unit `fileRewrite=true`，会走 `FileRewriteCompactTask`（§6）逐文件重写、免归并。这避免了"数据已在最高层但还要全量重写一遍"的无效写放大——也是 record-level expire 搭车 full compaction 清理过期行的入口（§11）。
 
-### 有什么坑
+### 5.2 UniversalCompaction 三级决策
 
-**误区陷阱:**
-1. **误以为 sizeRatio 越小越好**: sizeRatio=0 导致只有完全相同大小的 run 才合并,压缩几乎不触发
-2. **maxSizeAmp 设置过大**: maxSizeAmp=1000 导致空间放大 10 倍,存储成本爆炸
-3. **EarlyFullCompaction 的时间间隔过短**: optimization-interval=1h 导致频繁全量压缩,写放大过大
+`mergetree/compact/UniversalCompaction.java:42`。`pick()`（`:67`）骨架就是上面那张表的代码化，命中即返回，全 miss 返回 `Optional.empty()`。下面拆三级各自的"为什么"。
 
-**错误配置示例:**
-```sql
--- 错误 1: sizeRatio 过小
-ALTER TABLE my_table SET ('compaction.size-ratio' = '0');
--- 后果: 只有完全相同大小的 run 才合并,sorted run 数量失控
-
--- 错误 2: maxSizeAmp 过大
-ALTER TABLE my_table SET ('compaction.max-size-amplification-percent' = '10000');
--- 后果: 空间放大 100 倍,存储成本增加 100 倍
-
--- 错误 3: 低峰期配置错误
-ALTER TABLE my_table SET (
-    'compaction.offpeak.start.hour' = '2',
-    'compaction.offpeak.end.hour' = '2'  -- 错误! 开始和结束相同
-);
--- 后果: 低峰期策略永远不生效
-```
-
-**生产环境注意事项:**
-- 监控 `compactionThreadBusy`,持续 > 80% 说明压缩线程不够
-- Lookup 模式必须用 ForceUpLevel0Compaction,否则点查性能下降
-- 低峰期配置支持跨午夜,如 start=22, end=6 表示晚上 10 点到早上 6 点
-
-**性能陷阱:**
-```java
-// 陷阱 1: 频繁触发 EarlyFullCompaction
-ALTER TABLE my_table SET ('compaction.optimization-interval' = '60s');
-// 每分钟全量压缩一次,写放大 100 倍
-
-// 陷阱 2: total-size-threshold 设置过大
-ALTER TABLE my_table SET ('compaction.total-size-threshold' = '1TB');
-// 1TB 以下的表都频繁全量压缩,写放大过大
-```
-
-### 核心概念解释
-
-**术语定义:**
-- **UniversalCompaction**: 默认策略,借鉴 RocksDB,通过 sizeRatio 和 sizeAmp 控制
-- **ForceUpLevel0Compaction**: Lookup 模式策略,优先推 Level 0 文件到高层
-- **EarlyFullCompaction**: 提前全量压缩策略,支持时间/大小/增量三种触发条件
-- **OffPeakHours**: 低峰期自适应策略,放宽 sizeRatio 阈值
-
-**概念关系:**
-```
-CompactStrategy (接口)
-├── UniversalCompaction (默认)
-│   ├── pickForSizeAmp() (空间放大检查)
-│   ├── pickForSizeRatio() (大小比率检查)
-│   └── pickForFileNum() (文件数量检查)
-├── ForceUpLevel0Compaction (Lookup 模式)
-│   └── 包装 UniversalCompaction + forcePickL0()
-└── 辅助策略
-    ├── EarlyFullCompaction (提前全量)
-    └── OffPeakHours (低峰期)
-
-决策优先级:
-EarlyFullCompaction > SizeAmplification > SizeRatio > FileNum
-```
-
-**与其他系统对比:**
-| 系统 | 默认策略 | 写放大 | 读放大 | 可插拔 |
-|------|---------|--------|--------|--------|
-| Paimon | Universal | 低 | 中 | ✓ |
-| RocksDB | Leveled | 高 | 低 | ✓ |
-| HBase | Size-Tiered | 中 | 高 | ✗ |
-| Cassandra | Size-Tiered | 中 | 高 | ✓ |
-
-### 设计理念
-
-**为什么这样设计:**
-1. **策略模式**: 通过接口抽象,支持不同场景使用不同策略,扩展性强
-2. **四级决策**: EarlyFull > SizeAmp > SizeRatio > FileNum,优先级清晰
-3. **组合策略**: UniversalCompaction 可以组合 EarlyFullCompaction 和 OffPeakHours,灵活性高
-
-**权衡取舍:**
-```java
-// 权衡 1: 写放大 vs 读放大
-// 选择: numSortedRunCompactionTrigger = 5
-// 好处: 允许 5 个 run 存在,写放大降低 50%
-// 代价: 查询需要合并 5 路数据,读放大增加
-
-// 权衡 2: 空间放大 vs 写放大
-// 选择: maxSizeAmp = 200%
-// 好处: 避免频繁全量压缩,写放大降低
-// 代价: 存储成本增加 2 倍
-
-// 权衡 3: 低峰期激进 vs 稳定性
-// 选择: offPeakRatio 可配置,默认 0
-// 好处: 用户可以根据业务特点调整
-// 代价: 配置复杂度增加
-```
-
-**架构演进:**
-- **v0.4**: 只有简单的文件数量触发
-- **v0.6**: 引入 UniversalCompaction,支持 sizeRatio 和 sizeAmp
-- **v0.8**: 引入 ForceUpLevel0Compaction,支持 Lookup 模式
-- **v1.0**: 引入 EarlyFullCompaction,支持时间/大小/增量触发
-- **v1.3**: 引入 OffPeakHours,支持低峰期自适应
-- **v1.5**: 优化 createUnit 逻辑,避免输出到 Level 0
-
-**业界对比:**
-Paimon 的创新点:
-1. **四级决策**: EarlyFull > SizeAmp > SizeRatio > FileNum,比 RocksDB 更灵活
-2. **Lookup 优化**: ForceUpLevel0Compaction 专门为点查场景设计
-3. **低峰期自适应**: OffPeakHours 支持跨午夜配置,利用闲置资源
-
-### 5.1 策略接口设计
-
-**源码位置**：`paimon-core/src/main/java/org/apache/paimon/mergetree/compact/CompactStrategy.java`
+**第 1 级 `pickForSizeAmp`（`:125`）——控空间放大**
 
 ```java
-public interface CompactStrategy {
-    Optional<CompactUnit> pick(int numLevels, List<LevelSortedRun> runs);
-
-    static Optional<CompactUnit> pickFullCompaction(
-            int numLevels, List<LevelSortedRun> runs,
-            @Nullable RecordLevelExpire recordLevelExpire,
-            @Nullable BucketedDvMaintainer dvMaintainer,
-            boolean forceRewriteAllFiles) { ... }
+long candidateSize = /* 除最后一个 run 外所有 run 的总大小 */;
+long earliestRunSize = runs.get(runs.size() - 1).run().totalSize();   // 最老/最大 run 作基准
+if (candidateSize * 100 > maxSizeAmp * earliestRunSize) {
+    return CompactUnit.fromLevelRuns(maxLevel, runs);                  // 全量合到最高层
 }
 ```
 
-**为什么 `pickFullCompaction` 是静态方法而非实例方法？**
+runs 从新到老排列，最后一个是最老的基线。"增量总大小 / 基线大小 > 200%" 意味着为存 1 字节有效数据多花了 2 字节冗余，触发全量把增量并回基线。
 
-Full Compaction 的逻辑与具体策略无关，它总是选择所有文件。作为静态方法避免了在每个 CompactStrategy 实现中重复。
+- **`maxSizeAmp` 配置取舍**：默认 200（`CoreOptions.java:809`）。调大 → 容忍更多增量、全量更少（写放大降）、但存储成本和读放大升；调小 → 频繁全量（写放大升）、省空间。设成极大值（如 10000）= 实质关闭空间放大控制，旧版本无限堆积。
 
-**`pickFullCompaction` 的智能优化：**
-
-当只有最高层的一个 run 时，不是简单地返回全部文件，而是按需筛选：
+**第 2 级 `pickForSizeRatio`（`:163`）——控写放大**
 
 ```java
-if (runs.size() == 1 && runs.get(0).level() == maxLevel) {
-    for (DataFileMeta file : runs.get(0).run().files()) {
-        if (forceRewriteAllFiles) {
-            filesToBeCompacted.add(file);
-        } else if (recordLevelExpire != null && recordLevelExpire.isExpireFile(file)) {
-            filesToBeCompacted.add(file);
-        } else if (dvMaintainer != null
-                && dvMaintainer.deletionVectorOf(file.fileName()).isPresent()) {
-            filesToBeCompacted.add(file);
-        }
+for (int i = candidateCount; i < runs.size(); i++) {
+    LevelSortedRun next = runs.get(i);
+    if (candidateSize * (100.0 + sizeRatio + ratioForOffPeak()) / 100.0 < next.run().totalSize()) {
+        break;     // 下一个 run 比候选集大太多，不值得合（合进去就是小并大、写放大大）
     }
+    candidateSize += next.run().totalSize();
+    candidateCount++;
 }
 ```
 
-**为什么要这样优化？**
+从最新的 run 开始往后滚雪球：只要"候选集大小 ×(1 + sizeRatio%)"还兜得住下一个 run，就把它纳入。一旦下一个 run 大太多就停。这保证了**只合并大小相近的 run**——把小 run 合进大 run 会重写整个大 run（写放大极高），这一级专门避免它。
 
-当数据已经全部在最高层时，Full Compaction 本该是空操作。但有三种情况仍需重写：
-1. 强制重写所有文件（外部路径同步场景）
-2. 文件包含过期记录（Record Level Expire）
-3. 文件有 Deletion Vector（需要物化删除）
+- **`sizeRatio` 配置取舍（反直觉，对应陷阱 3）**：默认 1（即 1% 容差，`CoreOptions.java:824`）。它是"允许相邻 run 差多少还算相近"的**容差**：越小越保守（几乎等大才合，候选集难扩大，run 容易堆积）；越大越激进（差距大也合，写放大上升但 run 数下降快）。把它设成 0 ≈ 只有完全等大才合，几乎压不动。
 
-这样避免了不必要的全量重写，显著减少了写放大。
-
-### 5.2 UniversalCompaction：核心策略
-
-**源码位置**：`paimon-core/src/main/java/org/apache/paimon/mergetree/compact/UniversalCompaction.java`
-
-UniversalCompaction 是 Paimon 的默认压缩策略，借鉴自 RocksDB 的 Universal Compaction。
+**第 3 级文件数兜底（`pick:97`）**
 
 ```java
-public class UniversalCompaction implements CompactStrategy {
-    private final int maxSizeAmp;                 // 空间放大比例阈值（默认 200%）
-    private final int sizeRatio;                   // 大小比率阈值（默认 1%）
-    private final int numRunCompactionTrigger;     // 触发压缩的 run 数量
-    @Nullable private final EarlyFullCompaction earlyFullCompact;
-    @Nullable private final OffPeakHours offPeakHours;
+if (runs.size() > numRunCompactionTrigger) {                          // run 数超阈值
+    int candidateCount = runs.size() - numRunCompactionTrigger + 1;   // 至少压掉超出的部分
+    return Optional.ofNullable(pickForSizeRatio(maxLevel, runs, candidateCount));
 }
 ```
 
-**`pick()` 方法的四级决策逻辑：**
+前两级都没命中、但 run 数已超 `numRunCompactionTrigger`（默认 5）时，强制以"超出数量 + 1"为起点再走一遍 SizeRatio。这是读放大的最后防线——`numRunCompactionTrigger` 一参三用（触发阈值 / SizeAmp/Ratio 最小候选数 / `num-levels` 默认值），调它的连锁影响见陷阱 1 与 [01 §1.3 陷阱 7](01-核心存储引擎分析.md)。
+
+**`createUnit`（`:197`）——绝不输出到 L0**
+
+输出 level = 全量则 maxLevel，否则 `下一个未纳入 run 的 level - 1`。若算出 0，会继续向后扫到第一个非 0 level 才停（`:206`）。**为什么禁止输出 L0**：L0 的语义是"未排序的新写入、每文件一个 run"，compaction 的输出是已排序的，落 L0 会打破 L0 不变量、让归并逻辑失效。
+
+### 5.3 ForceUpLevel0Compaction：Lookup 强清 L0
+
+`mergetree/compact/ForceUpLevel0Compaction.java:31` 是 Lookup 模式专用策略，包装一个 `UniversalCompaction`。`pick()`（`:50`）逻辑：
 
 ```java
-public Optional<CompactUnit> pick(int numLevels, List<LevelSortedRun> runs) {
-    int maxLevel = numLevels - 1;
-
-    // 第 0 级：尝试 EarlyFullCompaction
-    if (earlyFullCompact != null) {
-        Optional<CompactUnit> unit = earlyFullCompact.tryFullCompact(numLevels, runs);
-        if (unit.isPresent()) return unit;
-    }
-
-    // 第 1 级：检查空间放大
-    CompactUnit unit = pickForSizeAmp(maxLevel, runs);
-    if (unit != null) return Optional.of(unit);
-
-    // 第 2 级：检查大小比率
-    unit = pickForSizeRatio(maxLevel, runs);
-    if (unit != null) return Optional.of(unit);
-
-    // 第 3 级：检查文件数量
-    if (runs.size() > numRunCompactionTrigger) {
-        int candidateCount = runs.size() - numRunCompactionTrigger + 1;
-        return Optional.ofNullable(pickForSizeRatio(maxLevel, runs, candidateCount));
-    }
-
-    return Optional.empty();
+Optional<CompactUnit> pick = universal.pick(numLevels, runs);   // 1. 先走标准策略
+if (pick.isPresent()) return pick;
+if (maxCompactInterval == null || compactTriggerCount == null) {
+    return universal.forcePickL0(numLevels, runs);              // 2a. RADICAL：每次都强推 L0
 }
+compactTriggerCount.getAndIncrement();                          // 2b. GENTLE：攒够 maxInterval 次才推
+if (compactTriggerCount.compareAndSet(maxCompactInterval, 0)) {
+    return universal.forcePickL0(numLevels, runs);
+}
+return Optional.empty();
 ```
 
-**为什么是这个优先级顺序？**
+`forcePickL0`（`UniversalCompaction.java:109`）收集所有连续的 L0 run，以 `forcePick=true` 走 SizeRatio——即使只有一个 L0 文件也会被选中推到高层。
 
-```
-EarlyFullCompaction > SizeAmplification > SizeRatio > FileNum
-```
+**为什么 Lookup 要这个**：见 §4.4，Lookup/MOW 的 `compactNotCompleted()` 因 L0 非空就挡 commit，所以必须主动清空 L0。`RADICAL`（`lookup-compact` 默认）每次强推、查询延迟最低但写放大较高；`GENTLE` 用 `lookup-compact.max-interval`（默认 `trigger*2`）控制频率，写压力大时可接受 L0 短暂存在。对应 `LookupCompactMode` 枚举。
 
-1. **EarlyFullCompaction 最优先**：时间触发或大小触发的全量压缩是用户显式配置的需求，必须最先检查
-2. **SizeAmplification 次之**：空间放大过大直接影响存储成本，需要优先处理
-3. **SizeRatio 第三**：按大小比率合并相邻 run，优化读取效率
-4. **FileNum 最后**：兜底策略，当 run 数量过多时强制合并
+| 模式 | maxCompactInterval | 行为 | 取舍 |
+|------|--------------------|------|------|
+| `RADICAL`（默认） | null | 标准策略不动就立即强推 L0 | 查询延迟最低，写放大较高 |
+| `GENTLE` | 非 null（默认 trigger×2） | 每 N 次触发才强推一次 L0 | 写压力小，容忍 L0 短暂存在 |
 
-#### 5.2.1 pickForSizeAmp：空间放大控制
+### 5.4 OffPeakHours：低峰期放宽阈值
+
+`mergetree/compact/OffPeakHours.java:26`。`currentRatio(hour)`（`:38`）判断当前是否在低峰时段（支持跨午夜：`startHour > endHour` 时用 `hour < endHour || startHour <= hour`），是则返回配置的 `compactOffPeakRatio`，否则 0。
+
+它的唯一作用点是 §5.2 SizeRatio 公式里的 `ratioForOffPeak()`：低峰期把容差从 `sizeRatio` 放宽到 `sizeRatio + offPeakRatio`，于是更多 run 被纳入合并。**设计意图**：白天高峰不动（offPeakRatio 加成为 0），夜里集群闲时多合，用闲置资源提前还读放大的债，不影响业务高峰。`start.hour`/`end.hour` 默认 -1（禁用），`start==end` 也视为禁用（`:61`）。
+
+### 5.5 Full Compaction 的入口与"空操作"优化
+
+Full compaction 选文件逻辑已在 §5.1 讲完（`pickFullCompaction` 静态方法 + 空操作优化），这里汇总**触发它的五个入口**，便于排障定位：
+
+1. `commit.force-compact=true`：每次 commit 前强制（批处理收尾用，流式慎用，陷阱 4）
+2. `full-compaction.delta-commits=N`：流式每 N 次 commit 全量一次（`changelog-producer=full-compaction` 必需）
+3. `EarlyFullCompaction` 的三种条件（时间/总大小/增量阈值，见 §5.5.1）
+4. `SizeAmplification` 超 `maxSizeAmp`（§5.2 第 1 级，本质也走全量到最高层）
+5. 用户经 Flink Action / Spark Procedure 手动触发，或 dedicated compaction 作业（§11）
+
+#### 5.5.1 EarlyFullCompaction 三种触发（提前全量）
+
+`mergetree/compact/EarlyFullCompaction.java:37`，`tryFullCompact()`（`:86`）三个条件任一命中即全量（`runs.size()==1` 直接返回空，单 run 无需压）：
 
 ```java
-CompactUnit pickForSizeAmp(int maxLevel, List<LevelSortedRun> runs) {
-    if (runs.size() < numRunCompactionTrigger) return null;
-
-    long candidateSize = runs.subList(0, runs.size() - 1).stream()
-            .map(LevelSortedRun::run).mapToLong(SortedRun::totalSize).sum();
-    long earliestRunSize = runs.get(runs.size() - 1).run().totalSize();
-
-    // 空间放大 = 除最大 run 外所有 run 的总大小 / 最大 run 的大小
-    if (candidateSize * 100 > maxSizeAmp * earliestRunSize) {
-        return CompactUnit.fromLevelRuns(maxLevel, runs); // 全量压缩
-    }
-    return null;
+if (fullCompactionInterval != null && (lastFullCompaction == null
+        || currentTimeMillis() - lastFullCompaction > fullCompactionInterval)) {
+    updateLastFullCompaction(); return Optional.of(fromLevelRuns(maxLevel, runs)); // 条件1 时间间隔
+}
+if (totalSizeThreshold != null && totalSize < totalSizeThreshold) {
+    updateLastFullCompaction(); return ...;                                         // 条件2 小表全量
+}
+if (incrementalSizeThreshold != null && incrementalSize > incrementalSizeThreshold) {
+    updateLastFullCompaction(); return ...;                                         // 条件3 增量过多
 }
 ```
-
-**为什么用最后一个 run（最大/最老的）作为基准？**
-
-在 Universal Compaction 中，runs 是从新到老排列的。最后一个 run 通常是最大的基线数据。如果其他 run（增量数据）的总大小超过基线大小的 `maxSizeAmp%`，说明空间放大过大，需要全量压缩将增量合并到基线中。
-
-**默认 maxSizeAmp=200 的含义**：增量数据最多占基线数据的 2 倍。即如果基线是 1GB，增量超过 2GB 时触发全量压缩。
-
-#### 5.2.2 pickForSizeRatio：大小比率合并
-
-```java
-public CompactUnit pickForSizeRatio(
-        int maxLevel, List<LevelSortedRun> runs, int candidateCount, boolean forcePick) {
-    long candidateSize = candidateSize(runs, candidateCount);
-    for (int i = candidateCount; i < runs.size(); i++) {
-        LevelSortedRun next = runs.get(i);
-        // 关键判断：候选集的总大小 * (100 + sizeRatio + offPeakRatio) / 100 < 下一个 run 的大小
-        if (candidateSize * (100.0 + sizeRatio + ratioForOffPeak()) / 100.0
-                < next.run().totalSize()) {
-            break;  // 下一个 run 太大，不值得合并
-        }
-        candidateSize += next.run().totalSize();
-        candidateCount++;
-    }
-
-    if (forcePick || candidateCount > 1) {
-        return createUnit(runs, maxLevel, candidateCount);
-    }
-    return null;
-}
-```
-
-**为什么这个算法能控制写放大？**
-
-通过 `sizeRatio` 阈值，只有当相邻 run 的大小"差不多"时才合并它们。这避免了将小 run 与大 run 合并（写放大大），也避免了大量小 run 堆积（读放大大）。
-
-**`sizeRatio=1` 的默认含义**：如果候选集的大小至少是下一个 run 大小的 1/101（约 1%），则将下一个 run 也纳入候选集。
-
-#### 5.2.3 createUnit：输出 level 的确定
-
-```java
-CompactUnit createUnit(List<LevelSortedRun> runs, int maxLevel, int runCount) {
-    int outputLevel;
-    if (runCount == runs.size()) {
-        outputLevel = maxLevel;          // 全量合并，输出到最高层
-    } else {
-        outputLevel = Math.max(0, runs.get(runCount).level() - 1); // 下一个 run 的 level - 1
-    }
-
-    if (outputLevel == 0) {
-        // 不允许输出到 level 0，继续向后扫描
-        for (int i = runCount; i < runs.size(); i++) {
-            LevelSortedRun next = runs.get(i);
-            runCount++;
-            if (next.level() != 0) {
-                outputLevel = next.level();
-                break;
-            }
-        }
-    }
-
-    if (runCount == runs.size()) {
-        outputLevel = maxLevel;
-    }
-    return CompactUnit.fromLevelRuns(outputLevel, runs.subList(0, runCount));
-}
-```
-
-**为什么不允许输出到 Level 0？**
-
-Level 0 的语义是"未排序的新写入文件"。Compaction 的输出是已排序的，应该放到 Level 1 或更高层。如果输出到 Level 0，会打破 Level 0 "每个文件一个 SortedRun" 的不变量。
-
-### 5.3 ForceUpLevel0Compaction：Lookup 模式策略
-
-**源码位置**：`paimon-core/src/main/java/org/apache/paimon/mergetree/compact/ForceUpLevel0Compaction.java`
-
-ForceUpLevel0Compaction 是 Lookup 模式下的专用策略，通过优先推送 Level 0 文件到高层来优化点查性能。
-
-**为什么 Lookup 需要特殊策略？**
-
-Lookup 模式下，查询通过本地索引对文件进行点查。Level 0 文件的 key 范围可能重叠，查询需要遍历所有 L0 文件，降低了查询效率。因此 Lookup 策略的目标是尽快将 L0 文件推到高层。
-
-**`RADICAL` vs `GENTLE` 模式**（对应 `LookupCompactMode` 枚举）：
-
-| 模式 | 行为 | 适用场景 |
-|------|------|---------|
-| `RADICAL`（默认） | `maxCompactInterval=null`，每次都强制 compact L0 | 需要低延迟查询 |
-| `GENTLE` | `maxCompactInterval` 控制频率 | 写入压力大，可接受一定查询延迟 |
-
-**实现原理：**
-
-```java
-public Optional<CompactUnit> pick(int numLevels, List<LevelSortedRun> runs) {
-    // 1. 先尝试 UniversalCompaction 的标准策略
-    Optional<CompactUnit> pick = universal.pick(numLevels, runs);
-    if (pick.isPresent()) return pick;
-
-    // 2. 如果标准策略没有选中，则强制推 L0
-    if (maxCompactInterval == null) {
-        // RADICAL 模式：总是强制刷 L0
-        return universal.forcePickL0(numLevels, runs);
-    }
-
-    // GENTLE 模式：按频率控制
-    compactTriggerCount.getAndIncrement();
-    if (compactTriggerCount.compareAndSet(maxCompactInterval, 0)) {
-        return universal.forcePickL0(numLevels, runs);
-    } else {
-        return Optional.empty();
-    }
-}
-```
-
-**`forcePickL0()` 的实现：**
-
-```java
-Optional<CompactUnit> forcePickL0(int numLevels, List<LevelSortedRun> runs) {
-    int candidateCount = 0;
-    for (int i = candidateCount; i < runs.size(); i++) {
-        if (runs.get(i).level() > 0) break;
-        candidateCount++;
-    }
-    return candidateCount == 0 ? Optional.empty()
-            : Optional.of(pickForSizeRatio(numLevels - 1, runs, candidateCount, true));
-}
-```
-
-注意 `forcePick=true`，这意味着即使只有一个 L0 文件也会被选中压缩。
-
-### 5.4 EarlyFullCompaction：提前全量压缩
-
-**源码位置**：`paimon-core/src/main/java/org/apache/paimon/mergetree/compact/EarlyFullCompaction.java`
-
-EarlyFullCompaction 提供了三种触发 Full Compaction 的条件：
-
-```java
-public class EarlyFullCompaction {
-    @Nullable private final Long fullCompactionInterval;    // 时间间隔触发
-    @Nullable private final Long totalSizeThreshold;        // 总大小阈值触发
-    @Nullable private final Long incrementalSizeThreshold;  // 增量大小阈值触发
-    @Nullable private Long lastFullCompaction;              // 上次 Full Compaction 时间
-
-    public Optional<CompactUnit> tryFullCompact(int numLevels, List<LevelSortedRun> runs) {
-        if (runs.size() == 1) return Optional.empty();  // 只有一个 run，不需要压缩
-
-        // 条件 1：时间间隔
-        if (fullCompactionInterval != null) {
-            if (lastFullCompaction == null
-                    || currentTimeMillis() - lastFullCompaction > fullCompactionInterval) {
-                updateLastFullCompaction();
-                return Optional.of(CompactUnit.fromLevelRuns(maxLevel, runs));
-            }
-        }
-
-        // 条件 2：总大小 < 阈值（小表可以频繁全量压缩）
-        if (totalSizeThreshold != null) {
-            long totalSize = runs.stream().mapToLong(r -> r.run().totalSize()).sum();
-            if (totalSize < totalSizeThreshold) {
-                return Optional.of(CompactUnit.fromLevelRuns(maxLevel, runs));
-            }
-        }
-
-        // 条件 3：增量大小 > 阈值（增量太多，需要全量压缩）
-        if (incrementalSizeThreshold != null) {
-            long incrementalSize = runs.stream()
-                    .filter(r -> r.level() != maxLevel)
-                    .mapToLong(r -> r.run().totalSize()).sum();
-            if (incrementalSize > incrementalSizeThreshold) {
-                return Optional.of(CompactUnit.fromLevelRuns(maxLevel, runs));
-            }
-        }
-
-        return Optional.empty();
-    }
-}
-```
-
-**为什么需要这三个条件？**
 
 | 条件 | 配置项 | 使用场景 |
 |------|--------|---------|
-| 时间间隔 | `compaction.optimization-interval` | 保证读优化系统表的查询时效性 |
-| 总大小阈值 | `compaction.total-size-threshold` | 小表频繁 Full Compaction 成本低，减少读放大 |
-| 增量大小阈值 | `compaction.incremental-size-threshold` | 增量过多时及时合并，控制空间放大 |
+| 时间间隔 | `compaction.optimization-interval` | 保证 read-optimized 系统表的查询时效 |
+| 总大小阈值 | `compaction.total-size-threshold` | 小表频繁全量成本低、读放大最优 |
+| 增量大小阈值 | `compaction.incremental-size-threshold` | 增量过多时及时并回基线、控空间放大 |
 
-**`updateLastFullCompaction()` 的调用时机：**
-
-不仅在 `EarlyFullCompaction.tryFullCompact()` 中调用，还在 `UniversalCompaction.pickForSizeAmp()` 和 `createUnit(runCount == runs.size())` 时调用。这确保了所有导致全量压缩的路径都会更新时间戳。
-
-### 5.5 OffPeakHours：低峰期自适应策略
-
-**源码位置**：`paimon-core/src/main/java/org/apache/paimon/mergetree/compact/OffPeakHours.java`
-
-```java
-public class OffPeakHours {
-    private final int startHour;
-    private final int endHour;
-    private final int compactOffPeakRatio;
-
-    public int currentRatio(int targetHour) {
-        boolean isOffPeak;
-        if (startHour <= endHour) {
-            isOffPeak = startHour <= targetHour && targetHour < endHour;
-        } else {
-            isOffPeak = targetHour < endHour || startHour <= targetHour; // 跨午夜
-        }
-        return isOffPeak ? compactOffPeakRatio : 0;
-    }
-}
-```
-
-**为什么需要低峰期策略？**
-
-在集群负载低的时段（如凌晨 2 点到上午 6 点），可以适当放宽 `sizeRatio` 的阈值，让更多的 run 被合并。这样在不影响业务高峰期性能的前提下，通过低峰期的额外压缩来降低整体读放大。
-
-**集成方式：** 在 `UniversalCompaction.pickForSizeRatio()` 中：
-
-```java
-if (candidateSize * (100.0 + sizeRatio + ratioForOffPeak()) / 100.0 < next.run().totalSize()) {
-    break;
-}
-```
-
-低峰期时 `ratioForOffPeak()` 返回配置的 offPeakRatio，使阈值更宽松。
-
-### 5.6 Full Compaction：全量压缩
-
-Full Compaction 由 `CompactStrategy.pickFullCompaction()` 静态方法实现（已在 5.1 节分析）。触发场景包括：
-
-1. **commit.force-compact=true**：每次 commit 前强制全量压缩
-2. **full-compaction.delta-commits**：流式写入每 N 次 commit 触发一次
-3. **EarlyFullCompaction** 的三种条件
-4. **SizeAmplification** 超过阈值
-5. **用户通过 Flink Action 或 Spark Procedure 手动触发**
+**`updateLastFullCompaction()` 的调用面**（已修正）：三个条件命中后都会调它（`:96/:106/:118`，旧稿漏了条件 2 的调用），此外 `UniversalCompaction.pickForSizeAmp`（`:141`）和 `createUnit` 全量分支（`:220`）也会调——确保**任何导致全量的路径**都刷新时间戳，时间间隔触发才准确。
 
 ---
 
-## 6. Compact Task 执行层
+## 6. Compact Task 执行层：upgrade vs rewrite
 
-### 6.1 MergeTreeCompactTask：主压缩任务
+**① 要解决什么问题**：选好文件后，怎么用**最少的 I/O** 把它们合到目标层？核心洞见是——**不是所有文件都需要重写**。已经足够大的文件，只要把它的 level 元数据改高就行，物理数据原封不动。这是 compaction 写放大优化的关键。
 
-**源码位置**：`paimon-core/src/main/java/org/apache/paimon/mergetree/compact/MergeTreeCompactTask.java`
+### 6.1 MergeTreeCompactTask：大文件 upgrade、小文件 rewrite
 
-这是主键表 Compaction 的核心执行逻辑。
-
-```java
-public class MergeTreeCompactTask extends CompactTask {
-    private final long minFileSize;                           // compactionFileSize
-    private final CompactRewriter rewriter;
-    private final int outputLevel;
-    private final List<List<SortedRun>> partitioned;          // IntervalPartition 的结果
-    private final boolean dropDelete;
-    private final int maxLevel;
-    @Nullable private final RecordLevelExpire recordLevelExpire;
-    private final boolean forceRewriteAllFiles;
-}
-```
-
-**`doCompact()` 的详细流程：**
+`mergetree/compact/MergeTreeCompactTask.java:41`。`doCompact()`（`:82`）先经 IntervalPartition 切 section（§3.2），再对每个 section 分流：
 
 ```java
-protected CompactResult doCompact() throws Exception {
-    List<List<SortedRun>> candidate = new ArrayList<>();
-    CompactResult result = new CompactResult();
-
-    for (List<SortedRun> section : partitioned) {
-        if (section.size() > 1) {
-            // 多个 SortedRun 重叠，需要 merge sort
-            candidate.add(section);
-        } else {
-            SortedRun run = section.get(0);
-            for (DataFileMeta file : run.files()) {
-                if (file.fileSize() < minFileSize) {
-                    // 小文件：加入候选集，与前面的文件一起重写
-                    candidate.add(singletonList(SortedRun.fromSingle(file)));
-                } else {
-                    // 大文件：先重写已有候选，然后 upgrade 大文件
-                    rewrite(candidate, result);
-                    upgrade(file, result);
-                }
+for (List<SortedRun> section : partitioned) {
+    if (section.size() > 1) {
+        candidate.add(section);                         // 多 run 重叠 → 必须 merge sort
+    } else {
+        for (DataFileMeta file : section.get(0).files()) {
+            if (file.fileSize() < minFileSize) {        // 小文件 → 攒进候选集一起重写
+                candidate.add(singletonList(SortedRun.fromSingle(file)));
+            } else {                                    // 大文件 → 先冲刷候选，再 upgrade
+                rewrite(candidate, result);
+                upgrade(file, result);
             }
         }
     }
-    rewrite(candidate, result);
-    result.setDeletionFile(compactDfSupplier.get());
-    return result;
 }
+rewrite(candidate, result);
+result.setDeletionFile(compactDfSupplier.get());        // DV 延迟生成在这里求值
 ```
 
-**核心设计决策——为什么区分大文件和小文件？**
+**为什么以 `minFileSize`（= `compactionFileSize` = `targetFileSize × compaction.small-file-ratio`，默认 0.7）为界**：阈值取 0.7 而非 1.0 是关键——压缩输出文件大小受压缩率影响、由 RollingFileWriter 滚动切分，不完全精确。若界线正好等于 targetFileSize，一个刚写出的"接近目标大小"的文件可能在连续两次 compaction 里被反复判定为"不够大、重写"，来回折腾。0.7 留出安全余量，让足够大的文件稳定走零 I/O 的 upgrade（`CoreOptions.java:3042`、`:725`）。
 
-这是一个写放大优化的关键设计：
+### 6.2 upgrade：零 I/O，但三种情况下必须降级为重写
 
-- **大文件**（>= `compactionFileSize`，即 `targetFileSize * 0.7`）：直接 upgrade level，只修改元数据（DataFileMeta 的 level 字段），不重写数据。这避免了大量无效 I/O。
-- **小文件**（< `compactionFileSize`）：加入候选集一起重写，将多个小文件合并成一个大文件。
-
-**`compactionFileSize = targetFileSize * 0.7` 的设计意图：**
-
-使用 70% 的 targetFileSize 作为阈值是因为压缩算法对文件大小的估算不完全精确（压缩率影响）。如果阈值与 targetFileSize 完全相等，可能导致同一个文件在连续两次 Compaction 中被反复重写。70% 提供了一个安全余量。
-
-#### upgrade 方法的深层逻辑
+`upgrade(file)`（`:123`）默认只改 level 元数据：
 
 ```java
 private void upgrade(DataFileMeta file, CompactResult toUpdate) throws Exception {
-    if ((outputLevel == maxLevel && containsDeleteRecords(file))
-            || forceRewriteAllFiles
-            || containsExpiredRecords(file)) {
-        // 不能简单 upgrade，必须重写
-        List<List<SortedRun>> candidate = new ArrayList<>();
-        candidate.add(singletonList(SortedRun.fromSingle(file)));
-        rewriteImpl(candidate, toUpdate);
-        return;
+    if ((outputLevel == maxLevel && containsDeleteRecords(file))   // ① 输出最高层且含 DELETE
+            || forceRewriteAllFiles                                // ② 强制重写（外部路径同步）
+            || containsExpiredRecords(file)) {                     // ③ 含过期记录（record-level expire）
+        rewriteImpl(/* 单文件作为一个 section */); return;          //   → 必须真重写
     }
-
     if (file.level() != outputLevel) {
-        CompactResult upgradeResult = rewriter.upgrade(outputLevel, file);
-        toUpdate.merge(upgradeResult);
+        toUpdate.merge(rewriter.upgrade(outputLevel, file));       // 否则零 I/O：file.upgrade(level)
         upgradeFilesNum++;
     }
 }
 ```
 
-**三种必须重写的情况：**
+`rewriter.upgrade`（`AbstractCompactRewriter`）只 `new CompactResult(file, file.upgrade(outputLevel))`——新建一个 level 字段改了的 DataFileMeta，**物理文件指针不变，零字节 I/O**。
 
-1. **输出到最高层且包含删除记录**：最高层的删除记录需要被真正删除（dropDelete），不能保留
-2. **强制重写所有文件**：用于外部路径同步等场景
-3. **包含过期记录**：Record Level Expire 需要物理删除过期数据
+**三种必须真重写的情况（背后都是"元数据改改不掉的脏东西"）**：
+1. 输出到最高层且含 DELETE 记录：最高层要 dropDelete 物理清掉删除标记，光改 level 删不掉。
+2. `forceRewriteAllFiles`：外部路径同步等场景要求每个文件都新生成。
+3. 含过期记录：record-level expire 要物理删掉过期行（§11），只有重写才能去掉它们。
 
-### 6.2 FileRewriteCompactTask：文件级重写任务
+### 6.3 FileRewriteCompactTask 与分流总览
 
-**源码位置**：`paimon-core/src/main/java/org/apache/paimon/mergetree/compact/FileRewriteCompactTask.java`
+`mergetree/compact/FileRewriteCompactTask.java` 用于 `CompactUnit.fileRewrite=true`（§5.1 空操作优化命中时）：逐文件 `rewriter.rewrite(outputLevel, dropDelete, [file])`，无 IntervalPartition、无 merge sort，简单高效——因为这些文件已在最高层、彼此不重叠，只是各自需要清过期/物化 DV。
 
-```java
-public class FileRewriteCompactTask extends CompactTask {
-    @Override
-    protected CompactResult doCompact() throws Exception {
-        CompactResult result = new CompactResult();
-        for (DataFileMeta file : files) {
-            rewriteFile(file, result);
-        }
-        return result;
-    }
+分流决策树：
 
-    private void rewriteFile(DataFileMeta file, CompactResult toUpdate) throws Exception {
-        List<List<SortedRun>> candidate = singletonList(singletonList(SortedRun.fromSingle(file)));
-        toUpdate.merge(rewriter.rewrite(outputLevel, dropDelete, candidate));
-    }
-}
+```
+CompactUnit
+├─ fileRewrite=true  → FileRewriteCompactTask（逐文件重写，免归并）
+└─ fileRewrite=false → MergeTreeCompactTask → IntervalPartition 切 section
+       ├─ section 多 run 重叠            → 候选集 merge sort
+       └─ section 单 run，逐文件：
+              ├─ < minFileSize           → 候选集（与邻近文件一起重写）
+              └─ ≥ minFileSize：
+                     ├─ 命中三种必须重写  → 强制 rewrite
+                     └─ 否则             → upgrade（仅改 level，零 I/O）
 ```
 
-**为什么需要单独的 FileRewriteCompactTask？**
-
-当 `CompactUnit.fileRewrite()=true` 时（Full Compaction 中仅最高层有文件需要单独重写的场景），不需要 IntervalPartition 和 merge sort 的复杂流程。`FileRewriteCompactTask` 逐文件调用 `rewriter.rewrite()`，简单高效。
-
-### 6.3 upgrade 与 rewrite 的区分逻辑
-
-```mermaid
-graph TD
-    A[CompactUnit] --> B{fileRewrite?}
-    B -->|true| C[FileRewriteCompactTask]
-    B -->|false| D[MergeTreeCompactTask]
-    D --> E[IntervalPartition 分区]
-    E --> F{section.size > 1?}
-    F -->|是| G[加入候选集 merge sort]
-    F -->|否| H{file.size < minFileSize?}
-    H -->|是| I[加入候选集]
-    H -->|否| J{需要重写?}
-    J -->|是| K[强制 rewrite]
-    J -->|否| L[upgrade level 只改元数据]
-```
+**⑤ 收益与代价**：upgrade 让"数据已大体到位、只是分层不对"的常见情形几乎免 I/O，是 Paimon 写放大显著低于 CoW 湖格式的实现细节之一。代价是判断分支较多、`minFileSize` 配置需配合 `targetFileSize` 理解（陷阱见 §6.1）。
 
 ---
 
-## 7. CompactRewriter 重写器体系
+## 7. CompactRewriter：标准 / Changelog / Lookup 三系
 
-### 7.1 继承层次总览
+**① 要解决什么问题**：rewrite 阶段真正干"读多个 sorted run → 归并 → 写新文件"的活，但不同 changelog-producer 还要在归并时**顺带产出 changelog**。`CompactRewriter` 用继承把"标准重写"和"重写时产 changelog"分层，changelog 的语义详见 [24 Changelog 产生](24-Changelog机制全链路分析.md)，本文只讲 compaction 阶段的部分。
 
 ```
-CompactRewriter (interface)
-└── AbstractCompactRewriter (abstract)
-    └── MergeTreeCompactRewriter (default)
-        └── ChangelogMergeTreeRewriter (abstract)
-            ├── LookupMergeTreeCompactRewriter
-            └── FullChangelogMergeTreeCompactRewriter
+CompactRewriter (接口)
+└── AbstractCompactRewriter        upgrade() 默认实现：new CompactResult(file, file.upgrade(level))
+    └── MergeTreeCompactRewriter   标准：merge sort + RollingFileWriter 写新文件（无 changelog）
+        └── ChangelogMergeTreeRewriter   抽象：rewriteChangelog() 判断要不要产 changelog
+            ├── LookupMergeTreeCompactRewriter            changelog-producer=lookup
+            └── FullChangelogMergeTreeCompactRewriter     changelog-producer=full-compaction
 ```
 
-| 重写器 | 适用场景 | 特殊能力 |
-|--------|---------|---------|
-| `MergeTreeCompactRewriter` | 标准主键表（无 changelog） | merge sort + 写入新文件 |
-| `LookupMergeTreeCompactRewriter` | `changelog-producer=lookup` | 通过 LookupLevels 查找旧值，生成 changelog |
-| `FullChangelogMergeTreeCompactRewriter` | `changelog-producer=full-compaction` | Full Compaction 时生成 changelog |
+### 7.1 MergeTreeCompactRewriter：标准重写
 
-### 7.2 MergeTreeCompactRewriter：标准重写器
+`mergetree/compact/MergeTreeCompactRewriter.java:47`。`rewriteCompaction()`（`:78`）核心三步：`createRollingMergeTreeFileWriter` 建按 targetFileSize 自动滚动的写出器 → `readerForMergeTree(sections, ReducerMergeFunctionWrapper)` 建归并 reader（`dropDelete` 时套一层 `DropDeleteReader` 过滤掉删除记录）→ `writer.write(iterator)`。归并链路（SortMergeReader/MergeFunction/四种 merge engine）详见 [01 §5 读取路径](01-核心存储引擎分析.md)、[08 PartialUpdate/Aggregation](08-Merge引擎与聚合函数.md)。`upgrade()` 走父类 `AbstractCompactRewriter.java:34` 的零 I/O 实现（§6.2）。
 
-**源码位置**：`paimon-core/src/main/java/org/apache/paimon/mergetree/compact/MergeTreeCompactRewriter.java`
+### 7.2 ChangelogMergeTreeRewriter：要不要产 changelog
+
+`mergetree/compact/ChangelogMergeTreeRewriter.java:47`。`rewrite()`（`:103`）按 `rewriteChangelog()`（抽象，`:78`）的返回值分流：要产 changelog 走 `rewriteOrProduceChangelog()`（`:118`，归并时把每条记录的旧值与新值的差异同时写进 changelog 文件），否则退回标准 `rewriteCompaction()`。
+
+`UpgradeStrategy` 枚举（`:214`）控制 upgrade 时的两个开关（产不产 changelog × 重不重写数据）：
+
+| 策略 | 产 changelog | 重写数据 | 含义 |
+|------|:---:|:---:|------|
+| `NO_CHANGELOG_NO_REWRITE` | ✗ | ✗ | 普通 upgrade，纯改 level |
+| `CHANGELOG_NO_REWRITE` | ✓ | ✗ | 只为产 changelog 读一遍，但数据文件直接 upgrade |
+| `CHANGELOG_WITH_REWRITE` | ✓ | ✓ | 既产 changelog 又重写数据 |
+
+**为什么需要"不是每次 compaction 都产 changelog"**：产 changelog 要额外读旧值、写新文件，成本不低。只在真正能看到完整变更的 compaction 上产——这也是 lookup 与 full-compaction 两个 producer 的核心差异点。
+
+### 7.3 LookupMergeTreeCompactRewriter：涉及 L0 才产
+
+`mergetree/compact/LookupMergeTreeCompactRewriter.java:56`。`rewriteChangelog` 转调 `rewriteLookupChangelog`（`ChangelogMergeTreeRewriter.java:85`）：`outputLevel==0` 不产；否则只要 section 里涉及任一 L0 文件就产 changelog——因为 L0 是新写入，与高层旧值归并才能算出变更前后镜像。
+
+`upgradeStrategy()`（`:133`）的分级决策（精简）：
+- `file.level() != 0` → `NO_CHANGELOG_NO_REWRITE`（非 L0 文件，无新变更）
+- L0 但**跨文件格式**（`level2FileFormat` 不一致）→ `CHANGELOG_WITH_REWRITE`（格式变了必须重写）
+- L0 且 **DV 模式有删除行** → `CHANGELOG_WITH_REWRITE`（要物化删除）
+- L0 且输出最高层 → `CHANGELOG_NO_REWRITE`
+- L0 且 **DEDUPLICATE 引擎 + 无 sequence 字段** → `CHANGELOG_NO_REWRITE`（"最新"由文件 seqNum 定，upgrade 不改 seqNum，结果不变，故免重写）
+- 其余 → `CHANGELOG_WITH_REWRITE`
+
+两个回调收尾（`:103`、`:110`）：`notifyRewriteCompactBefore` 在重写前移除旧文件的 DV（新文件已物化删除，旧 DV 不能再套到新文件上）；`notifyRewriteCompactAfter` 在启用远程 lookup 文件时把新文件包装生成 `.lookup` 远程索引文件（避免 failover 后重建本地索引，对应 [01 §1.3 陷阱 6](01-核心存储引擎分析.md)）。
+
+### 7.4 FullChangelogMergeTreeCompactRewriter：只在最高层产
+
+`mergetree/compact/FullChangelogMergeTreeCompactRewriter.java:43`。逻辑极简（`:72`、`:84`）：
 
 ```java
-protected CompactResult rewriteCompaction(
-        int outputLevel, boolean dropDelete, List<List<SortedRun>> sections) throws Exception {
-    RollingFileWriter<KeyValue, DataFileMeta> writer =
-            writerFactory.createRollingMergeTreeFileWriter(outputLevel, FileSource.COMPACT);
-    RecordReader<KeyValue> reader = null;
-    try {
-        reader = readerForMergeTree(sections, new ReducerMergeFunctionWrapper(mfFactory.create()));
-        if (dropDelete) {
-            reader = new DropDeleteReader(reader);
-        }
-        writer.write(new RecordReaderIterator<>(reader));
-    } finally {
-        IOUtils.closeAll(reader, writer);
-    }
-    List<DataFileMeta> before = extractFilesFromSections(sections);
-    List<DataFileMeta> after = writer.result();
-    return new CompactResult(before, after);
-}
-```
-
-**为什么使用 RollingFileWriter？**
-
-`RollingFileWriter` 在写入过程中会根据 `targetFileSize` 自动切分文件。这确保了压缩输出的每个文件大小都接近目标值，避免产生过大或过小的文件。
-
-**upgrade 方法的默认实现：**
-
-```java
-// AbstractCompactRewriter
-public CompactResult upgrade(int outputLevel, DataFileMeta file) throws Exception {
-    return new CompactResult(file, file.upgrade(outputLevel));
-}
-```
-
-`file.upgrade(outputLevel)` 只创建一个新的 DataFileMeta 对象，将 level 字段改为 outputLevel，物理文件不变。这是零 I/O 操作。
-
-### 7.3 ChangelogMergeTreeRewriter：变更日志重写器
-
-**源码位置**：`paimon-core/src/main/java/org/apache/paimon/mergetree/compact/ChangelogMergeTreeRewriter.java`
-
-这是一个抽象类，定义了生成 changelog 的 Compaction 框架：
-
-```java
-@Override
-public CompactResult rewrite(
-        int outputLevel, boolean dropDelete, List<List<SortedRun>> sections) throws Exception {
-    if (rewriteChangelog(outputLevel, dropDelete, sections)) {
-        return rewriteOrProduceChangelog(outputLevel, sections, dropDelete, true);
-    } else {
-        return rewriteCompaction(outputLevel, dropDelete, sections);
-    }
-}
-```
-
-**为什么需要 `rewriteChangelog()` 判断？**
-
-并非所有 Compaction 都需要生成 changelog。例如：
-- Lookup 模式只在涉及 L0 文件时生成 changelog
-- Full-Compaction 模式只在输出到最高层时生成 changelog
-
-**`rewriteOrProduceChangelog()` 的双写流程：**
-
-```java
-private CompactResult rewriteOrProduceChangelog(...) {
-    CloseableIterator<ChangelogResult> iterator = readerForMergeTree(sections, createMergeWrapper(outputLevel)).toCloseableIterator();
-    RollingFileWriter<KeyValue, DataFileMeta> compactFileWriter = ...;
-    RollingFileWriter<KeyValue, DataFileMeta> changelogFileWriter = ...;
-
-    while (iterator.hasNext()) {
-        ChangelogResult result = iterator.next();
-        KeyValue keyValue = result.result();
-        if (compactFileWriter != null && keyValue != null && (!dropDelete || keyValue.isAdd())) {
-            compactFileWriter.write(keyValue);
-        }
-        if (produceChangelog) {
-            for (KeyValue kv : result.changelogs()) {
-                changelogFileWriter.write(kv);
-            }
-        }
-    }
-    // ...
-}
-```
-
-**`UpgradeStrategy` 枚举——升级时的行为选择：**
-
-```java
-protected enum UpgradeStrategy {
-    NO_CHANGELOG_NO_REWRITE(false, false),    // 无 changelog，不重写
-    CHANGELOG_NO_REWRITE(true, false),         // 生成 changelog，不重写数据
-    CHANGELOG_WITH_REWRITE(true, true);        // 生成 changelog 且重写数据
-}
-```
-
-### 7.4 LookupMergeTreeCompactRewriter：Lookup 重写器
-
-**源码位置**：`paimon-core/src/main/java/org/apache/paimon/mergetree/compact/LookupMergeTreeCompactRewriter.java`
-
-```java
-@Override
-protected boolean rewriteChangelog(int outputLevel, boolean dropDelete, List<List<SortedRun>> sections) {
-    return rewriteLookupChangelog(outputLevel, sections);
-}
-
-// ChangelogMergeTreeRewriter 中的实现
-protected boolean rewriteLookupChangelog(int outputLevel, List<List<SortedRun>> sections) {
-    if (outputLevel == 0) return false;
-    for (List<SortedRun> runs : sections) {
-        for (SortedRun run : runs) {
-            for (DataFileMeta file : run.files()) {
-                if (file.level() == 0) return true;  // 涉及 L0 文件则生成 changelog
-            }
-        }
-    }
-    return false;
-}
-```
-
-**`upgradeStrategy()` 的复杂决策：**
-
-```java
-protected UpgradeStrategy upgradeStrategy(int outputLevel, DataFileMeta file) {
-    if (file.level() != 0) return NO_CHANGELOG_NO_REWRITE;
-    // L0 文件需要特殊处理
-
-    // 不同文件格式需要重写
-    if (!level2FileFormat.apply(file.level()).equals(level2FileFormat.apply(outputLevel))) {
-        return CHANGELOG_WITH_REWRITE;
-    }
-    // DV 模式下有删除记录需要重写
-    if (dvMaintainer != null && file.deleteRowCount().map(cnt -> cnt > 0).orElse(true)) {
-        return CHANGELOG_WITH_REWRITE;
-    }
-    // 输出到最高层，不需要重写
-    if (outputLevel == maxLevel) return CHANGELOG_NO_REWRITE;
-    // DEDUPLICATE 引擎无序列字段时不需要重写
-    if (mergeEngine == MergeEngine.DEDUPLICATE && noSequenceField) {
-        return CHANGELOG_NO_REWRITE;
-    }
-    // 其他情况必须重写
-    return CHANGELOG_WITH_REWRITE;
-}
-```
-
-**为什么 DEDUPLICATE + 无序列字段可以不重写？**
-
-DEDUPLICATE 引擎保留最新记录。没有序列字段时，"最新"的定义是文件的 sequence number 最大。upgrade（只改 level）不会改变 sequence number，因此不影响最终结果。
-
-**`notifyRewriteCompactBefore()` 和 `notifyRewriteCompactAfter()`：**
-
-```java
-@Override
-protected void notifyRewriteCompactBefore(List<DataFileMeta> files) {
-    if (dvMaintainer != null) {
-        files.forEach(file -> dvMaintainer.removeDeletionVectorOf(file.fileName()));
-    }
-}
-
-@Override
-protected List<DataFileMeta> notifyRewriteCompactAfter(List<DataFileMeta> files) {
-    if (remoteLookupFileManager == null) return files;
-    List<DataFileMeta> result = new ArrayList<>();
-    for (DataFileMeta file : files) {
-        result.add(remoteLookupFileManager.genRemoteLookupFile(file));
-    }
-    return result;
-}
-```
-
-**为什么在压缩前移除 DV？**
-
-压缩后的新文件已经物化了删除（通过 merge sort 或 dropDelete），不再需要旧的 Deletion Vector。提前移除避免了旧 DV 被错误应用到新文件。
-
-### 7.5 FullChangelogMergeTreeCompactRewriter
-
-**源码位置**：`paimon-core/src/main/java/org/apache/paimon/mergetree/compact/FullChangelogMergeTreeCompactRewriter.java`
-
-```java
-@Override
-protected boolean rewriteChangelog(int outputLevel, boolean dropDelete, List<List<SortedRun>> sections) {
+protected boolean rewriteChangelog(...) {
     boolean changelog = outputLevel == maxLevel;
-    if (changelog) {
-        Preconditions.checkArgument(dropDelete, "Delete records should be dropped...");
-    }
+    if (changelog) Preconditions.checkArgument(dropDelete, "Delete records should be dropped...");
     return changelog;
 }
-
-@Override
 protected UpgradeStrategy upgradeStrategy(int outputLevel, DataFileMeta file) {
     return outputLevel == maxLevel ? CHANGELOG_NO_REWRITE : NO_CHANGELOG_NO_REWRITE;
 }
 ```
 
-**为什么只在 outputLevel == maxLevel 时生成 changelog？**
-
-Full-Compaction changelog 模式的语义是：只有全量压缩（输出到最高层）时才能看到完整的变更。非全量压缩不涉及所有数据，无法产生完整的 changelog。
+**为什么只在 `outputLevel == maxLevel` 产**：full-compaction changelog 的语义是"全量压缩时一次性吐出完整变更"。非全量压缩不涉及所有数据，看不到某 key 的完整历史，无法产正确的 changelog。这也解释了陷阱 7——这个模式必须配 `full-compaction.delta-commits` 或 `optimization-interval` 保证全量压缩按时发生，否则 changelog 延迟可达数小时。
 
 ---
 
 ## 8. Append-Only 表 Compaction
 
-### 解决什么问题
+**① 要解决什么问题**：Append 表无主键、无 UPDATE/DELETE（DV 模式除外），不需要按 key merge sort，但**小文件治理的需求一模一样**——每次 flush 一个小文件，不合并照样读爆/OOM。和主键表的关键差异：合并只是把多个小文件拼成大文件（无归并语义），且要按 Writer 是否绑定固定 bucket 分两套机制。小文件成因与运维处方详见 [11 小文件治理](11-小文件治理机制.md)，本文只讲 compaction 的执行机制。
 
-**核心业务问题:**
-Append-Only 表的 Compaction 解决的是"无主键表如何压缩"的问题。与主键表不同:
-- 不需要 merge sort,只需要简单拼接
-- 不需要处理 UPDATE/DELETE,只有 INSERT
-- 但仍需要合并小文件,减少文件数量
-- 需要处理 Deletion Vector(行级删除)
+| 表形态 | 管理器 | 触发判断 | 备注 |
+|--------|--------|----------|------|
+| 有桶 Append | `BucketedAppendCompactManager` | 滑动窗口：文件数 ≥ minFileNum 或总大小 ≥ targetFileSize×2 | Writer 端内联 |
+| 无桶（Unaware-Bucket） | `AppendCompactCoordinator` | 中心化扫描 + Age 机制 | 常作为 dedicated 作业（§11） |
 
-**没有这个设计的后果:**
-```java
-// 没有 Append Compaction 的后果:
-// 场景 1: 小文件堆积
-// 每秒写入 1 个小文件,一天产生 86400 个文件
-List<DataFileMeta> files = scan.files(); // 86400 个文件
-for (DataFileMeta file : files) {
-    reader.open(file); // 打开 86400 次,OOM
-}
+### 8.1 BucketedAppendCompactManager：滑动窗口
 
-// 场景 2: 无法清理 DV 标记的删除行
-// DELETE FROM table WHERE id = 1; // 通过 DV 标记删除
-// 但物理文件永远不会重写,删除行永远占用空间
-```
-
-**实际场景:**
-某日志系统的访问日志表,每秒写入 10000 条记录,每次 flush 产生 1 个 10MB 的小文件。一天产生 8640 个文件,查询时需要打开所有文件,内存占用 100GB,最终 OOM。引入 Append Compaction 后,合并为 100 个 1GB 文件,内存占用降到 1GB。
-
-### 有什么坑
-
-**误区陷阱:**
-1. **误以为 Append 表不需要压缩**: 小文件堆积同样会导致读性能下降和 OOM
-2. **minFileNum 设置过大**: minFileNum=100 导致小文件长时间不被压缩
-3. **忘记处理尾文件**: 压缩输出的最后一个小文件不放回队列,成为永久小文件
-
-**错误配置示例:**
-```sql
--- 错误 1: minFileNum 过大
-ALTER TABLE my_table SET ('compaction.min.file-num' = '1000');
--- 后果: 需要 1000 个小文件才触发压缩,文件数失控
-
--- 错误 2: targetFileSize 过小
-ALTER TABLE my_table SET ('target-file-size' = '1MB');
--- 后果: 压缩后仍然产生大量小文件
-
--- 错误 3: 禁用 Age 机制
--- 无法配置禁用,但如果 minFileNum 过大,Age 机制也无法生效
-```
-
-**生产环境注意事项:**
-- 监控文件数量,超过 1000 说明压缩跟不上写入
-- DV 模式下必须按 indexFile 分组,避免索引文件冲突
-- Unaware-Bucket 表必须配置 Coordinator,否则无法自动压缩
-
-**性能陷阱:**
-```java
-// 陷阱 1: 频繁触发压缩
-ALTER TABLE my_table SET ('compaction.min.file-num' = '2');
-// 每 2 个文件就压缩一次,写放大过大
-
-// 陷阱 2: 不回收尾文件
-// 压缩输出的最后一个小文件不放回队列
-// 导致永久存在小文件
-```
-
-### 核心概念解释
-
-**术语定义:**
-- **BucketedAppendCompactManager**: 有 Bucket 的 Append 表压缩管理器
-- **AppendCompactCoordinator**: Unaware-Bucket 表的中心化协调器
-- **SubCoordinator**: 每个分区的子协调器,维护待压缩文件列表
-- **Age 机制**: 老化机制,强制压缩长时间未凑够数量的文件
-
-**概念关系:**
-```
-Append 表 Compaction
-├── 有 Bucket
-│   └── BucketedAppendCompactManager
-│       ├── toCompact: PriorityQueue<DataFileMeta> (按 seqNum 排序)
-│       └── pickCompactBefore() (滑动窗口算法)
-└── 无 Bucket (Unaware-Bucket)
-    └── AppendCompactCoordinator
-        ├── FilesIterator (扫描快照)
-        └── SubCoordinator (每个分区)
-            ├── toCompact: Set<DataFileMeta>
-            ├── age: int (老化计数)
-            └── agePack() (Age 机制)
-```
-
-**与其他系统对比:**
-| 系统 | Append 表压缩 | 中心化协调 | Age 机制 | DV 支持 |
-|------|--------------|-----------|---------|---------|
-| Paimon | ✓ | ✓ (Unaware-Bucket) | ✓ | ✓ |
-| Iceberg | ✓ | ✗ (外部调度) | ✗ | ✓ |
-| Hudi | ✓ | ✗ | ✗ | ✗ |
-| Delta Lake | ✓ | ✗ | ✗ | ✓ |
-
-### 设计理念
-
-**为什么这样设计:**
-1. **区分 Bucket 和 Unaware-Bucket**: 有 Bucket 的表可以在 Writer 端自动压缩,无 Bucket 的表需要中心化协调
-2. **滑动窗口算法**: BucketedAppendCompactManager 使用滑动窗口,避免一次性合并过多数据
-3. **Age 机制**: SubCoordinator 的 Age 机制确保少量文件也能被压缩,避免永久小文件
-
-**权衡取舍:**
-```java
-// 权衡 1: 何时触发压缩
-// 选择: fileNum >= minFileNum || totalSize >= targetFileSize * 2
-if (fileNum >= minFileNum) {
-    return Optional.of(candidates);
-} else if (totalFileSize >= targetFileSize * 2) {
-    // 移除最早的文件,右移窗口
-}
-// 好处: 既保证文件数量,又控制总大小
-// 代价: 算法复杂度增加
-
-// 权衡 2: Age 机制的阈值
-// 选择: COMPACT_AGE=5, REMOVE_AGE=10
-if (++age > COMPACT_AGE && toCompact.size() > 1) {
-    // 强制压缩
-}
-// 好处: 避免少量文件永远不被压缩
-// 代价: 可能产生较小的压缩输出
-```
-
-**架构演进:**
-- **v0.4**: 只支持有 Bucket 的 Append 表
-- **v0.6**: 引入 AppendCompactCoordinator,支持 Unaware-Bucket 表
-- **v0.8**: 引入 Age 机制,避免永久小文件
-- **v1.0**: 引入 DV 支持,按 indexFile 分组
-- **v1.3**: 引入 AppendPreCommitCompactCoordinator,pre-commit 级别压缩
-
-**业界对比:**
-Paimon 的创新点:
-1. **中心化协调**: AppendCompactCoordinator 支持 Unaware-Bucket 表的自动压缩
-2. **Age 机制**: 确保少量文件也能被压缩,避免永久小文件
-3. **DV 分组**: 按 indexFile 分组,避免索引文件冲突
-
-### 8.1 BucketedAppendCompactManager
-
-**源码位置**：`paimon-core/src/main/java/org/apache/paimon/append/BucketedAppendCompactManager.java`
-
-有 Bucket 的 Append-Only 表使用 `BucketedAppendCompactManager`，其设计比主键表的简单得多。
+`append/BucketedAppendCompactManager.java:52`。待压缩文件放进 `PriorityQueue<DataFileMeta> toCompact`（`:60`，按 `minSequenceNumber` 排序，优先合并较旧文件保时间局部性）。`pickCompactBefore()`（`:204`）是滑动窗口：
 
 ```java
-public class BucketedAppendCompactManager extends CompactFutureManager {
-    private final PriorityQueue<DataFileMeta> toCompact;  // 按 minSequenceNumber 排序
-    private final int minFileNum;
-    private final long targetFileSize;
-    private final long compactionFileSize;
-    private List<DataFileMeta> compacting;  // 当前正在压缩的文件
-}
-```
-
-**为什么使用 PriorityQueue 而非 List？**
-
-按 minSequenceNumber 排序确保了文件按写入顺序处理。优先合并较旧的文件，保持数据的时间局部性。
-
-**自动压缩的文件选择：**
-
-```java
-Optional<List<DataFileMeta>> pickCompactBefore() {
-    long totalFileSize = 0L;
-    int fileNum = 0;
-    LinkedList<DataFileMeta> candidates = new LinkedList<>();
-
-    while (!toCompact.isEmpty()) {
-        DataFileMeta file = toCompact.poll();
-        candidates.add(file);
-        totalFileSize += file.fileSize();
-        fileNum++;
-        if (fileNum >= minFileNum) {
-            return Optional.of(candidates);
-        } else if (totalFileSize >= targetFileSize * 2) {
-            // 总大小过大，移除最早的文件，右移窗口
-            DataFileMeta removed = candidates.pollFirst();
-            totalFileSize -= removed.fileSize();
-            fileNum--;
-        }
-    }
-    toCompact.addAll(candidates);  // 不够数量，放回去
-    return Optional.empty();
-}
-```
-
-**滑动窗口算法的设计意图：**
-
-当文件总大小超过 `targetFileSize * 2` 时，从头部移除最早的文件。这保证了候选集的总大小不会过大，同时维持足够的文件数量。这样做的好处是：
-1. 避免一次性合并过多数据导致内存溢出
-2. 保持文件数量在合理范围内
-3. 优先合并较旧的文件，保持时间局部性
-
-**结果处理的尾文件回收：**
-
-```java
-public Optional<CompactResult> getCompactionResult(boolean blocking) {
-    Optional<CompactResult> result = innerGetCompactionResult(blocking);
-    if (result.isPresent()) {
-        CompactResult compactResult = result.get();
-        if (!compactResult.after().isEmpty()) {
-            DataFileMeta lastFile = compactResult.after().get(compactResult.after().size() - 1);
-            if (lastFile.fileSize() < compactionFileSize) {
-                toCompact.add(lastFile);  // 尾文件太小，放回候选队列
-            }
-        }
-        compacting = null;
-    }
-    return result;
-}
-```
-
-**为什么要回收尾文件？**
-
-压缩输出的最后一个文件可能因为数据不够而较小。将其放回候选队列，让它在下一次压缩中与新文件合并，避免产生永久的小文件。
-
-### 8.2 AppendCompactCoordinator：Unaware-Bucket 协调器
-
-**源码位置**：`paimon-core/src/main/java/org/apache/paimon/append/AppendCompactCoordinator.java`
-
-Unaware-Bucket 表没有固定的 Bucket 分配，需要一个中心化的协调器来扫描快照、分配压缩任务。
-
-**核心流程：**
-
-```java
-public List<AppendCompactTask> run() {
-    if (scan()) {          // 1. 扫描新文件
-        return compactPlan(); // 2. 生成压缩计划
-    }
-    return Collections.emptyList();
-}
-```
-
-**FilesIterator 的扫描机制：**
-
-```java
-class FilesIterator {
-    private void assignNewIterator() {
-        if (nextSnapshot == null) {
-            nextSnapshot = snapshotManager.latestSnapshotId();
-            snapshotReader.withMode(ScanMode.ALL);     // 首次全量扫描
-        } else {
-            snapshotReader.withMode(ScanMode.DELTA);   // 后续增量扫描
-        }
-        currentIterator = snapshotReader.withSnapshot(snapshot).readFileIterator();
+while (!toCompact.isEmpty()) {
+    DataFileMeta file = toCompact.poll();
+    candidates.add(file); totalFileSize += file.fileSize(); fileNum++;
+    if (fileNum >= minFileNum) return Optional.of(candidates);          // 攒够数量就合
+    else if (totalFileSize >= targetFileSize * 2) {                     // 总量太大：右移窗口
+        DataFileMeta removed = candidates.pollFirst();
+        totalFileSize -= removed.fileSize(); fileNum--;
     }
 }
+toCompact.addAll(candidates); return Optional.empty();                  // 不够，放回
 ```
 
-**为什么首次用 ALL，后续用 DELTA？**
+**为什么用滑动窗口而非一次全取**：总大小卡 `targetFileSize×2` 上限，避免单次合并吞太多数据导致内存/产物过大，同时维持足够文件数。
 
-首次启动需要扫描所有现有文件以发现需要压缩的小文件。之后只需要关注新增的文件（DELTA），避免重复处理。
+**尾文件回收**（`getCompactionResult`，`:185`）：压缩产物的最后一个文件可能因数据不够而偏小，若 `< compactionFileSize` 就放回 `toCompact`，让它下次和新文件再合，避免留下永久小文件。
 
-**`shouldCompact()` 的判断逻辑：**
+### 8.2 AppendCompactCoordinator：Unaware-Bucket 与 Age 机制
+
+`append/AppendCompactCoordinator.java:70`。无桶表没有 Writer-bucket 绑定，需中心化协调器扫快照、分任务。`FilesIterator`（`:404`）首次用 `ScanMode.ALL` 全量扫（`:437`）、之后用 `ScanMode.DELTA` 增量扫（`:442`），避免重复处理老文件。`shouldCompact()` 只挑小文件或删除比例过高的文件。
+
+每个分区一个 `SubCoordinator`（`:212`），其 **Age 机制**（`:72`–`:73`、`:252`）解决中心化协调的两个死角：
 
 ```java
-private boolean shouldCompact(BinaryRow partition, DataFileMeta file) {
-    return file.fileSize() < compactionFileSize || tooHighDeleteRatio(partition, file);
-}
+protected static final int REMOVE_AGE = 10;
+protected static final int COMPACT_AGE = 5;
+// agePack(): 攒不够 minFileNum 时
+if (++age > COMPACT_AGE && toCompact.size() > 1) { /* 强制压缩现有文件 */ }
+// readyToRemove():
+return toCompact.isEmpty() || age > REMOVE_AGE;       // 久不活跃就从内存移除
 ```
 
-只有小文件或删除比例过高的文件才参与压缩。大文件不需要压缩。
+- `COMPACT_AGE=5`：一个分区文件数始终凑不够 minFileNum 时，等 5 轮就强制合现有文件——否则冷分区的少量小文件**永远**不会被压缩。
+- `REMOVE_AGE=10`：超 10 轮仍不活跃的分区从内存清出，防止协调器内存随历史分区数无界增长。
 
-**SubCoordinator 的老化机制：**
+**DV 模式按 indexFile 分组**（`packInDeletionVectorVMode`）：多个数据文件可能共享同一个 DV 索引文件，必须分到同一压缩任务，否则该索引文件被多任务重复读写、冲突。
 
-```java
-class SubCoordinator {
-    int age = 0;
-    static final int REMOVE_AGE = 10;
-    static final int COMPACT_AGE = 5;
+### 8.3 AppendCompactTask 与 pre-commit 预压缩
 
-    private List<List<DataFileMeta>> agePack() {
-        List<List<DataFileMeta>> packed = pack(toCompact);
-        if (packed.isEmpty()) {
-            if (++age > COMPACT_AGE && toCompact.size() > 1) {
-                // 5 次扫描都没凑够数量，强制压缩
-                List<DataFileMeta> all = new ArrayList<>(toCompact);
-                toCompact.clear();
-                packed = Collections.singletonList(all);
-            }
-        }
-        return packed;
-    }
+`append/AppendCompactTask.java` 的 `doCompact()` 调 `write.compactRewrite(partition, bucket, dvGetter, compactBefore)` 拼接重写；DV 启用时先取删除向量在重写中应用，再清旧 DV、持久化新索引条目。产物封装成 `CommitMessageImpl`，**bucket 固定为 0**——Unaware-Bucket 表所有数据逻辑上在 bucket 0，是向后兼容旧设计的约定。
 
-    public boolean readyToRemove() {
-        return toCompact.isEmpty() || age > REMOVE_AGE; // 10 次后清除
-    }
-}
-```
-
-**为什么需要老化机制？**
-
-- **COMPACT_AGE=5**：如果一个分区的文件凑不够 `minFileNum` 个，等待 5 轮后强制压缩。这避免了少量小文件永远不被处理。
-- **REMOVE_AGE=10**：超过 10 轮仍然只有一个文件的分区，从内存中移除。这是内存优化，避免长时间保持不活跃分区的状态。
-
-**DV 模式下的分组策略：**
-
-```java
-private List<List<DataFileMeta>> packInDeletionVectorVMode(Set<DataFileMeta> toCompact) {
-    Map<String, List<DataFileMeta>> filesWithDV = new HashMap<>();
-    Set<DataFileMeta> rest = new HashSet<>();
-    for (DataFileMeta dataFile : toCompact) {
-        String indexFile = dvMaintainerCache.dvMaintainer(partition).getIndexFilePath(dataFile.fileName());
-        if (indexFile == null) {
-            rest.add(dataFile);
-        } else {
-            filesWithDV.computeIfAbsent(indexFile, f -> new ArrayList<>()).add(dataFile);
-        }
-    }
-    // 按 indexFile 分组，确保共享同一个 DV 文件的数据文件一起压缩
-}
-```
-
-**为什么要按 DV indexFile 分组？**
-
-多个数据文件可能共享同一个 DV 索引文件。如果它们分别在不同的压缩任务中处理，会导致 DV 索引文件被重复读写。按 indexFile 分组确保了共享 DV 的文件一起处理，避免索引文件冲突。
-
-### 8.3 AppendCompactTask：独立压缩任务
-
-**源码位置**：`paimon-core/src/main/java/org/apache/paimon/append/AppendCompactTask.java`
-
-```java
-public CommitMessage doCompact(FileStoreTable table, BaseAppendFileStoreWrite write) throws Exception {
-    boolean dvEnabled = table.coreOptions().deletionVectorsEnabled();
-    if (dvEnabled) {
-        // DV 模式：通过 DV 维护器获取删除向量，重写时应用
-        AppendDeleteFileMaintainer dvIndexFileMaintainer = ...;
-        compactAfter.addAll(write.compactRewrite(partition, UNAWARE_BUCKET,
-                dvIndexFileMaintainer::getDeletionVector, compactBefore));
-        // 清理旧 DV 并持久化新的索引条目
-        compactBefore.forEach(f -> dvIndexFileMaintainer.notifyRemovedDeletionVector(f.fileName()));
-        List<IndexManifestEntry> indexEntries = dvIndexFileMaintainer.persist();
-    } else {
-        compactAfter.addAll(write.compactRewrite(partition, UNAWARE_BUCKET, null, compactBefore));
-    }
-
-    return new CommitMessageImpl(partition, 0, table.coreOptions().bucket(),
-            DataIncrement.emptyIncrement(),
-            new CompactIncrement(compactBefore, compactAfter, ...));
-}
-```
-
-**为什么 bucket=0？**
-
-Unaware-Bucket 表的所有数据逻辑上在 bucket 0 中。这是向后兼容旧设计的约定。
-
-### 8.4 AppendPreCommitCompactCoordinator
-
-**源码位置**：`paimon-core/src/main/java/org/apache/paimon/append/AppendPreCommitCompactCoordinator.java`
-
-这是一个轻量级的 pre-commit 阶段压缩协调器，用于在提交前将同分区的小文件缓冲起来。
-
-```java
-public class AppendPreCommitCompactCoordinator {
-    private final long targetFileSize;
-    private final Map<BinaryRow, PartitionFiles> partitions;
-
-    public Optional<Pair<BinaryRow, List<DataFileMeta>>> addFile(BinaryRow partition, DataFileMeta file) {
-        PartitionFiles files = partitions.computeIfAbsent(partition, ignore -> new PartitionFiles());
-        files.addFile(file);
-        if (files.totalSize >= targetFileSize) {
-            partitions.remove(partition);
-            return Optional.of(Pair.of(partition, files.files));
-        }
-        return Optional.empty();
-    }
-}
-```
-
-**为什么需要 pre-commit 级别的压缩？**
-
-这是一个"预防性"压缩：在 commit 之前，如果同一分区的文件总大小已经达到 targetFileSize，就立即发起压缩。这减少了后续异步压缩的压力。
+`append/AppendPreCommitCompactCoordinator.java` 是轻量级 pre-commit 预压缩：`addFile()` 把同分区文件缓冲，一旦累计 `≥ targetFileSize` 立即发起压缩。这是"预防性"合并，在 commit 前就把刚写的小文件并掉，减轻后续异步压缩压力。
 
 ---
 
-## 9. Clustering Compaction:聚簇压缩
+## 9. Clustering Compaction：聚簇压缩
 
-### 解决什么问题
+**① 要解决什么问题**：普通 MergeTree compaction 按主键排序，但很多查询按非主键列过滤（时间区间、地区、类型）。数据按主键排时，每个文件的过滤列 min/max 范围都横跨全域，谓词无法跳文件。Clustering compaction 把数据**按用户指定的聚簇列重排**，让每个文件的聚簇列范围收窄、不重叠，查询时基于 min/max 统计跳过大量文件。它是主键表的可选高级模式（`ClusteringCompactManager`），不能替代主键去重，只优化扫描。
 
-**核心业务问题:**
-Clustering Compaction 解决的是"如何优化特定列的查询性能"的问题。普通 MergeTree Compaction 按主键排序,但业务查询往往按其他列过滤:
-- 按时间范围查询: WHERE create_time BETWEEN '2024-01-01' AND '2024-01-31'
-- 按地区查询: WHERE region = 'Beijing'
-- 按类型查询: WHERE order_type = 'online'
+**② 设计原理与取舍：两阶段 + 外部排序 + Spill**
 
-**没有这个设计的后果:**
+`clustering/ClusteringCompactManager.java:67`，只有两层文件（unsorted=L0 / sorted=L1，由 `ClusteringFiles` 管理）。`compact()`（`:195`）分两阶段：
+
 ```java
-// 没有 Clustering Compaction 的后果:
-// 场景: 按 create_time 查询,但数据按 order_id(主键)排序
-SELECT * FROM orders WHERE create_time BETWEEN '2024-01-01' AND '2024-01-31';
-
-// 需要扫描所有文件,因为每个文件的 create_time 范围都是 [2024-01-01, 2024-12-31]
-for (DataFileMeta file : allFiles) {
-    if (timeRangeOverlap(file, queryRange)) {
-        scan(file); // 扫描 1000 个文件,耗时 10 秒
-    }
+List<DataFileMeta> existingSortedFiles = fileLevels.sortedFiles();   // Phase 2 用 Phase 1 之前的快照
+for (DataFileMeta file : unsortedFiles) {                            // Phase 1：每个 unsorted 单独排序
+    sortedFiles = fileRewriter.sortAndRewriteFile(file, ...);
 }
-
-// 有 Clustering Compaction 后:
-// 数据按 create_time 排序,每个文件的时间范围不重叠
-// 只需要扫描 10 个文件,耗时 100ms
-```
-
-**实际场景:**
-某电商公司的订单表,主键是 order_id,但 90% 的查询按 create_time 过滤。使用主键排序时,查询需要扫描 1000 个文件,耗时 10 秒。引入 Clustering Compaction 按 create_time 排序后,只需扫描 10 个文件,耗时降到 100ms,性能提升 100 倍。
-
-### 有什么坑
-
-**误区陷阱:**
-1. **聚簇列选择错误**: 选择高基数列(如 order_id)作为聚簇列,无法有效过滤文件
-2. **忘记配置 sort-spill-buffer-size**: 默认 64MB 太小,排序时频繁溢写,性能下降
-3. **误以为 Clustering 可以替代主键**: Clustering 只是优化查询,仍需要主键保证唯一性
-
-**错误配置示例:**
-```sql
--- 错误 1: 聚簇列选择错误
-ALTER TABLE orders SET ('clustering.columns' = 'order_id');
--- order_id 是主键,已经按主键排序,聚簇列应该选择查询常用的列
-
--- 错误 2: sort-spill-buffer-size 过小
-ALTER TABLE orders SET (
-    'clustering.columns' = 'create_time',
-    'clustering.sort-spill-buffer-size' = '1MB'  -- 太小!
-);
--- 后果: 排序时频繁溢写,性能下降 10 倍
-
--- 错误 3: spillThreshold 过小
-ALTER TABLE orders SET ('clustering.spill-threshold' = '2');
--- 后果: 合并 3 个文件就溢写,产生大量临时文件
-```
-
-**生产环境注意事项:**
-- 聚簇列应该选择查询常用的低基数列(如时间、地区、类型)
-- sort-spill-buffer-size 建议设置为 256MB-1GB
-- spillThreshold 建议设置为 10-20,避免频繁溢写
-
-**性能陷阱:**
-```java
-// 陷阱 1: 频繁触发 Clustering Compaction
-ALTER TABLE orders SET ('clustering.trigger-interval' = '1m');
-// 每分钟触发一次,写放大过大
-
-// 陷阱 2: 聚簇列过多
-ALTER TABLE orders SET ('clustering.columns' = 'col1,col2,col3,col4,col5');
-// 5 个聚簇列,排序开销过大,性能下降
-```
-
-### 核心概念解释
-
-**术语定义:**
-- **Clustering Compaction**: 按聚簇列重新排序数据的压缩模式
-- **ClusteringFiles**: 两级文件管理,unsorted(Level 0) 和 sorted(Level 1)
-- **ClusteringKeyIndex**: 主键索引,用于去重(first-row merge engine)
-- **Spill 机制**: 当合并文件数超过阈值时,溢写小文件到行式临时文件
-
-**概念关系:**
-```
-ClusteringCompactManager
-├── fileLevels: ClusteringFiles
-│   ├── unsortedFiles: List<DataFileMeta> (Level 0)
-│   └── sortedFiles: List<DataFileMeta> (Level 1)
-├── fileRewriter: ClusteringFileRewriter
-│   ├── sortAndRewriteFile() (Phase 1: 排序)
-│   └── mergeAndRewriteFiles() (Phase 2: 合并)
-└── keyIndex: ClusteringKeyIndex (主键索引)
-
-两阶段流程:
-Phase 1: unsorted → 外部排序 → sorted
-Phase 2: sorted → 多路归并 → merged sorted
-```
-
-**与其他系统对比:**
-| 系统 | 聚簇支持 | 排序方式 | Spill 机制 | 索引去重 |
-|------|---------|---------|-----------|---------|
-| Paimon | ✓ | 外部排序 | ✓ | ✓ |
-| Delta Lake | ✓ (Z-Order) | Hilbert 曲线 | ✗ | ✗ |
-| Iceberg | ✓ (Sort Order) | 内存排序 | ✗ | ✗ |
-| Hudi | ✓ (Clustering) | 内存排序 | ✗ | ✗ |
-
-### 设计理念
-
-**为什么这样设计:**
-1. **两阶段压缩**: Phase 1 独立排序,Phase 2 协调合并,职责清晰
-2. **外部排序**: 使用 BinaryExternalSortBuffer,支持大文件排序,不受内存限制
-3. **Spill 机制**: 当合并文件数过多时,溢写小文件,减少同时打开的 reader 数量
-
-**权衡取舍:**
-```java
-// 权衡 1: 内存排序 vs 外部排序
-// 选择: 外部排序(BinaryExternalSortBuffer)
-BinaryExternalSortBuffer sortBuffer = BinaryExternalSortBuffer.create(...);
-// 好处: 支持大文件排序,不受内存限制
-// 代价: 需要溢写到磁盘,性能略低于内存排序
-
-// 权衡 2: 何时 Spill
-// 选择: 文件数 > spillThreshold 时溢写最小的文件
-if (inputFiles.size() > spillThreshold) {
-    sortedBySize.sort(Comparator.comparingLong(DataFileMeta::fileSize));
-    filesToSpill = sortedBySize.subList(0, spillCount);
-}
-// 好处: 减少同时打开的 reader 数量,避免 OOM
-// 代价: 溢写和读取临时文件有额外开销
-
-// 权衡 3: Phase 2 使用 Phase 1 之前的快照
-List<DataFileMeta> existingSortedFiles = fileLevels.sortedFiles(); // Phase 1 之前
-// 好处: 避免刚写入的文件立即被合并,减少写放大
-// 代价: Phase 1 产生的文件需要等下次 Compaction 才能合并
-```
-
-**架构演进:**
-- **v0.8**: 引入 Clustering Compaction,支持聚簇列排序
-- **v1.0**: 引入 ClusteringKeyIndex,支持 first-row 去重
-- **v1.2**: 引入 Spill 机制,支持大量文件合并
-- **v1.5**: 优化 Phase 2 的 section 划分,减少写放大
-
-**业界对比:**
-Paimon 的创新点:
-1. **两阶段设计**: Phase 1 独立排序,Phase 2 协调合并,比 Delta Lake 的 Z-Order 更灵活
-2. **外部排序**: 支持大文件排序,不受内存限制
-3. **Spill 机制**: 减少同时打开的 reader 数量,避免 OOM
-
-### 9.1 ClusteringCompactManager 整体设计
-
-**源码位置**：`paimon-core/src/main/java/org/apache/paimon/mergetree/compact/clustering/ClusteringCompactManager.java`
-
-Clustering Compaction 是 Paimon 独有的高级压缩模式，通过将数据按聚簇列重新排序，优化特定查询模式的读取性能。
-
-**设计哲学：**
-
-普通 MergeTree Compaction 按主键排序，而 Clustering Compaction 按用户指定的聚簇列排序。这意味着：
-- 按聚簇列查询时，可以跳过大量不相关的文件（基于 min/max 统计）
-- 相同聚簇列值的数据物理上相邻存储，提升 I/O 效率
-
-**两阶段压缩流程：**
-
-```java
-private CompactResult compact(boolean fullCompaction) throws Exception {
-    CompactResult result = new CompactResult();
-
-    // Phase 1: 排序所有未排序文件
-    List<DataFileMeta> unsortedFiles = fileLevels.unsortedFiles();
-    List<DataFileMeta> existingSortedFiles = fileLevels.sortedFiles();
-    for (DataFileMeta file : unsortedFiles) {
-        List<DataFileMeta> sortedFiles =
-                fileRewriter.sortAndRewriteFile(file, kvSerializer, kvSchemaType, keyIndex);
-        result.before().add(file);
-        result.after().addAll(sortedFiles);
-    }
-
-    // Phase 2: 合并已排序文件
-    List<List<DataFileMeta>> mergeGroups;
-    if (fullCompaction) {
-        mergeGroups = singletonList(existingSortedFiles);
-    } else {
-        mergeGroups = fileRewriter.pickMergeCandidates(existingSortedFiles);
-    }
-
-    for (List<DataFileMeta> mergeGroup : mergeGroups) {
-        if (mergeGroup.size() >= 2) {
-            for (DataFileMeta file : mergeGroup) keyIndex.deleteIndex(file);
-            List<DataFileMeta> mergedFiles = fileRewriter.mergeAndRewriteFiles(mergeGroup);
-            for (DataFileMeta newFile : mergedFiles) keyIndex.rebuildIndex(newFile);
-            if (dvMaintainer != null) {
-                for (DataFileMeta file : mergeGroup) dvMaintainer.removeDeletionVectorOf(file.fileName());
-            }
-            result.before().addAll(mergeGroup);
-            result.after().addAll(mergedFiles);
-        }
-    }
-    return result;
+mergeGroups = fullCompaction ? singletonList(existingSortedFiles)
+                             : fileRewriter.pickMergeCandidates(existingSortedFiles);  // Phase 2：选合并组
+for (List<DataFileMeta> g : mergeGroups) if (g.size() >= 2) {
+    g.forEach(keyIndex::deleteIndex);
+    merged = fileRewriter.mergeAndRewriteFiles(g);                   // 多路归并
+    merged.forEach(keyIndex::rebuildIndex);
 }
 ```
 
-**为什么要分两个阶段？**
+- **为什么分两阶段**：Phase 1（单文件排序）彼此独立、可并行；Phase 2（按聚簇列范围重叠分组后多路归并）需要协调。分开使两边都简单。
+- **为什么 Phase 2 用 Phase 1 之前的 `existingSortedFiles` 快照**（`:204`）：否则会把 Phase 1 刚产出的文件立刻又卷进合并，平白增加写放大。
+- **外部排序 + Spill**：Phase 1 用 `BinaryExternalSortBuffer`（内存不够溢写磁盘，支持大文件）；Phase 2 多路归并时若输入文件数超 `spillThreshold`，把最小的几个文件先溢写成行式临时文件，减少同时打开的 reader 数、防 OOM（每个输入文件本身已按聚簇列有序，溢写不破坏顺序）。
 
-- **Phase 1 是独立的**：每个未排序文件单独排序重写，不需要与其他文件交互
-- **Phase 2 需要协调**：合并需要考虑文件间的 key 范围重叠关系
+**③ 关键细节**
+- `ClusteringFiles` 标注 `@ThreadSafe`（方法全 synchronized）：`addNewFile()`（Writer 线程）和 `compact()`（压缩线程）并发访问。不复用 `Levels` 是因为只需两层、且要额外的文件 ID 映射给 key index 用。
+- `ClusteringKeyIndex` 给 first-row merge engine 做去重：Phase 1 排序后用 `keyIndex.checkKey()` 跳过主键已存在于更早文件的记录。
+- `pickMergeCandidates` 会把相邻的小 section 与重叠 section 一起并，避免产出大量小文件。
 
-分阶段设计使得 Phase 1 可以并行处理多个文件（虽然当前实现是顺序的），Phase 2 的合并候选选择更加精确（基于 Phase 1 产生的已排序文件）。
+**④ 风险 / 陷阱**
+- 聚簇列应选**查询常用的低基数列**（时间/地区/类型）。选主键这类高基数列等于没聚簇（主键本就有序），白付写放大。
+- 聚簇列过多 → 排序开销线性上升；`sort-spill-buffer-size` 过小 → 频繁溢写拖慢 Phase 1。
 
-**关键点——为什么 Phase 2 使用 Phase 1 之前的 `existingSortedFiles` 快照？**
-
-```java
-List<DataFileMeta> existingSortedFiles = fileLevels.sortedFiles(); // Phase 1 之前快照
-```
-
-Phase 1 会产生新的排序文件加入 fileLevels。如果 Phase 2 使用最新的 sortedFiles，会包含 Phase 1 刚产生的文件，导致刚写入的文件立即被合并，增加不必要的写放大。
-
-### 9.2 Phase 1：排序重写
-
-**源码位置**：`paimon-core/src/main/java/org/apache/paimon/mergetree/compact/clustering/ClusteringFileRewriter.java`
-
-```java
-public List<DataFileMeta> sortAndRewriteFile(
-        DataFileMeta inputFile, KeyValueSerializer kvSerializer,
-        RowType kvSchemaType, ClusteringKeyIndex keyIndex) throws Exception {
-
-    // 1. 创建外部排序缓冲区
-    int[] sortFieldsInKeyValue = Arrays.stream(clusteringColumns)
-            .map(i -> i + keyType.getFieldCount() + 2)  // 偏移到 value 中的聚簇列
-            .toArray();
-    BinaryExternalSortBuffer sortBuffer = BinaryExternalSortBuffer.create(
-            ioManager, kvSchemaType, sortFieldsInKeyValue, sortSpillBufferSize, ...);
-
-    // 2. 读取所有记录写入排序缓冲区
-    try (RecordReader<KeyValue> reader = valueReaderFactory.createRecordReader(inputFile)) {
-        try (CloseableIterator<KeyValue> iterator = reader.toCloseableIterator()) {
-            while (iterator.hasNext()) {
-                KeyValue kv = iterator.next();
-                sortBuffer.write(kvSerializer.toRow(kv));
-            }
-        }
-    }
-
-    // 3. 读取排序后的数据，检查 key 索引，写入新文件
-    RollingFileWriter<KeyValue, DataFileMeta> writer = writerFactory.createRollingClusteringFileWriter();
-    try {
-        MutableObjectIterator<BinaryRow> sortedIterator = sortBuffer.sortedIterator();
-        BinaryRow binaryRow = new BinaryRow(kvSchemaType.getFieldCount());
-        while ((binaryRow = sortedIterator.next(binaryRow)) != null) {
-            KeyValue kv = kvSerializer.fromRow(binaryRow);
-            KeyValue copied = kv.copy(new InternalRowSerializer(keyType), new InternalRowSerializer(valueType));
-            byte[] keyBytes = keySerializer.serializeToBytes(copied.key());
-            if (!keyIndex.checkKey(keyBytes)) continue;  // 键索引去重
-            writer.write(copied);
-        }
-    } finally {
-        sortBuffer.clear();
-        writer.close();
-    }
-
-    List<DataFileMeta> newFiles = writer.result();
-    fileLevels.removeFile(inputFile);
-    for (DataFileMeta newFile : newFiles) fileLevels.addNewFile(newFile);
-    for (DataFileMeta sortedFile : newFiles) keyIndex.rebuildIndex(sortedFile);
-    return newFiles;
-}
-```
-
-**为什么要用 BinaryExternalSortBuffer？**
-
-文件可能很大（128MB+），不能全部放入内存排序。`BinaryExternalSortBuffer` 支持内存+磁盘的外部排序，内存不够时自动溢写到临时文件。
-
-**为什么需要 key 索引检查（`keyIndex.checkKey()`）？**
-
-Clustering Compaction 用于 first-row merge engine 时，需要去重。key 索引维护了已知的主键集合，如果排序后发现某条记录的主键已存在于更早的文件中，则跳过该记录（或通过 DV 标记删除旧记录）。
-
-### 9.3 Phase 2：合并重写
-
-**合并候选选择算法：**
-
-```java
-public List<List<DataFileMeta>> pickMergeCandidates(List<DataFileMeta> sortedFiles) {
-    if (sortedFiles.size() < 2) return Collections.emptyList();
-
-    // 1. 按聚簇列范围分组（重叠的文件在同一组）
-    List<List<DataFileMeta>> sections = groupIntoSections(sortedFiles);
-
-    // 2. 合并相邻的重叠组和小组
-    long smallSectionThreshold = targetFileSize / 2;
-    List<List<DataFileMeta>> mergeGroups = new ArrayList<>();
-    List<DataFileMeta> pending = new ArrayList<>();
-
-    for (List<DataFileMeta> section : sections) {
-        boolean needsMerge = section.size() >= 2;           // 有重叠
-        boolean isSmall = sectionSize(section) < smallSectionThreshold; // 太小
-
-        if (needsMerge || isSmall) {
-            pending.addAll(section);  // 需要合并的组加入待处理
-        } else {
-            if (pending.size() >= 2) mergeGroups.add(new ArrayList<>(pending));
-            pending.clear();          // 大的独立组作为分隔符
-        }
-    }
-    if (pending.size() >= 2) mergeGroups.add(pending);
-    return mergeGroups;
-}
-```
-
-**为什么要合并相邻的小 section？**
-
-单独合并每个小 section 会产生很多小文件。通过合并相邻的小 section（和重叠的 section），可以产生更大的文件，减少后续读取时需要打开的文件数量。
-
-**多路归并排序实现：**
-
-```java
-public List<DataFileMeta> mergeAndRewriteFiles(List<DataFileMeta> inputFiles) throws Exception {
-    // 1. 大文件保留 reader，小文件溢写到行式临时文件
-    List<DataFileMeta> filesToSpill = new ArrayList<>();
-    List<DataFileMeta> filesToKeep;
-    if (inputFiles.size() > spillThreshold) {
-        // 按大小排序，最小的溢写
-        sortedBySize.sort(Comparator.comparingLong(DataFileMeta::fileSize));
-        int spillCount = inputFiles.size() - spillThreshold;
-        filesToSpill = sortedBySize.subList(0, spillCount);
-        filesToKeep = sortedBySize.subList(spillCount, sortedBySize.size());
-    } else {
-        filesToKeep = inputFiles;
-    }
-
-    // 2. 使用最小堆进行多路归并
-    PriorityQueue<MergeEntry> minHeap = new PriorityQueue<>((a, b) ->
-            clusteringComparatorInValue.compare(a.currentKeyValue.value(), b.currentKeyValue.value()));
-
-    // 初始化堆
-    for (DataFileMeta file : filesToKeep) {
-        CloseableIterator<KeyValue> iterator = valueReaderFactory.createRecordReader(file).toCloseableIterator();
-        if (iterator.hasNext()) {
-            minHeap.add(new MergeEntry(iterator.next().copy(...), iterator));
-        }
-    }
-    // ... 类似处理 spilledChannels
-
-    // 3. 归并写入
-    while (!minHeap.isEmpty()) {
-        MergeEntry entry = minHeap.poll();
-        writer.write(entry.currentKeyValue);
-        if (entry.iterator.hasNext()) {
-            entry.currentKeyValue = entry.iterator.next().copy(...);
-            minHeap.add(entry);
-        }
-    }
-}
-```
-
-### 9.4 ClusteringFiles 文件管理
-
-**源码位置**：`paimon-core/src/main/java/org/apache/paimon/mergetree/compact/clustering/ClusteringFiles.java`
-
-```java
-@ThreadSafe
-public class ClusteringFiles {
-    private final List<DataFileMeta> unsortedFiles = new ArrayList<>();  // Level 0
-    private final List<DataFileMeta> sortedFiles = new ArrayList<>();    // Level 1
-    private final Map<Integer, DataFileMeta> idToFileMap = new HashMap<>();
-    private final Map<String, Integer> fileNameToIdMap = new HashMap<>();
-}
-```
-
-**为什么使用 `@ThreadSafe`？**
-
-`ClusteringCompactManager` 的 `addNewFile()` 由 Writer 线程调用，而 `compact()` 由 CompactTask 线程调用。`ClusteringFiles` 的所有方法都是 synchronized 的，确保线程安全。
-
-**为什么不使用 Levels 而是自己管理？**
-
-Clustering Compaction 只有两个层级（unsorted/sorted），不需要 Levels 的多层管理。此外，还需要文件 ID 映射（用于 key index），这是 Levels 不提供的。
-
-### 9.5 Spill 机制与内存管理
-
-```java
-private SpilledChannel spillToRowBasedFile(DataFileMeta file) throws Exception {
-    FileIOChannel.ID channel = ioManager.createChannel();
-    KeyValueWithLevelNoReusingSerializer serializer = new KeyValueWithLevelNoReusingSerializer(keyType, valueType);
-    BlockCompressionFactory compressFactory = BlockCompressionFactory.create(compression);
-    int compressBlock = (int) MemorySize.parse("64 kb").getBytes();
-
-    ChannelWriterOutputView out = FileChannelUtil.createOutputView(ioManager, channel, compressFactory, compressBlock);
-    try (RecordReader<KeyValue> reader = valueReaderFactory.createRecordReader(file)) {
-        RecordIterator<KeyValue> batch;
-        KeyValue record;
-        while ((batch = reader.readBatch()) != null) {
-            while ((record = batch.next()) != null) {
-                serializer.serialize(record, out);
-            }
-            batch.releaseBatch();
-        }
-    } finally {
-        out.close();
-    }
-    return new SpilledChannel(channelWithMeta, compressFactory, compressBlock, serializer);
-}
-```
-
-**为什么需要 spill 到行式临时文件？**
-
-当合并的文件数量超过 `spillThreshold` 时，同时打开所有文件的 reader 会占用大量内存和文件句柄。通过将较小的文件先溢写到行式格式（不需要解析列式格式的复杂结构），可以减少同时打开的 reader 数量，同时保持按聚簇列排序的特性（因为每个输入文件本身已经是按聚簇列排序的）。
+**⑤ 收益与代价**：聚簇列查询可跳过大量文件、I/O 大幅下降；代价是额外的排序/归并写放大，且只对命中聚簇列的查询有效。聚簇/排序写入的更多细节可参考 [11 小文件治理](11-小文件治理机制.md) 的排序压缩部分。
 
 ---
 
-## 10. Manifest 文件 Compaction
+## 10. Manifest 文件 Compaction（元数据层）
 
-### 10.1 MinorCompaction：增量合并
+**① 要解决什么问题**：每次 commit 都新增 manifest 文件（记录 DataFile 的 ADD/DELETE），commit 多了 manifest 文件爆炸，拖慢每次快照扫描的元数据读取。元数据层也要 compaction。入口 `operation/ManifestFileMerger.java`，分 Minor（增量合并）与 Full（全量对消）。
 
-**源码位置**：`paimon-core/src/main/java/org/apache/paimon/operation/ManifestFileMerger.java`
+### 10.1 Minor Compaction：攒够就合
 
-```java
-private static List<ManifestFileMeta> tryMinorCompaction(
-        List<ManifestFileMeta> input, ..., long suggestedMetaSize, int suggestedMinMetaCount, ...) {
-    List<ManifestFileMeta> result = new ArrayList<>();
-    List<ManifestFileMeta> candidates = new ArrayList<>();
-    long totalSize = 0;
+`tryMinorCompaction`（`ManifestFileMerger.java`）按顺序累加 manifest，攒够 `suggestedMetaSize` 就 `mergeCandidates` 合一批；末尾不足 `suggestedMinMetaCount` 的零头不合、原样保留。合并时 `FileEntry.mergeEntries` 会把同一 DataFile 的 **ADD + DELETE 对消**，只留最终状态——这是元数据瘦身的核心：一个文件被加又被删，两条记录抵消成零条。
 
-    for (ManifestFileMeta manifest : input) {
-        totalSize += manifest.fileSize();
-        candidates.add(manifest);
-        if (totalSize >= suggestedMetaSize) {
-            mergeCandidates(candidates, manifestFile, result, newFilesForAbort, ...);
-            candidates.clear();
-            totalSize = 0;
-        }
-    }
+### 10.2 Full Compaction：分区过滤优化
 
-    if (candidates.size() >= suggestedMinMetaCount) {
-        mergeCandidates(candidates, manifestFile, result, newFilesForAbort, ...);
-    } else {
-        result.addAll(candidates);
-    }
-    return result;
-}
-```
+`tryFullCompaction` 三步：
+1. 判断是否值得：只有 `numDeletedFiles>0 或 fileSize<suggestedMetaSize` 的"待变更" manifest，总大小超 `manifest.full-compaction-threshold-size`（默认 16MB，`CoreOptions.java:457`）才做。
+2. 读出所有 DELETE 条目集合。
+3. **分区过滤**：用 `PartitionPredicate` 只重写"包含被删分区"的 manifest——删除若只涉及少数分区，其他分区的 manifest 整文件原样保留，不读不写。逐条扫待变更 manifest：DELETE 条目跳过、被删 identifier 对消、其余保留；有变更才重写，无变更直接 `result.add(file)`。
 
-**为什么需要 Manifest Minor Compaction？**
-
-每次 commit 都会生成新的 manifest 文件。随着 commit 次数增加，manifest 文件数量会快速增长，影响快照扫描性能。Minor Compaction 将多个小 manifest 合并成大的，减少文件数量。
-
-**合并时的 ADD/DELETE 对消：**
-
-```java
-private static void mergeCandidates(...) {
-    Map<FileEntry.Identifier, ManifestEntry> map = new LinkedHashMap<>();
-    FileEntry.mergeEntries(manifestFile, candidates, map, ...);
-    // mergeEntries 会将 ADD + DELETE 对消，只保留最终状态
-}
-```
-
-### 10.2 FullCompaction：全量压缩
-
-```java
-public static Optional<List<ManifestFileMeta>> tryFullCompaction(
-        List<ManifestFileMeta> inputs, ..., long sizeTrigger, RowType partitionType, ...) {
-    // 1. 判断是否需要全量压缩
-    Filter<ManifestFileMeta> mustChange =
-            file -> file.numDeletedFiles() > 0 || file.fileSize() < suggestedMetaSize;
-    long totalDeltaFileSize = 0;
-    for (ManifestFileMeta file : inputs) {
-        if (mustChange.test(file)) {
-            totalDeltaFileSize += file.fileSize();
-        }
-    }
-    if (totalDeltaFileSize < sizeTrigger) return Optional.empty();
-
-    // 2. 读取所有删除条目
-    Set<FileEntry.Identifier> deleteEntries = FileEntry.readDeletedEntries(manifestFile, inputs, ...);
-
-    // 3. 用分区过滤跳过不受影响的 base 文件
-    PartitionPredicate predicate = ...;  // 只处理包含删除分区的 manifest
-
-    // 4. 重写需要变更的 manifest 文件
-    for (ManifestFileMeta file : toBeMerged) {
-        for (ManifestEntry entry : manifestFile.read(file)) {
-            if (entry.kind() == FileKind.DELETE) continue;    // 跳过 DELETE
-            if (deleteEntries.contains(entry.identifier())) {
-                requireChange = true;                          // 对消
-            } else {
-                entries.add(entry);                            // 保留
-            }
-        }
-        if (requireChange) writer.write(entries);
-        else result.add(file);  // 不需要变更的直接保留
-    }
-}
-```
-
-**为什么 Full Compaction 使用分区过滤优化？**
-
-如果删除操作只涉及少数分区，那么其他分区的 manifest 文件不需要重写。通过分区过滤，可以跳过大量不受影响的 manifest 文件，大幅减少全量压缩的 I/O。
-
-**触发条件**：当需要变更的 manifest 文件总大小超过 `manifest.full-compaction-threshold-size`（默认 16MB）时触发。
+**为什么分区过滤是关键优化**：全量对消若不加过滤要重写所有 manifest，I/O 与表规模成正比。分区过滤把代价降到"只和被影响分区相关"，大表上差距是数量级的。
 
 ---
 
-## 11. Compaction 配置参数全景
+## 11. Dedicated Compaction 与 Record-Level Expire 搭车清理
 
-### 11.1 主键表核心参数
+### 11.1 Dedicated（专用/离线）compaction：把压缩从写入里拆出来
+
+**① 要解决什么问题**：默认 compaction 是**写入端内联**的——写任务自己跑压缩、自己被反压。但有些场景不想让压缩占用写任务资源：写任务想全力吞吐、压缩交给单独作业；或 Unaware-Bucket 表根本没有 Writer-bucket 绑定、必须有中心化作业来压。这就是 dedicated compaction。
+
+**② 设计原理与取舍**：通过 Flink `CompactAction`（`paimon-flink-common/.../action/CompactAction.java:79`）/ `CompactProcedure` 或 Spark procedure 起一个专门的压缩作业，读表的快照、生成压缩任务、提交。关键约束（`:165`）：
+
+```java
+if (fullCompaction == null) {
+    fullCompaction = !isStreaming;          // 批模式默认 full，流模式默认 minor
+}
+checkArgument(!(fullCompaction && isStreaming),
+    "The full compact strategy is only supported in batch mode.");
+```
+
+- **批模式 dedicated 默认 full compaction**：一次性把表压到最优，适合定时离线整理。
+- **流模式 dedicated 默认 minor**：持续增量压缩，full 在流模式被禁止（会无限阻塞）。
+- 写任务侧应配合关闭内联 compaction（`write-only=true`），否则两边重复压、抢同一批文件冲突。
+
+**③ 取舍**：dedicated 把压缩的资源消耗、反压与写入解耦——写吞吐更稳、压缩可独立扩缩容/挑时段；代价是多一个作业要运维、且压缩与写入异步导致读放大短期更高。运维层面的部署与资源配比详见 [10 运维](10-运维优化方案.md)。Unaware-Bucket 的 `AppendCompactCoordinator`（§8.2）就是典型的 dedicated 协调器。
+
+### 11.2 Record-Level Expire：搭 full compaction 的车清过期行
+
+**① 要解决什么问题**：主键表想按"行内时间字段"做 TTL（如保留最近 90 天），但 LSM 不支持原地删行。Paimon 的做法是**不单独跑一个删除作业，而是让过期清理搭 compaction 的车**——反正 compaction 要重写文件，顺手把过期行扔掉，零额外 I/O 成本。
+
+**② 设计原理**：`io/RecordLevelExpire.java:52`，由 `record-level.expire-time` + `record-level.time-field` 两个配置启用（`CoreOptions.java:1912`、`:1922`，均无默认值，必须成对配）。它挂在 §5.1 的 `pickFullCompaction` 和 §6.2 的 `MergeTreeCompactTask.upgrade` 上：
+
+- `isExpireFile(file)`（`:118`）：读文件 value stats 的**最小时间值**，若 `minTime < currentTime - expireTime`（`:135`），说明文件里**可能**有过期行，标记为待重写。注意是基于文件级 min 统计的粗筛，不是逐行。
+- full compaction：`pickFullCompaction` 即使数据已全在最高层（本是空操作），只要某文件 `isExpireFile` 为真就把它选进来重写（§5.1）。
+- 大文件 upgrade：`upgrade` 里 `containsExpiredRecords(file)` 为真就从零 I/O 的 upgrade 降级为真重写（§6.2），重写时逐行过滤掉过期记录。
+
+**③ 关键认知（直接对应官方文档措辞）**：`record-level.expire-time` 的描述明确写着"expiration happens in compaction, there is no strong guarantee to expire records in time"——**过期是 compaction 的副作用，没有及时性保证**。一个过期行只有在它所在文件被 compaction 选中重写时才真正消失。
+
+**④ 风险 / 陷阱**
+- **过期延迟不可控**：冷数据文件长期不被 compaction 选中，过期行就一直在盘。要靠 `compaction.optimization-interval` 之类强制定期 full compaction 才能兜底清理。想要确定性的时间分区淘汰，应用 partition expire（[01 §14](01-核心存储引擎分析.md)）而非 record-level。
+- **必须成对配置**：只配 `expire-time` 不配 `time-field`，`create` 会校验失败（`:73`）。
+- **粗筛非精确**：`isExpireFile` 用文件级 min 统计判断，一个文件只要最老行过期就整体重写、其中未过期的行原样保留——所以代价是"可能多重写一些文件"，但保证不漏删。
+
+---
+
+## 12. Compaction 配置参数全景
+
+### 12.1 主键表核心参数
 
 | 参数 | 默认值 | 说明 | 设计意图 |
 |------|--------|------|---------|
-| `num-sorted-run.compaction-trigger` | 5 | 触发 Compaction 的 sorted run 数量 | 平衡读/写放大。值越小读性能越好但写放大越大 |
+| `num-sorted-run.compaction-trigger` | 5 | 触发 Compaction 的 sorted run 数量 | 平衡读/写放大。值越小读性能越好但写放大越大；一参三用（见陷阱 1） |
 | `num-sorted-run.stop-trigger` | trigger + 3 = 8 | 触发写入反压的阈值 | 给 Compaction 留出追赶时间，避免 sorted run 无限增长 |
 | `num-levels` | trigger + 1 = 6 | 总层级数 | 确保不会输出到 level 0 |
 | `target-file-size` | PK 表 128MB | 目标文件大小 | 太大导致单文件读取慢，太小导致文件过多 |
+| `compaction.small-file-ratio` | 0.7 | 小文件分界 = target × 此值 | upgrade/rewrite 分界，留余量防同文件反复重写（§6.1） |
 | `compaction.max-size-amplification-percent` | 200 | 空间放大触发阈值 | 200% 意味着增量数据最多是基线的 2 倍 |
-| `compaction.size-ratio` | 1 | 大小比率阈值 | 1% 的灵活度，越大越激进 |
+| `compaction.size-ratio` | 1 | 大小比率容差（%） | **越小越保守**（几乎等大才合）；调大才更激进（陷阱 3） |
 | `compaction.force-up-level-0` | false | 强制 L0 上推 | Lookup 场景自动启用 |
 | `write-buffer-size` | 256MB | 写缓冲区大小 | 影响 flush 频率和 L0 文件大小 |
-| `commit.force-compact` | false | commit 前强制压缩 | 批处理场景保证输出质量 |
+| `commit.force-compact` | false | commit 前强制压缩 | 批处理场景保证输出质量，流式慎用（陷阱 4） |
 
-### 11.2 Append 表参数
+### 12.2 Append 表参数
 
 | 参数 | 默认值 | 说明 | 设计意图 |
 |------|--------|------|---------|
@@ -2827,25 +830,26 @@ public static Optional<List<ManifestFileMeta>> tryFullCompaction(
 | `compaction.delete-ratio-threshold` | 0.2 | 删除比例阈值 | 超过 20% 删除的文件需要压缩 |
 | `target-file-size` | Append 表 256MB | 目标文件大小 | Append 表通常文件更大 |
 
-### 11.3 高级调优参数
+### 12.3 高级调优参数
 
 | 参数 | 默认值 | 说明 | 设计意图 |
 |------|--------|------|---------|
-| `compaction.optimization-interval` | null | 定期 Full Compaction 间隔 | 保证 read-optimized 系统表的时效性 |
+| `compaction.optimization-interval` | null | 定期 Full Compaction 间隔 | 保证 read-optimized 系统表的时效性、兜底 record-level expire |
 | `compaction.total-size-threshold` | null | 小表全量压缩阈值 | 小表可以频繁全量压缩 |
 | `compaction.incremental-size-threshold` | null | 增量大小触发阈值 | 增量过多时触发全量压缩 |
-| `compaction.offpeak.start.hour` | -1 | 低峰期开始小时 | -1 禁用 |
+| `compaction.offpeak.start.hour` | -1 | 低峰期开始小时 | -1 禁用，start==end 也禁用 |
 | `compaction.offpeak.end.hour` | -1 | 低峰期结束小时 | 支持跨午夜 |
 | `compaction.offpeak-ratio` | 0 | 低峰期额外比率 | 低峰期更激进压缩 |
 | `full-compaction.delta-commits` | null | 流式 N 次 commit 后 Full Compaction | changelog-producer=full-compaction 必需 |
 | `lookup-compact` | RADICAL | Lookup 压缩模式 | RADICAL 总是推 L0，GENTLE 有间隔 |
 | `lookup-compact.max-interval` | trigger * 2 | GENTLE 模式最大间隔 | 控制 L0 推送频率 |
 | `compaction.force-rewrite-all-files` | false | 强制重写所有文件 | 同步到外部路径场景 |
+| `record-level.expire-time` / `record-level.time-field` | null | 记录级过期（成对配） | 搭 compaction 清过期行，无及时性保证（§11.2） |
 | `manifest.full-compaction-threshold-size` | 16MB | Manifest 全量压缩触发大小 | 控制 Manifest 压缩频率 |
 
 ---
 
-## 12. Compaction Metrics 监控体系
+## 13. Compaction Metrics 监控体系
 
 **源码位置**：`paimon-core/src/main/java/org/apache/paimon/operation/metrics/CompactionMetrics.java`
 
@@ -2878,80 +882,44 @@ DoubleStream getCompactBusyStream() {
 }
 ```
 
-**为什么用 60 秒窗口？**
+**为什么用 60 秒窗口？** 太短指标抖动剧烈，太长反应迟钝，60 秒是平衡。
 
-太短的窗口会导致指标波动剧烈，太长的窗口反应迟钝。60 秒是一个合理的平衡，既能反映当前状态，又不会过于敏感。
-
----
-
-## 13. 设计决策深度剖析
-
-### 13.1 为什么选择 Universal Compaction 而非 Leveled Compaction？
-
-**RocksDB 提供了两种主要的 Compaction 策略：**
-
-| 特性 | Universal Compaction | Leveled Compaction |
-|------|---------------------|-------------------|
-| 写放大 | **低**（合并相近大小的 run） | 高（每次只合并一个 level） |
-| 读放大 | 中（sorted run 数量受限） | **低**（每层最多一个 run） |
-| 空间放大 | 中（通过 sizeAmp 控制） | 低 |
-| 适用场景 | 写密集型 | 读密集型 |
-
-**Paimon 选择 Universal Compaction 的原因：**
-
-1. Paimon 主要面向实时数据仓库场景，写入吞吐量是首要考量
-2. 通过 `EarlyFullCompaction` 和 `OffPeakHours` 弥补读放大
-3. Lookup 模式通过 `ForceUpLevel0Compaction` 保证查询性能
-4. 更简单的实现——不需要维护每层的大小比例
-
-### 13.2 为什么 dropDelete 的判断如此复杂？
-
-```java
-boolean dropDelete = !forceKeepDelete
-        && unit.outputLevel() != 0
-        && (unit.outputLevel() >= levels.nonEmptyHighestLevel() || dvMaintainer != null);
-```
-
-**背后的不变量：**
-
-删除标记只有在确认"没有更老的数据版本需要用这个标记来标识删除"时才能丢弃。
-
-- `outputLevel == 0`：不能丢弃，因为可能还有更老的高层数据
-- `outputLevel >= nonEmptyHighestLevel`：可以丢弃，因为输出就是最老的层
-- `dvMaintainer != null`：可以丢弃，因为 DV 会记录删除信息
-
-### 13.3 为什么 Clustering Compaction 使用两级文件（unsorted/sorted）而非多级 Levels？
-
-1. **语义简单**：只有"新写入未排序"和"已按聚簇列排序"两种状态
-2. **Phase 2 的合并策略不适合多级**：基于 key 范围重叠的 section 划分不是 level-based 的
-3. **避免多次排序**：多级 LSM 在 Compaction 时需要 merge sort，而 Clustering 的 Phase 1 已经完成排序
-
-### 13.4 为什么 AppendCompactCoordinator 使用 Age 机制？
-
-**核心问题**：Unaware-Bucket 表没有固定的 Writer-Bucket 绑定，无法在 Writer 端做自动压缩。中心化的 Coordinator 可能长时间收不到某个分区的新文件。
-
-**Age 机制解决两个问题：**
-1. **COMPACT_AGE=5**：避免少量文件永远凑不够 `minFileNum` 而不被压缩
-2. **REMOVE_AGE=10**：避免内存中保持大量不活跃分区的状态
-
-### 13.5 为什么 MergeTreeCompactTask 中要区分 IntervalPartition 的 section？
-
-**不做区间分区的问题：**
-
-假设有文件 A[1,100]、B[50,150]、C[200,300]。如果一次性 merge sort，需要读取所有三个文件。但实际上 C 与 A、B 没有 key 重叠。
-
-**做区间分区后：**
-
-- Section 1: {A, B}（重叠，需要 merge sort）
-- Section 2: {C}（独立，可以直接 upgrade）
-
-这减少了不必要的 I/O，尤其是当 C 是一个大文件时效果显著。
+**排障速查**（监控阈值与处方详见 [10 运维](10-运维优化方案.md)，此处给方向）：
+- `maxLevel0FileCount` 持续高（如 >20）：压缩跟不上写入 → 加压缩并行（多 bucket）、或转 dedicated compaction（§11.1）。
+- `compactionThreadBusy` 持续接近 100%：压缩线程吃满 → 资源不足或 `compaction-trigger` 太小压得太勤。
+- `compactionQueuedCount` 持续非零：任务排队，线程池处理不过来。
+- `maxSortBufferUtilisationPercent` 持续满：归并内存吃紧，多半是 `compaction-trigger` 调大后单次归并 run 太多（陷阱 1）。
 
 ---
 
-## 14. 全链路流程图
+## 14. 设计决策总结
 
-### 14.1 主键表 Compaction 全链路
+| 决策点 | 选择 | 取舍 / 代价 | 收益 |
+|--------|------|-------------|------|
+| 整体策略 | Universal（非 Leveled） | 读放大中等、需补丁补回 | 写放大最低，契合实时数仓写优先 |
+| 三级决策顺序 | EarlyFull > SizeAmp > SizeRatio > FileNum | 判断分支多 | 先还最贵的债，默认偏少写 |
+| `dropDelete` 三元判断 | 仅输出最高层或有 DV 才丢 | 逻辑复杂 | 保证删除语义正确，不复活已删行 |
+| 大文件 upgrade | 只改 level 元数据、零 I/O | 需配合 `small-file-ratio` 理解 | 写放大显著低于 CoW 湖格式 |
+| Lookup 强清 L0 | `ForceUpLevel0Compaction` + `compactNotCompleted` 挡 commit | 写放大升、可能阻塞 | L0 清空才能高效点查 |
+| 异步执行 + 双阈值反压 | trigger / stop 分离、checkpoint 阈值 +1 | 写吞吐受压缩耗时影响 | 写不被压缩长期阻塞，run 数有界 |
+| 单 manager 单任务 | `taskFuture != null` 串行 | 单桶压缩吞吐受限 | 并发简单，靠多 bucket 横向扩展 |
+| changelog 按需产 | lookup 涉 L0 才产 / full 仅最高层产 | 配置不当延迟高（陷阱 7） | 避免无谓的归并/写 changelog 成本 |
+| record-level expire 搭车 | 挂 compaction 重写、文件级粗筛 | 无及时性保证、可能多重写 | 零额外作业、零额外扫描成本 |
+| Append 区分有桶/无桶 | 有桶内联滑动窗口 / 无桶中心化 + Age | 无桶需 dedicated 作业运维 | 覆盖两种数据分布，冷分区也能清 |
+| Clustering 两级文件 | unsorted/sorted 两层、自管而非 Levels | 多一套文件管理 | 语义简单、Phase 1 已排序免多级归并 |
+
+### 14.1 几个值得记住的"为什么"
+
+- **为什么 Universal 而非 Leveled**：Leveled 把数据反复下推多层、写放大高；Paimon 写优先，选 Universal（合相近大小 run、写放大低），读放大缺口用 EarlyFull/OffPeak/ForceUpLevel0 三块补丁按场景补。
+- **为什么 dropDelete 判断不能简化**：删除标记是用来"盖住"更老版本的；只要可能还有更老数据（输出非最高层且无 DV），就必须保留，否则被删记录会从老版本里复活。
+- **为什么 IntervalPartition 切 section**：让无 key 重叠的大文件走零 I/O upgrade，而不是被卷进 merge sort 整文件重写——这是 upgrade 优化能生效的前提。
+- **为什么 Age 机制**：中心化协调器对冷分区可能长期收不到新文件，COMPACT_AGE 保证少量文件最终被压、REMOVE_AGE 防协调器内存随历史分区无界增长。
+
+---
+
+## 15. 全链路流程图
+
+### 15.1 主键表 Compaction 全链路
 
 ```mermaid
 sequenceDiagram
@@ -3008,7 +976,7 @@ sequenceDiagram
     CompactManager->>Levels: update(before, after)
 ```
 
-### 14.2 Append 表 Compaction 全链路
+### 15.2 Append 表 Compaction 全链路
 
 ```mermaid
 sequenceDiagram
@@ -3044,7 +1012,7 @@ sequenceDiagram
     end
 ```
 
-### 14.3 Clustering Compaction 全链路
+### 15.3 Clustering Compaction 全链路
 
 ```mermaid
 flowchart TD
@@ -3074,7 +1042,7 @@ flowchart TD
     H --> I[处理 DeletionFile]
 ```
 
-### 14.4 CompactRewriter 继承层次决策树
+### 15.4 CompactRewriter 继承层次决策树
 
 ```mermaid
 flowchart TD

@@ -1,0 +1,756 @@
+---
+title: "Blob 存储"
+sidebar_position: 7
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# Blob 存储 {#blob-storage}
+
+## 概述 {#overview}
+
+`BLOB`（Binary Large Object，二进制大对象）类型是一种数据类型，专为在 Paimon 表中存储图像、视频、音频文件以及其他大型二进制对象等多模态数据而设计。与传统的 `BYTES` 类型将二进制数据与其他列内联存储不同，`BLOB` 类型将大型二进制数据存储在单独的文件中并维护对它们的引用，从而为大对象提供更好的性能。
+
+Blob 存储基于 Data Evolution 模式。
+
+Blob 类型非常适合以下场景：
+
+- **图像存储**：存储商品图片、用户头像、医学影像数据
+- **视频内容**：存储视频片段、监控录像、多媒体内容
+- **音频文件**：存储语音录音、音乐文件、播客节目
+- **文档存储**：存储 PDF 文档、办公文件、大型文本文件
+- **机器学习**：存储 embedding、模型权重、特征向量
+- **任意大型二进制数据**：任何因体积过大而无法高效内联存储的数据
+
+## 存储布局 {#storage-layout}
+
+当你定义一张包含 Blob 列的表时，Paimon 会自动将存储分离：
+
+1. **普通数据文件**（例如 `.parquet`、`.orc`）：存储常规列（INT、STRING 等）
+2. **Blob 数据文件**（`.blob`）：存储实际的 blob 数据
+
+例如，给定一张 schema 为 `(id INT, name STRING, picture BLOB)` 的表：
+
+```
+table/
+├── bucket-0/
+│   ├── data-uuid-0.parquet      # Contains id, name columns
+│   ├── data-uuid-1.blob         # Contains picture blob data
+│   ├── data-uuid-2.blob         # Contains more picture blob data
+│   └── ...
+├── manifest/
+├── schema/
+└── snapshot/
+```
+
+这种分离带来若干好处：
+- 高效的列投影（读取非 blob 列时不会加载 blob 数据）
+- 基于 blob 大小优化的文件滚动
+- 对常规列式数据有更好的压缩效果
+
+关于 blob 文件格式结构的详细信息，请参阅 [文件格式 - BLOB](../concepts/spec/fileformat#blob)。
+
+## 存储模式 {#storage-modes}
+
+Paimon 为 BLOB 字段支持四种存储模式：
+
+1. **默认 blob 存储**
+   Blob 字节写入表路径下由 Paimon 管理的 `.blob` 文件中。
+
+2. **仅描述符（Descriptor-only）存储**
+   配置在 `blob-descriptor-field` 中的字段只在数据文件中内联存储序列化后的 `BlobDescriptor` 字节。Paimon 不会为这些字段写入 `.blob` 文件，且写入时必须提供基于描述符的输入。
+
+3. **外部存储描述符模式**
+   配置在 `blob-external-storage-field` 中的字段是 `blob-descriptor-field` 的子集。在写入时，Paimon 将原始 blob 数据写入配置的 `blob-external-storage-path`，并只在数据文件中内联存储序列化后的 `BlobDescriptor` 字节。
+
+4. **Blob 视图存储**
+   配置在 `blob-view-field` 中的字段在数据文件中内联存储序列化后的 `BlobViewStruct` 字节。该结构通过表标识符、BLOB 字段和 row id 指向上游表中的某个 BLOB 值。实际的 blob 字节在读取时从上游表解析获得。
+
+这使得一张表可以混用原始数据 BLOB 字段、仅描述符 BLOB 字段、由外部存储支撑的基于描述符的 BLOB 字段，以及引用上游 BLOB 值的视图字段。
+
+## 表配置项 {#table-options}
+
+<table className="table table-bordered">
+    <thead>
+      <tr>
+        <th className="text-left" style={{width: "25%"}}>配置项</th>
+        <th className="text-center" style={{width: "8%"}}>是否必填</th>
+        <th className="text-center" style={{width: "7%"}}>默认值</th>
+        <th className="text-center" style={{width: "10%"}}>类型</th>
+        <th className="text-center" style={{width: "50%"}}>描述</th>
+      </tr>
+    </thead>
+    <tbody>
+    <tr>
+      <td><h5>blob-field</h5></td>
+      <td>否</td>
+      <td style={{wordWrap: "break-word"}}>(none)</td>
+      <td>String</td>
+      <td>指定应作为 blob 类型存储的列名。当你想把某个 BYTES 列当作 BLOB 处理时使用此配置项。列在 <code>blob-descriptor-field</code> 或 <code>blob-view-field</code> 中的字段也会被视为 BLOB 字段。</td>
+    </tr>
+    <tr>
+      <td><h5>blob-as-descriptor</h5></td>
+      <td>否</td>
+      <td style={{wordWrap: "break-word"}}>false</td>
+      <td>Boolean</td>
+      <td>控制 blob 字段的读取输出格式。设为 true 时，查询返回序列化后的 BlobDescriptor 字节；设为 false 时，查询返回实际的 blob 字节。该配置项是动态的，可以通过 <code>ALTER TABLE ... SET</code> 修改。</td>
+    </tr>
+    <tr>
+      <td><h5>blob-descriptor-field</h5></td>
+      <td>否</td>
+      <td style={{wordWrap: "break-word"}}>(none)</td>
+      <td>String</td>
+      <td>
+        以逗号分隔的字段名，这些字段被视为 BLOB 字段，并在普通数据文件中内联存储为序列化后的 <code>BlobDescriptor</code> 字节。
+        默认情况下，所有 blob 字段都将 blob 字节存储在单独的 <code>.blob</code> 文件中。
+        若配置此项，一张表可以混用：
+        部分 BLOB 字段存于 <code>.blob</code> 文件，部分作为描述符引用。
+      </td>
+    </tr>
+    <tr>
+      <td><h5>blob-write-null-on-missing-file</h5></td>
+      <td>否</td>
+      <td style={{wordWrap: "break-word"}}>false</td>
+      <td>Boolean</td>
+      <td>
+        对于 Flink 写入，启用此项后，如果某个描述符 BLOB 值引用了一个不存在的文件，Paimon 会为该值写入 <code>NULL</code> 并记录一条警告，而不是在读取描述符时失败。
+      </td>
+    </tr>
+    <tr>
+      <td><h5>blob-view-field</h5></td>
+      <td>否</td>
+      <td style={{wordWrap: "break-word"}}>(none)</td>
+      <td>String</td>
+      <td>
+        以逗号分隔的字段名，这些字段被视为 BLOB 字段，并在普通数据文件中内联存储为序列化后的 <code>BlobViewStruct</code> 字节。
+        这些字段值引用上游表中的 BLOB 值，并在读取时解析。
+        此配置项不得与 <code>blob-descriptor-field</code> 重叠。
+      </td>
+    </tr>
+    <tr>
+      <td><h5>blob-external-storage-field</h5></td>
+      <td>否</td>
+      <td style={{wordWrap: "break-word"}}>(none)</td>
+      <td>String</td>
+      <td>
+        以逗号分隔的 BLOB 字段名，这些字段的原始数据应在写入时写入外部存储。
+        此配置项必须是 <code>blob-descriptor-field</code> 的子集。
+        对于这些字段，Paimon 在数据文件中内联存储序列化后的 <code>BlobDescriptor</code> 字节。
+      </td>
+    </tr>
+    <tr>
+      <td><h5>blob-external-storage-path</h5></td>
+      <td>否</td>
+      <td style={{wordWrap: "break-word"}}>(none)</td>
+      <td>String</td>
+      <td>
+        供配置在 <code>blob-external-storage-field</code> 中的字段使用的外部存储路径。
+        孤儿文件清理不会应用于此路径。
+      </td>
+    </tr>
+    <tr>
+      <td><h5>blob.target-file-size</h5></td>
+      <td>否</td>
+      <td style={{wordWrap: "break-word"}}>(same as target-file-size)</td>
+      <td>MemorySize</td>
+      <td>blob 文件的目标大小。当某个 blob 文件达到此大小时，会创建一个新文件。如果未指定，则使用与 <code>target-file-size</code> 相同的值。</td>
+    </tr>
+    <tr>
+      <td><h5>row-tracking.enabled</h5></td>
+      <td>是*</td>
+      <td style={{wordWrap: "break-word"}}>false</td>
+      <td>Boolean</td>
+      <td>blob 表必须启用此项才能支持行级操作。</td>
+    </tr>
+    <tr>
+      <td><h5>data-evolution.enabled</h5></td>
+      <td>是*</td>
+      <td style={{wordWrap: "break-word"}}>false</td>
+      <td>Boolean</td>
+      <td>blob 表必须启用此项才能支持 schema 演进。</td>
+    </tr>
+    </tbody>
+</table>
+
+*为使 blob 功能正常工作所必需。
+
+具体而言，如果输入 BlobDescriptor 的存储系统与 Paimon 所使用的存储系统不同，
+你可以使用前缀 `blob-descriptor.` 为输入 blob 描述符指定存储配置。
+例如，如果源数据存储在另一个 OSS endpoint 上，
+你可以按如下方式进行配置（以 flink sql 为例）：
+```sql
+CREATE TABLE image_table (
+    id INT,
+    name STRING,
+    image BYTES
+) WITH (
+    'row-tracking.enabled' = 'true',
+    'data-evolution.enabled' = 'true',
+    'blob-field' = 'image',
+    'fs.oss.endpoint' = 'aaa',                   -- This is for Paimon's own config
+    'blob-descriptor.fs.oss.endpoint' = 'bbb'    -- This is for input blob descriptors' config
+);
+```
+
+## SQL 用法 {#sql-usage}
+
+### 创建表 {#creating-a-table}
+
+<Tabs groupId="blob-create-table">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+```sql
+-- Create a table with a blob field
+-- Note: In Flink SQL, use BYTES type and specify blob-field option
+CREATE TABLE image_table (
+    id INT,
+    name STRING,
+    image BYTES
+) WITH (
+    'row-tracking.enabled' = 'true',
+    'data-evolution.enabled' = 'true',
+    'blob-field' = 'image'
+);
+```
+
+</TabItem>
+
+<TabItem value="spark-sql" label="Spark SQL">
+
+```sql
+-- Create a table with a blob field
+-- Note: In Spark SQL, use BINARY type and specify blob-field option
+CREATE TABLE image_table (
+    id INT,
+    name STRING,
+    image BINARY
+) TBLPROPERTIES (
+    'row-tracking.enabled' = 'true',
+    'data-evolution.enabled' = 'true',
+    'blob-field' = 'image'
+);
+```
+
+</TabItem>
+
+</Tabs>
+
+### 插入 Blob 数据 {#inserting-blob-data}
+
+<Tabs groupId="blob-insert">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+```sql
+-- Insert data with inline blob bytes
+INSERT INTO image_table VALUES (1, 'sample', X'89504E470D0A1A0A');
+
+-- Insert from another table
+INSERT INTO image_table
+SELECT id, name, content FROM source_table;
+```
+
+</TabItem>
+
+<TabItem value="spark-sql" label="Spark SQL">
+
+```sql
+-- Insert data with inline blob bytes
+INSERT INTO image_table VALUES (1, 'sample', X'89504E470D0A1A0A');
+```
+
+</TabItem>
+
+</Tabs>
+
+### 查询 Blob 数据 {#querying-blob-data}
+
+```sql
+-- Select all columns including blob
+SELECT * FROM image_table;
+
+-- Select only non-blob columns (efficient - doesn't load blob data)
+SELECT id, name FROM image_table;
+
+-- Select specific rows with blob
+SELECT * FROM image_table WHERE id = 1;
+```
+
+### Blob 读取输出模式（`blob-as-descriptor`） {#blob-read-output-mode-blob-as-descriptor}
+
+`blob-as-descriptor` 仅控制读取时如何返回 blob 值。
+
+```sql
+-- Return descriptor bytes
+ALTER TABLE blob_table SET ('blob-as-descriptor' = 'true');
+SELECT image FROM blob_table;
+
+-- Return actual blob bytes
+ALTER TABLE blob_table SET ('blob-as-descriptor' = 'false');
+SELECT image FROM blob_table;
+```
+
+### Blob 视图 {#blob-view}
+
+当下游表需要引用上游表中已存储的 BLOB 值，而又不想复制字节或创建新的 `.blob` 文件时，Blob 视图非常有用。一个 blob 视图字段只内联存储一个小的 `BlobViewStruct`。当读取该字段时，Paimon 会从上游表解析被引用的 BLOB。
+
+Blob 视图要求：
+
+- 上游表启用了行跟踪（row tracking），使每一行都有稳定的 `_ROW_ID`
+- 下游字段被列在 `blob-view-field` 中
+- 写入时提供序列化后的 `BlobViewStruct`；在 Flink SQL 中，使用内置的 `sys.blob_view` 函数
+
+Flink SQL 函数签名为：
+
+```sql
+sys.blob_view(table_name, field_name, row_id)
+```
+
+参数：
+
+- `table_name`：上游表名。必须完整限定为 `database.table` 或 `catalog.database.table`。未限定的表名将被拒绝。
+- `field_name`：上游 BLOB 字段名。
+- `row_id`：来自上游行跟踪表的 `_ROW_ID` 值。
+
+以下示例写入一张下游表，其 `image_ref` 字段视图引用 `image_table` 中的 `image` 字段：
+
+```sql
+CREATE TABLE image_table (
+    id INT,
+    name STRING,
+    image BYTES
+) WITH (
+    'row-tracking.enabled' = 'true',
+    'data-evolution.enabled' = 'true',
+    'blob-field' = 'image'
+);
+
+CREATE TABLE image_view_table (
+    id INT,
+    label STRING,
+    image_ref BYTES
+) WITH (
+    'row-tracking.enabled' = 'true',
+    'data-evolution.enabled' = 'true',
+    'blob-view-field' = 'image_ref'
+);
+
+INSERT INTO image_view_table
+SELECT
+    id,
+    name AS label,
+    sys.blob_view('default.image_table', 'image', _ROW_ID)
+FROM `image_table$row_tracking`;
+```
+
+如果表名中包含当前 Paimon catalog 名称，该函数也接受 `catalog.database.table`：
+
+```sql
+SELECT sys.blob_view('my_catalog.default.image_table', 'image', _ROW_ID)
+FROM `image_table$row_tracking`;
+```
+
+从 `image_view_table.image_ref` 的读取以与普通 blob 字段相同的方式返回被引用的 BLOB 字节。被引用的上游表和行必须保持可用，视图才能被解析。
+
+### MERGE INTO 支持 {#merge-into-support}
+
+对于 Flink 和 Spark 中的 Data Evolution 写入：
+
+- 原始数据 BLOB 列在部分列 `MERGE INTO` 更新中仍然会被拒绝
+- 基于描述符的 BLOB 列是允许的
+
+## Java API 用法 {#java-api-usage}
+
+### 创建表 {#creating-a-table-1}
+
+以下示例演示如何使用 Paimon 的 Java API 创建一张带 blob 列的表、写入 blob 数据并将其读回。
+
+```java
+import org.apache.paimon.catalog.Catalog;
+import org.apache.paimon.catalog.CatalogContext;
+import org.apache.paimon.catalog.CatalogFactory;
+import org.apache.paimon.catalog.Identifier;
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.data.BinaryString;
+import org.apache.paimon.data.Blob;
+import org.apache.paimon.data.BlobData;
+import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.fs.Path;
+import org.apache.paimon.fs.SeekableInputStream;
+import org.apache.paimon.reader.RecordReader;
+import org.apache.paimon.schema.Schema;
+import org.apache.paimon.table.Table;
+import org.apache.paimon.table.sink.BatchTableCommit;
+import org.apache.paimon.table.sink.BatchTableWrite;
+import org.apache.paimon.table.sink.BatchWriteBuilder;
+import org.apache.paimon.table.source.ReadBuilder;
+import org.apache.paimon.types.DataTypes;
+
+import java.io.ByteArrayInputStream;
+import java.nio.file.Files;
+
+public class BlobTableExample {
+
+    public static void main(String[] args) throws Exception {
+        // 1. Create catalog
+        Path warehouse = new Path("/tmp/paimon-warehouse");
+        Catalog catalog = CatalogFactory.createCatalog(CatalogContext.create(warehouse));
+        catalog.createDatabase("my_db", true);
+
+        // 2. Define schema with BLOB column
+        Schema schema = Schema.newBuilder()
+                .column("id", DataTypes.INT())
+                .column("name", DataTypes.STRING())
+                .column("image", DataTypes.BLOB())  // Blob column for storing images
+                .option(CoreOptions.ROW_TRACKING_ENABLED.key(), "true")
+                .option(CoreOptions.DATA_EVOLUTION_ENABLED.key(), "true")
+                .build();
+
+        // 3. Create table
+        Identifier tableId = Identifier.create("my_db", "image_table");
+        catalog.createTable(tableId, schema, true);
+        Table table = catalog.getTable(tableId);
+
+        // 4. Write blob data
+        writeBlobData(table);
+
+        // 5. Read blob data back
+        readBlobData(table);
+    }
+
+    private static void writeBlobData(Table table) throws Exception {
+        BatchWriteBuilder writeBuilder = table.newBatchWriteBuilder();
+
+        try (BatchTableWrite write = writeBuilder.newWrite();
+             BatchTableCommit commit = writeBuilder.newCommit()) {
+
+            // Method 1: Create blob from byte array
+            byte[] imageBytes = loadImageBytes("/path/to/image1.png");
+            GenericRow row1 = GenericRow.of(
+                    1,
+                    BinaryString.fromString("image1"),
+                    new BlobData(imageBytes)
+            );
+            write.write(row1);
+
+            // Method 2: Create blob from local file
+            GenericRow row2 = GenericRow.of(
+                    2,
+                    BinaryString.fromString("image2"),
+                    Blob.fromLocal("/path/to/image2.png")
+            );
+            write.write(row2);
+
+            // Method 3: Create blob from InputStream (useful for streaming data)
+            byte[] streamData = loadImageBytes("/path/to/image3.png");
+            ByteArrayInputStream inputStream = new ByteArrayInputStream(streamData);
+            GenericRow row3 = GenericRow.of(
+                    3,
+                    BinaryString.fromString("image3"),
+                    Blob.fromInputStream(() -> SeekableInputStream.wrap(inputStream))
+            );
+            write.write(row3);
+
+            // Method 4: Create blob from HTTP URL
+            GenericRow row4 = GenericRow.of(
+                    4,
+                    BinaryString.fromString("remote_image"),
+                    Blob.fromHttp("https://example.com/image.png")
+            );
+            write.write(row4);
+
+            // Commit all writes
+            commit.commit(write.prepareCommit());
+        }
+
+        System.out.println("Successfully wrote 4 rows with blob data");
+    }
+
+    private static void readBlobData(Table table) throws Exception {
+        ReadBuilder readBuilder = table.newReadBuilder();
+        RecordReader<InternalRow> reader =
+                readBuilder.newRead().createReader(readBuilder.newScan().plan());
+
+        reader.forEachRemaining(row -> {
+            int id = row.getInt(0);
+            String name = row.getString(1).toString();
+            Blob blob = row.getBlob(2);
+
+            // Method 1: Read blob as byte array (loads entire blob into memory)
+            byte[] data = blob.toData();
+            System.out.println("Row " + id + ": " + name + ", blob size: " + data.length);
+
+            // Method 2: Read blob as stream (better for large blobs)
+            try (SeekableInputStream in = blob.newInputStream()) {
+                // Process stream without loading entire blob into memory
+                byte[] buffer = new byte[1024];
+                int bytesRead;
+                long totalSize = 0;
+                while ((bytesRead = in.read(buffer)) != -1) {
+                    totalSize += bytesRead;
+                    // Process buffer...
+                }
+                System.out.println("Streamed " + totalSize + " bytes");
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        });
+    }
+
+    private static byte[] loadImageBytes(String path) throws Exception {
+        return Files.readAllBytes(java.nio.file.Path.of(path));
+    }
+}
+```
+
+### 从不同来源构造 blob {#construct-blob-from-different-sources}
+
+```java
+// From byte array (data already in memory)
+Blob blob = Blob.fromData(imageBytes);
+
+// From local file system
+Blob blob = Blob.fromLocal("/path/to/image.png");
+
+// From any FileIO (supports HDFS, S3, OSS, etc.)
+FileIO fileIO = FileIO.get(new Path("s3://bucket"), catalogContext);
+Blob blob = Blob.fromFile(fileIO, "s3://bucket/path/to/image.png");
+
+// From FileIO with offset and length (read partial file)
+Blob blob = Blob.fromFile(fileIO, "s3://bucket/large-file.bin", 1024, 2048);
+
+// From HTTP/HTTPS URL
+Blob blob = Blob.fromHttp("https://example.com/image.png");
+
+// From InputStream supplier (lazy loading)
+Blob blob = Blob.fromInputStream(() -> new FileInputStream("/path/to/image.png"));
+
+// From BlobDescriptor (reconstruct blob reference from descriptor)
+BlobDescriptor descriptor = new BlobDescriptor("s3://bucket/path/to/image.png", 0, 1024);
+UriReader uriReader = UriReader.fromFile(fileIO);
+Blob blob = Blob.fromDescriptor(uriReader, descriptor);
+```
+
+### 查询 Blob 数据 {#querying-blob-data-1}
+
+```java
+// Get blob from row (column index 2 in this example)
+Blob blob = row.getBlob(2);
+
+// Read as byte array (simple but loads entire blob into memory)
+byte[] data = blob.toData();
+
+// Read as stream (recommended for large blobs)
+try (SeekableInputStream in = blob.newInputStream()) {
+    // SeekableInputStream supports random access
+    in.seek(100);  // Jump to position 100
+    byte[] buffer = new byte[1024];
+    int bytesRead = in.read(buffer);
+}
+
+// Get blob descriptor (for reference-based blobs)
+// Note: Only works for BlobRef, not BlobData
+BlobDescriptor descriptor = blob.toDescriptor();
+String uri = descriptor.uri();      // e.g., "s3://bucket/path/to/blob"
+long offset = descriptor.offset();  // Starting position in the file
+long length = descriptor.length();  // Length of the blob data
+```
+
+### 描述符感知的写入行为 {#descriptor-aware-write-behavior}
+
+Paimon 的写入路径会自动感知描述符：
+
+1. 对于存储在 `.blob` 文件中的 blob 字段，输入可以是 blob 字节，也可以是 `BlobDescriptor`。
+2. 对于配置在 `blob-descriptor-field` 中的字段，Paimon 在数据文件中内联存储描述符字节（不为这些字段写入 `.blob` 文件），且输入必须是描述符。
+3. 对于配置在 `blob-external-storage-field` 中的字段，Paimon 将 blob 数据写入 `blob-external-storage-path`，并在数据文件中内联存储描述符字节。
+4. 此行为不依赖于 `blob-as-descriptor`。
+
+```java
+import org.apache.paimon.catalog.Catalog;
+import org.apache.paimon.catalog.CatalogContext;
+import org.apache.paimon.catalog.CatalogFactory;
+import org.apache.paimon.catalog.Identifier;
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.data.BinaryString;
+import org.apache.paimon.data.Blob;
+import org.apache.paimon.data.BlobData;
+import org.apache.paimon.data.BlobDescriptor;
+import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.fs.Path;
+import org.apache.paimon.reader.RecordReader;
+import org.apache.paimon.schema.Schema;
+import org.apache.paimon.table.Table;
+import org.apache.paimon.table.sink.BatchTableCommit;
+import org.apache.paimon.table.sink.BatchTableWrite;
+import org.apache.paimon.table.sink.BatchWriteBuilder;
+import org.apache.paimon.table.source.ReadBuilder;
+import org.apache.paimon.types.DataTypes;
+
+public class BlobDescriptorExample {
+
+    public static void main(String[] args) throws Exception {
+        Path warehouse = new Path("s3://my-bucket/paimon-warehouse");
+        CatalogContext catalogContext = CatalogContext.create(warehouse);
+        Catalog catalog = CatalogFactory.createCatalog(catalogContext);
+        catalog.createDatabase("my_db", true);
+
+        // Create table: store "video" as descriptor bytes inline
+        Schema schema = Schema.newBuilder()
+                .column("id", DataTypes.INT())
+                .column("name", DataTypes.STRING())
+                .column("video", DataTypes.BLOB())
+                .option(CoreOptions.ROW_TRACKING_ENABLED.key(), "true")
+                .option(CoreOptions.DATA_EVOLUTION_ENABLED.key(), "true")
+                .option(CoreOptions.BLOB_DESCRIPTOR_FIELD.key(), "video")
+                .build();
+
+        Identifier tableId = Identifier.create("my_db", "video_table");
+        catalog.createTable(tableId, schema, true);
+        Table table = catalog.getTable(tableId);
+
+        // Write blob using descriptor reference
+        writeLargeBlobWithDescriptor(table);
+
+        // Read blob data
+        readBlobData(table);
+    }
+
+    private static void writeLargeBlobWithDescriptor(Table table) throws Exception {
+        BatchWriteBuilder writeBuilder = table.newBatchWriteBuilder();
+
+        try (BatchTableWrite write = writeBuilder.newWrite();
+             BatchTableCommit commit = writeBuilder.newCommit()) {
+
+            // For a very large file (e.g., 2GB video), instead of loading into memory:
+            //   byte[] hugeVideo = Files.readAllBytes(...);  // This would cause OutOfMemoryError!
+            //
+            // Create a descriptor reference to external blob
+            String externalUri = "s3://my-bucket/videos/large_video.mp4";
+            long fileSize = 2L * 1024 * 1024 * 1024;  // 2GB
+
+            BlobDescriptor descriptor = new BlobDescriptor(externalUri, 0, fileSize);
+            // file io should be accessible to externalUri
+            FileIO fileIO = Table.fileIO();
+            UriReader uriReader = UriReader.fromFile(fileIO);
+            Blob blob = Blob.fromDescriptor(uriReader, descriptor);
+
+            GenericRow row = GenericRow.of(
+                    1,
+                    BinaryString.fromString("large_video"),
+                    blob);
+            write.write(row);
+
+            commit.commit(write.prepareCommit());
+        }
+
+        System.out.println("Successfully wrote large blob using descriptor reference");
+    }
+
+    private static void readBlobData(Table table) throws Exception {
+        ReadBuilder readBuilder = table.newReadBuilder();
+        RecordReader<InternalRow> reader =
+                readBuilder.newRead().createReader(readBuilder.newScan().plan());
+
+        reader.forEachRemaining(row -> {
+            int id = row.getInt(0);
+            String name = row.getString(1).toString();
+            Blob blob = row.getBlob(2);
+
+            // Field is configured in blob-descriptor-field, so descriptor is stored inline
+            BlobDescriptor descriptor = blob.toDescriptor();
+            System.out.println("Row " + id + ": " + name);
+            System.out.println("  Blob URI: " + descriptor.uri());
+            System.out.println("  Length: " + descriptor.length());
+        });
+    }
+}
+```
+
+**以不同输出模式读取 blob 数据：**
+
+`blob-as-descriptor` 配置项只影响读取输出：
+
+```sql
+-- When blob-as-descriptor = true: Returns BlobDescriptor bytes (reference to Paimon blob file)
+ALTER TABLE video_table SET ('blob-as-descriptor' = 'true');
+SELECT * FROM video_table;  -- Returns serialized BlobDescriptor
+
+-- When blob-as-descriptor = false: Returns actual blob bytes
+ALTER TABLE video_table SET ('blob-as-descriptor' = 'false');
+SELECT * FROM video_table;  -- Returns actual blob bytes from Paimon storage
+```
+
+### Blob 存储模式：仅描述符（DESCRIPTOR ONLY） {#blob-storage-mode-descriptor-only}
+
+如果你希望下游表**复用**上游 blob 文件（不复制，也不创建新的 <code>.blob</code> 文件），请配置目标 blob 字段：
+
+```sql
+'blob-descriptor-field' = 'image'
+```
+
+对于这些已配置的字段，Paimon 只在普通数据文件中存储序列化后的 <code>BlobDescriptor</code> 字节。读取 blob 时沿着描述符 URI 访问字节，而写入这些字段时需要描述符输入。
+
+### Blob 存储模式：外部存储（EXTERNAL STORAGE） {#blob-storage-mode-external-storage}
+
+如果你希望 Paimon 将原始 blob 数据写入一个单独的外部位置，同时只在内联存储描述符字节，请配置目标 blob 字段：
+
+```sql
+'blob-descriptor-field' = 'image',
+'blob-external-storage-field' = 'image',
+'blob-external-storage-path' = 'oss://bucket/path/'
+```
+
+对于这些已配置的字段：
+
+- 原始 blob 数据写入配置的外部存储路径
+- 普通数据文件只保留序列化后的 <code>BlobDescriptor</code> 字节
+- 写入仍可以从原始 BLOB 输入开始
+- 在诸如 `MERGE INTO` 之类的操作中，该字段被视为基于描述符的字段
+
+## 限制 {#limitations}
+
+1. **仅限 Append 表**：Blob 类型专为 append-only 表设计。不支持主键表。
+2. **不支持谓词下推**：Blob 列不能用于过滤谓词。
+3. **不支持统计信息**：不支持为 blob 列收集统计信息。
+4. **必需配置项**：`row-tracking.enabled` 和 `data-evolution.enabled` 必须设为 `true`。
+5. **外部存储清理**：通过 `blob-external-storage-path` 写入的文件不在 Paimon 的孤儿文件清理范围内。
+6. **Blob 视图依赖**：Blob 视图字段依赖于被引用的上游表和行。如果上游数据被删除或不再可读，视图将无法解析。
+
+## 最佳实践 {#best-practices}
+
+1. **使用列投影**：始终只选择你需要的列。如果不需要 blob 数据，请避免 `SELECT *`。
+
+2. **设置合适的目标文件大小**：根据你的 blob 大小配置 `blob.target-file-size`。值越大意味着文件越少，但单个文件越大。
+
+3. **复用外部 blob 文件时使用描述符字段**：为那些应保留描述符引用而非写入新 `.blob` 文件的字段配置 `blob-descriptor-field`。
+
+4. **接受原始输入但存储描述符时使用外部存储字段**：当上游写入原始 blob 字节，而你希望采用基于描述符的存储时，将 `blob-external-storage-field` 与 `blob-external-storage-path` 一起配置。
+
+5. **单独管理外部存储生命周期**：写入 `blob-external-storage-path` 的文件不会被 Paimon 清理，因此保留和删除应在外部进行管理。
+
+6. **使用 Blob 视图以避免复制 BLOB 数据**：当下游表只需要引用上游表中的 BLOB 值时，配置 `blob-view-field`。
+
+7. **使用分区**：按日期或其他维度对 blob 表进行分区，以提升查询性能和数据管理能力。

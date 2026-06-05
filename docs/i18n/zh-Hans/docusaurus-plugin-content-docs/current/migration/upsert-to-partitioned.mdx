@@ -1,0 +1,189 @@
+---
+title: "Upsert 到分区表"
+sidebar_position: 1
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# Upsert 到分区表 {#upsert-to-partitioned}
+
+:::warning
+
+__注意：__ 只有 Hive 引擎才能用于查询这些 upsert-to-partitioned 表。
+
+:::
+
+[标签管理](../maintenance/manage-tags) 会维护快照的 manifest（清单）文件与数据文件。
+一种典型用法是每天创建标签（Tag），这样你就可以维护每一天的历史数据以供批式读取。
+
+在使用主键表时，通常采用非分区的方式来维护更新，以便从上游数据库表镜像并同步表。这使得用户可以查询最新数据。而 Hive
+数据仓库的传统做法并非如此。离线数据仓库要求每天有一个不可变的视图，以确保计算的幂等性。因此我们创建了标签（Tag）机制来输出这些视图。
+
+然而，Hive 数据仓库的传统用法更习惯于使用分区来指定查询的标签（Tag），也更习惯于使用 Hive 计算引擎。
+
+因此，我们引入了 `'metastore.tag-to-partition'` 和 `'metastore.tag-to-partition.preview'`，将非分区的主键表
+映射为 Hive metastore 中的分区表，并将分区字段映射为标签（Tag）的名称，从而与 Hive 完全兼容。
+
+## 标签到分区的示例 {#example-for-tag-to-partition}
+
+**步骤 1：在 Flink SQL 中创建表和标签**
+
+<Tabs groupId="create-table-and-tag-in-flink-sql-1">
+
+<TabItem value="flink" label="Flink">
+
+```sql
+CREATE CATALOG my_hive WITH (
+    'type' = 'paimon',
+    'metastore' = 'hive',
+    -- 'uri' = 'thrift://<hive-metastore-host-name>:<port>', default use 'hive.metastore.uris' in HiveConf
+    -- 'hive-conf-dir' = '...', this is recommended in the kerberos environment
+    -- 'hadoop-conf-dir' = '...', this is recommended in the kerberos environment
+    -- 'warehouse' = 'hdfs:///path/to/table/store/warehouse', default use 'hive.metastore.warehouse.dir' in HiveConf
+);
+
+USE CATALOG my_hive;
+
+CREATE TABLE mydb.t (
+    pk INT,
+    col1 STRING,
+    col2 STRING
+) WITH (
+    'bucket' = '-1',
+    'metastore.tag-to-partition' = 'dt'
+);
+
+INSERT INTO t VALUES (1, '10', '100'), (2, '20', '200');
+
+-- create tag '2023-10-16' for snapshot 1
+CALL sys.create_tag('mydb.t', '2023-10-16', 1);
+```
+
+</TabItem>
+
+</Tabs>
+
+**步骤 2：在 Hive 中带分区裁剪地查询表**
+
+<Tabs groupId="query-table-in-hive-with-partition-pruning-1">
+
+<TabItem value="hive" label="Hive">
+
+```sql
+SHOW PARTITIONS t;
+/*
+OK
+dt=2023-10-16
+*/
+
+SELECT * FROM t WHERE dt='2023-10-16';
+/*
+OK
+1 10 100 2023-10-16
+2 20 200 2023-10-16
+*/
+```
+
+</TabItem>
+
+</Tabs>
+
+## 标签预览的示例 {#example-for-tag-preview}
+
+上面的示例只能查询已经创建好的标签，但 Paimon 是一个实时数据湖，你同样
+需要查询最新数据。因此，Paimon 提供了预览（preview）功能：
+
+**步骤 1：在 Flink SQL 中创建表和标签**
+
+<Tabs groupId="create-table-and-tag-in-flink-sql-2">
+
+<TabItem value="flink" label="Flink">
+
+```sql
+CREATE CATALOG my_hive WITH (
+    'type' = 'paimon',
+    'metastore' = 'hive',
+    -- 'uri' = 'thrift://<hive-metastore-host-name>:<port>', default use 'hive.metastore.uris' in HiveConf
+    -- 'hive-conf-dir' = '...', this is recommended in the kerberos environment
+    -- 'hadoop-conf-dir' = '...', this is recommended in the kerberos environment
+    -- 'warehouse' = 'hdfs:///path/to/table/store/warehouse', default use 'hive.metastore.warehouse.dir' in HiveConf
+);
+
+USE CATALOG my_hive;
+
+CREATE TABLE mydb.t (
+    pk INT,
+    col1 STRING,
+    col2 STRING
+) WITH (
+    'bucket' = '-1',
+    'metastore.tag-to-partition' = 'dt',
+    -- preview tag creation mode process-time
+    -- paimon will create partitions early based on process-time
+    'metastore.tag-to-partition.preview' = 'process-time'
+);
+
+INSERT INTO t VALUES (1, '10', '100'), (2, '20', '200');
+
+-- create tag '2023-10-16' for snapshot 1
+CALL sys.create_tag('mydb.t', '2023-10-16', 1);
+
+-- new data in '2023-10-17'
+INSERT INTO t VALUES (3, '30', '300'), (4, '40', '400');
+
+-- haven't finished writing the data for '2023-10-17' yet, so there's no need to create a tag for now
+-- but the data is already visible for Hive
+```
+
+</TabItem>
+
+</Tabs>
+
+**步骤 2：在 Hive 中带分区裁剪地查询表**
+
+<Tabs groupId="query-table-in-hive-with-partition-pruning-2">
+
+<TabItem value="hive" label="Hive">
+
+```sql
+SHOW PARTITIONS t;
+/*
+OK
+dt=2023-10-16
+dt=2023-10-17
+*/
+
+SELECT * FROM t WHERE dt='2023-10-17';
+-- preview tag '2023-10-17'
+/*
+OK
+1 10 100 2023-10-17
+2 20 200 2023-10-17
+3 30 300 2023-10-17
+4 40 400 2023-10-17
+*/
+```
+
+</TabItem>
+
+</Tabs>

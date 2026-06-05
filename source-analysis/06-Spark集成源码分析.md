@@ -1,283 +1,224 @@
-# Apache Paimon Spark 集成深度源码分析
+# Apache Paimon Spark 集成源码深度分析
 
-> 基于 paimon 1.5-SNAPSHOT (master 分支, commit: 55f4fd175)
-> 分析日期: 2026-04-22
+> **版本**：1.5-SNAPSHOT　**源码模块**：`paimon-spark`（核心在 `paimon-spark-common`，版本适配在 `paimon-spark3-common`/`paimon-spark4-common` 与各版本模块）　**核对日期**：2026-06（基于 master `e76fc41b7`）
 
----
+**一句话定位**：Paimon-Spark 集成把 Paimon 表"塞进"Spark 的 DataSource V2 + Catalyst 体系——用一套 Shim 抹平 Spark 3.2~4.1 的 API 断层，用 Catalog/Scan/Write 把 LSM 存储能力暴露成 Spark 表，用 SQL Extensions 注入 `CALL`/TAG/行级操作语法，用 37 个 Procedure 承载运维操作，用 Sort/Z-Order/Hilbert 把数据布局优化挂到 compaction 上。
 
-## 1. Spark 模块结构与版本适配架构
+读完本文你应能回答：① 为什么是"common + 3/4-common + 版本特定 + SPI Shim"四层而不是每版本一套，Shim 隔离了哪些 API；② `SparkCatalog` 与 `SparkGenericCatalog` 的"先 Paimon 后回退"委托模型差在哪、各自适用什么场景；③ V1Write（RunnableCommand 自管分桶）与 V2Write（`RequiresDistributionAndOrdering` 让 Spark shuffle）的边界条件与取舍；④ 谓词为什么要拆成 partitionFilter / dataFilter / postScan 三份，聚合下推如何做到"0 数据文件读取"；⑤ `PaimonSparkSessionExtensions` 在 Parser/Analyzer/PostHoc/Optimizer/Planner/AQE 六个扩展点各注入了什么，顺序为什么重要；⑥ `CompactProcedure` 如何按 BucketMode 分发、为什么在 Spark 端做分布式 compaction；⑦ 线性/Z-Order/Hilbert 三种排序在 Spark 侧的入口与适用维度；⑧ 哪些配置/用法会触发回退到 V1、产生小文件、或让 MOW 数据延迟可见。
 
-### 解决什么问题
-
-**核心业务问题**: Spark 从 3.2 到 4.0 跨越了多个大版本，每个版本的 API 都有不兼容变化（如 Spark 4.0 切换到 Scala 2.13 和 Java 17，`InternalRow` 接口变化，`MergeIntoTable` 签名变化等）。如果为每个版本都写一套完整代码，会导致代码重复率极高，维护成本爆炸。
-
-**没有这个设计的后果**:
-- 每个 Spark 版本都需要维护一套完整的 Catalog、DataSource、Procedure 代码
-- 修复一个 bug 需要在 5 个版本模块中分别修改
-- 新增功能需要在所有版本中重复实现
-- 代码库膨胀到无法维护的程度
-
-**实际场景**:
-- 用户 A 使用 Spark 3.2 + Scala 2.12
-- 用户 B 使用 Spark 3.5 + Scala 2.12
-- 用户 C 使用 Spark 4.0 + Scala 2.13 + Java 17
-- 三者需要使用同一套 Paimon 核心逻辑，但 Spark API 不兼容
-
-### 有什么坑
-
-**误区陷阱**:
-- **误区**: 认为只需要为 Spark 3.x 和 4.x 各写一套代码即可
-- **真相**: Spark 3.2/3.3/3.4/3.5 之间也有细微差异（如某些 API 在 3.4 才引入），需要版本特定模块处理
-
-**错误配置**:
-```xml
-<!-- 错误: 同时依赖多个版本 -->
-<dependency>
-    <groupId>org.apache.paimon</groupId>
-    <artifactId>paimon-spark-3.2</artifactId>
-</dependency>
-<dependency>
-    <groupId>org.apache.paimon</groupId>
-    <artifactId>paimon-spark-3.5</artifactId>
-</dependency>
-```
-正确做法: 只依赖与你的 Spark 版本匹配的单个模块。
-
-**生产环境注意事项**:
-- 使用 Spark 4.0 时必须确保 JDK 版本 >= 17
-- Spark 3.x 和 4.x 的 shaded jar 不能混用
-- 升级 Spark 版本时必须同步升级 Paimon Spark 模块
-
-**性能陷阱**:
-- 不要在运行时通过反射判断 Spark 版本，会影响性能
-- SparkShim 的 SPI 加载在类加载时完成，运行时无开销
-
-### 核心概念解释
-
-**SparkShim (Shim Layer)**:
-- **定义**: Shim 是"垫片"的意思，在软件工程中指用于抹平不同版本 API 差异的适配层
-- **作用**: 将版本特定的 API 调用封装在统一接口后面
-- **实现**: 通过 Java SPI (Service Provider Interface) 机制在运行时加载对应版本的实现
-
-**SPI (Service Provider Interface)**:
-```java
-// META-INF/services/org.apache.paimon.spark.shims.SparkShim
-org.apache.paimon.spark.shims.Spark3Shim  // Spark 3.x 模块中
-org.apache.paimon.spark.shims.Spark4Shim  // Spark 4.x 模块中
-```
-运行时通过 `ServiceLoader.load(SparkShim.class)` 自动加载正确的实现。
-
-**分层依赖 vs 平铺依赖**:
-- **平铺**: paimon-spark-3.2, paimon-spark-3.3, ... 各自独立，代码重复
-- **分层**: common → 3-common/4-common → 版本特定，代码复用最大化
-
-**与其他系统对比**:
-- **Iceberg**: 使用类似的 Shim 机制适配 Spark 版本
-- **Delta Lake**: 为每个 Spark 版本维护独立分支，代码重复度高
-- **Hudi**: 使用 Maven Profile + 条件编译，但仍有较多重复代码
-
-### 设计理念
-
-**为什么这样设计**:
-1. **最大化代码复用**: 核心逻辑（Catalog、DataSource、Procedure）占代码量的 90%，这些逻辑与 Spark 版本无关，应该只写一次
-2. **最小化版本差异**: 只有真正不兼容的 API 才需要版本特定实现，通过 Shim 隔离
-3. **编译时类型安全**: 不使用反射，所有版本适配在编译时确定，避免运行时错误
-4. **独立打包**: 每个版本的 shaded jar 只包含对应版本的代码，不会膨胀
-
-**权衡取舍**:
-- **优势**: 代码维护成本低，新功能只需在 common 模块实现一次
-- **劣势**: 模块结构复杂，新人理解成本高
-- **取舍**: 牺牲初期理解成本，换取长期维护效率
-
-**架构演进**:
-- **早期**: 每个 Spark 版本独立模块，代码重复严重
-- **中期**: 引入 paimon-spark-common，但版本差异仍在各模块中散落
-- **现在**: 三层架构（common → 3-common/4-common → 版本特定），差异完全隔离
-
-**业界对比**:
-- **Iceberg 的做法**: 与 Paimon 类似，使用 Shim + 分层依赖
-- **Delta Lake 的做法**: 为每个 Spark 版本维护独立代码库，通过 CI/CD 同步修改
-- **Paimon 的优势**: 更激进的代码复用策略，版本特定模块极简（只有 20-30 个文件）
-
-### 1.1 模块总览
-
-**支持的 Spark 版本**: 3.2 ~ 3.5 (Scala 2.12) 和 4.0 (Scala 2.13, Java 17)
-
-```
-paimon-spark/
-  paimon-spark-common/       -- 核心共享代码 (Java + Scala 混合)
-  paimon-spark3-common/      -- Spark 3.x 共享的适配层 (Scala 2.12)
-  paimon-spark4-common/      -- Spark 4.x 共享的适配层 (Scala 2.13)
-  paimon-spark-3.2/          -- Spark 3.2 版本特定代码 (Scala 2.12)
-  paimon-spark-3.3/          -- Spark 3.3 版本特定代码 (Scala 2.12)
-  paimon-spark-3.4/          -- Spark 3.4 版本特定代码 (Scala 2.12)
-  paimon-spark-3.5/          -- Spark 3.5 版本特定代码 (Scala 2.12)
-  paimon-spark-4.0/          -- Spark 4.0 版本特定代码 (Scala 2.13, Java 17)
-  paimon-spark-ut/           -- 统一测试模块 (Scala 测试)
-  pom.xml                    -- 聚合 POM
-```
-
-### 1.2 分层依赖架构
-
-```mermaid
-graph TD
-    A["paimon-spark-common<br/>(核心逻辑)"] --> B["paimon-spark3-common<br/>(Spark 3.x 适配)"]
-    A --> C["paimon-spark4-common<br/>(Spark 4.x 适配)"]
-    B --> D["paimon-spark-3.2"]
-    B --> E["paimon-spark-3.3"]
-    B --> F["paimon-spark-3.4"]
-    B --> G["paimon-spark-3.5"]
-    C --> H["paimon-spark-4.0"]
-    D & E & F & G & H --> I["paimon-spark-ut<br/>(统一测试)"]
-```
-
-**为什么这么设计？**
-- **最大化代码复用**: `paimon-spark-common` 包含所有跨版本共享的核心逻辑（Catalog、DataSource V2 接口、Procedure、排序器、写入器等），无论 Spark 版本如何，这些代码只写一遍。
-- **最小化版本差异**: Spark 3.x 与 4.x 之间有 API 不兼容变化（如 `InternalRow` 接口变化、`MergeIntoTable` 签名差异、Variant 类型支持等）。通过 `paimon-spark3-common` 和 `paimon-spark4-common` 两个中间层隔离这些差异。
-- **版本特定模块极简**: 例如 `paimon-spark-3.5` 包含 24 个文件，`paimon-spark-3.4` 包含 31 个文件，相比 `paimon-spark-common` 的数百个文件，版本特定的差异已被上层模块充分抽象。
-
-### 1.3 SparkShim 机制 -- 版本适配的核心
-
-```
-SparkShim (trait, paimon-spark-common)
-  ├── Spark3Shim (paimon-spark3-common)
-  └── Spark4Shim (paimon-spark4-common)
-```
-
-**源码位置**: `paimon-spark-common/.../shims/SparkShim.scala`
-
-`SparkShim` 是一个 trait，声明了所有在 Spark 3 与 Spark 4 之间有不兼容实现的方法：
-
-| 方法 | 作用 | 为什么需要适配 |
-|------|------|---------------|
-| `createSparkParser()` | 创建 SQL 解析器 | Spark 3/4 Parser API 签名不同 |
-| `createSparkInternalRow()` | 创建内部行对象 | `InternalRow` 接口在 Spark 4 中变化 |
-| `createSparkArrayData()` | 创建数组数据 | `ArrayData` 实现差异 |
-| `createMergeIntoTable()` | 创建 MERGE INTO 逻辑计划 | Spark 4 增加了 `withSchemaEvolution` 参数 |
-| `toPaimonVariant()` | Variant 类型转换 | Variant 是 Spark 4 新增类型 |
-| `createCustomResolution()` | 创建版本特定分析规则 | 不同版本的 Catalyst 规则差异 |
-
-**好处**: 运行时通过 `SparkShimLoader` (SPI 机制) 加载对应版本的 Shim 实现，主代码无需 `if-else` 判断版本号，同时每个版本的 shaded jar 只包含对应实现。
+> 阅读约定：本文每个机制按"① 要解决什么问题 → ② 设计原理与取舍 → ③ 关键源码（精选片段 + `路径:行号`）→ ④ 风险/陷阱/边界 → ⑤ 收益与代价"组织。源码行号以本次核对（master `e76fc41b7`）为准；与旧稿不符处用 `（已修正）` 标注。多维排序曲线（Z-Order/Hilbert）的**算法原理**由 `12` 号文档主讲，本篇只讲 Spark 侧入口与调用，重叠处交叉引用；文件索引（Bloom/Bitmap/BSI，下推过滤的物理依据）详见 `13`。
 
 ---
 
-## 2. SparkCatalog 体系
+## 目录
 
-### 解决什么问题
+- [1. 快速理解（核心问题 / 概念速查 / 高频陷阱）](#1-快速理解核心问题--概念速查--高频陷阱)
+  - [1.1 核心问题：Paimon 要怎样"长进"Spark](#11-核心问题paimon-要怎样长进-spark)
+  - [1.2 核心概念速查表](#12-核心概念速查表)
+  - [1.3 高频生产陷阱](#13-高频生产陷阱)
+- [2. 模块结构与 SparkShim 版本适配](#2-模块结构与-sparkshim-版本适配)
+- [3. SparkCatalog 体系](#3-sparkcatalog-体系)
+  - [3.1 类继承层次](#31-类继承层次)
+  - [3.2 SparkBaseCatalog：Procedure 统一入口](#32-sparkbasecatalogprocedure-统一入口)
+  - [3.3 SparkCatalog：独立 Paimon Catalog 与多态 loadTable](#33-sparkcatalog独立-paimon-catalog-与多态-loadtable)
+  - [3.4 SparkGenericCatalog：CatalogExtension 委托模型](#34-sparkgenericcatalogcatalogextension-委托模型)
+  - [3.5 FormatTable / View / Function 扩展](#35-formattable--view--function-扩展)
+- [4. DataSource V2 读取与下推](#4-datasource-v2-读取与下推)
+  - [4.1 读取链路与类继承](#41-读取链路与类继承)
+  - [4.2 谓词下推：三份谓词的拆分](#42-谓词下推三份谓词的拆分)
+  - [4.3 列裁剪](#43-列裁剪)
+  - [4.4 聚合下推与 TopN 下推](#44-聚合下推与-topn-下推)
+  - [4.5 BinPacking：小 Split 合并](#45-binpacking小-split-合并)
+  - [4.6 桶分区报告与元数据列](#46-桶分区报告与元数据列)
+- [5. DataSource V2 写入：V1Write vs V2Write](#5-datasource-v2-写入v1write-vs-v2write)
+  - [5.1 两条写入路径与自动选择](#51-两条写入路径与自动选择)
+  - [5.2 V2Write 与 RequiresDistributionAndOrdering](#52-v2write-与-requiresdistributionandordering)
+  - [5.3 Copy-on-Write 行级操作](#53-copy-on-write-行级操作)
+  - [5.4 Overwrite 四种模式](#54-overwrite-四种模式)
+- [6. SQL Extensions：六个扩展点](#6-sql-extensions六个扩展点)
+  - [6.1 PaimonSparkSessionExtensions 注册全景](#61-paimonsparksessionextensions-注册全景)
+  - [6.2 Parser 扩展（ANTLR）](#62-parser-扩展antlr)
+  - [6.3 关键 Analyzer / PostHoc 规则](#63-关键-analyzer--posthoc-规则)
+  - [6.4 优化器与 Planner 规则](#64-优化器与-planner-规则)
+- [7. Procedures：37 个运维操作](#7-procedures37-个运维操作)
+  - [7.1 Procedure 体系与加载链路](#71-procedure-体系与加载链路)
+  - [7.2 完整 Procedure 列表](#72-完整-procedure-列表)
+  - [7.3 CompactProcedure：按 BucketMode 分发的分布式压缩](#73-compactprocedure按-bucketmode-分发的分布式压缩)
+- [8. Sort / Z-Order / Hilbert 排序 Compact](#8-sort--z-order--hilbert-排序-compact)
+  - [8.1 排序器体系](#81-排序器体系)
+  - [8.2 三种排序的 Spark 侧实现](#82-三种排序的-spark-侧实现)
+  - [8.3 排序如何挂到 compaction 上](#83-排序如何挂到-compaction-上)
+- [9. 流式读写（Micro-Batch）](#9-流式读写micro-batch)
+- [10. 与 Flink 集成的架构对比](#10-与-flink-集成的架构对比)
+- [11. 测试框架（paimon-spark-ut）](#11-测试框架paimon-spark-ut)
+- [12. 设计决策总结](#12-设计决策总结)
 
-**核心业务问题**: Spark 用户需要在同一个 Session 中访问多种数据源（Paimon 表、Hive 表、临时表、视图等），同时需要支持 Paimon 特有的功能（Procedure、Time Travel、Format Table）。如果只提供一个独立的 Paimon Catalog，用户就无法访问已有的 Hive 表；如果完全替换 Spark 的 SessionCatalog，又会丢失 Spark 原生功能。
+---
 
-**没有这个设计的后果**:
-- 用户必须在多个 Catalog 之间频繁切换：`USE CATALOG paimon_catalog` → `USE CATALOG spark_catalog`
-- 无法在一条 SQL 中 JOIN Paimon 表和 Hive 表
-- 已有的 Hive 表迁移到 Paimon 需要修改所有 SQL 语句
-- Procedure 功能无法使用（Spark 原生不支持）
+## 1. 快速理解（核心问题 / 概念速查 / 高频陷阱）
 
-**实际场景**:
-```sql
--- 场景 1: 混合查询 Paimon 表和 Hive 表
-SELECT p.*, h.dim_value
-FROM paimon_db.fact_table p
-JOIN hive_db.dim_table h ON p.id = h.id;
+### 1.1 核心问题：Paimon 要怎样"长进"Spark
 
--- 场景 2: 调用 Paimon Procedure 做 Compaction
-CALL sys.compact(table => 'paimon_db.fact_table');
+**① 要解决什么问题**
 
--- 场景 3: Time Travel 查询历史数据
-SELECT * FROM paimon_db.fact_table VERSION AS OF 12345;
+Spark 自己不认识 Paimon 表，也不支持 `CALL`、TAG、`MERGE INTO` 的 Paimon 语义。集成层要在**不改 Spark 源码**的前提下，把 Paimon 的 LSM 存储能力（带 bucket 分布、快照隔离、行级删除）映射成 Spark 能读能写的表，同时跨 Spark 3.2~4.1 多个不兼容大版本（4.0 起切到 Scala 2.13 + Java 17）只维护一套核心逻辑。
+
+**② 设计原理与取舍**
+
+Spark 提供了三套官方扩展点，Paimon 全部用上：
+
+| Spark 扩展点 | Paimon 用它做什么 | 关键类 |
+|---|---|---|
+| **DataSource V2**（`TableCatalog`/`Scan`/`Write`） | 把 Paimon 表暴露成 Spark 表，读写都走 V2 接口 | `SparkCatalog`、`PaimonScan`、`PaimonV2Write` |
+| **SessionExtensions**（Parser/Analyzer/Optimizer/Planner/AQE） | 注入 `CALL`/TAG 语法、行级操作重写、下推优化 | `PaimonSparkSessionExtensions` |
+| **SPI（ServiceLoader）** | 运行时按 classpath 选择 Spark3Shim / Spark4Shim，编译期零反射 | `SparkShim`、`SparkShimLoader` |
+
+一句话设计哲学：**核心逻辑写一次放在 `paimon-spark-common`，把所有"随 Spark 版本变"的 API 收进 `SparkShim` trait，用 SPI 在运行时选实现——版本差异隔离在垫片里，主代码里没有一句 `if (sparkVersion ...)`。**
+
+代价是模块层级深（common → 3/4-common → 版本特定 → ut）、新人理解成本高；收益是修一个 bug 只改 common 一处、版本特定模块极薄。
+
+**一次 SQL 的全生命周期（串起全文各章）**：以 `CALL sys.compact(...)` 和 `INSERT INTO pk_table SELECT ...` 为例——
+
+```
+读/写入口   SparkSource(shortName="paimon") / SparkCatalog.loadTable  →  SparkTable（§3）
+SQL 扩展    PaimonSparkSessionExtensions 注入 Parser/Analyzer/Planner（§6）
+            CALL 被解析成 PaimonCallStatement → PaimonCallCommand → PaimonCallExec（§6.4/§7.1）
+读路径      ScanBuilder 下推谓词(三拆)/列裁剪/聚合/TopN（§4.2~4.4）→ PaimonScan
+            BinPacking 合并小 Split（§4.5）→ PartitionReader 逐行出 InternalRow
+写路径      useV2Write 判定（§5.1）→ V2 让 Spark 按 distribution shuffle（§5.2）
+            或 V1 走 RunnableCommand 自管分桶；每 Task 出 CommitMessage
+提交        Driver 端 BatchTableCommit.commit() 原子提交（§5.2，不用 Spark CommitCoordinator）
+运维        compact 按 BucketMode 分发，parallelize 到集群分布式压缩（§7.3）
+            带 order_strategy 时挂 Z-Order/Hilbert 排序重写文件（§8）
 ```
 
-### 有什么坑
+### 1.2 核心概念速查表
 
-**误区陷阱**:
-- **误区 1**: 认为 `SparkCatalog` 和 `SparkGenericCatalog` 可以同时配置
-- **真相**: 两者是互斥的，`SparkGenericCatalog` 用于替换 `spark_catalog`，`SparkCatalog` 用于独立 Catalog
+| 概念 | 一句话定义 | 关键源码 |
+|------|-----------|---------|
+| **SparkSource** | DataSource 注册入口，`shortName()="paimon"` | `SparkSource.scala:45`、`NAME` 在 `:131` |
+| **SparkShim** | 收纳所有跨 Spark 版本不兼容 API 的 trait，SPI 选实现 | `org/apache/spark/sql/paimon/shims/SparkShim.scala:48` |
+| **SparkShimLoader** | `ServiceLoader.load(SparkShim)` 单例加载，多于/少于 1 个都报错 | `SparkShimLoader.scala:28` |
+| **SparkBaseCatalog** | 两个 Catalog 的公共基座，统一 `loadProcedure` | `SparkBaseCatalog.java:42` |
+| **SparkCatalog** | 独立 Paimon Catalog，`loadSparkTable` 按表类型多态分发 | `SparkCatalog.java:759` |
+| **SparkGenericCatalog** | `CatalogExtension`，替换 `spark_catalog`，先 Paimon 后回退 | `SparkGenericCatalog.java` |
+| **PaimonScanBuilder** | 下推聚合/TopN，`build()` 产出 PaimonScan 或 PaimonLocalScan | `PaimonScanBuilder.scala:128` |
+| **PaimonBaseScanBuilder** | 谓词三拆 + 列裁剪的公共逻辑 | `PaimonBaseScanBuilder.scala:65` |
+| **PaimonSparkTableBase** | Spark 表基类，`useV2Write` 在此判定 | `PaimonSparkTableBase.scala:50` |
+| **PaimonSparkSessionExtensions** | SQL 扩展注册中心，注入六类规则 | `extensions/PaimonSparkSessionExtensions.scala:34` |
+| **SparkProcedures** | 37 个 Procedure 的注册表（ImmutableMap） | `SparkProcedures.java:85` |
+| **TableSorter** | 排序器基类，`getSorter` 按 ORDER/ZORDER/HILBERT 分发 | `sort/TableSorter.java:65` |
 
-**错误配置**:
-```properties
-# 错误: 同时配置两种 Catalog
-spark.sql.catalog.spark_catalog=org.apache.paimon.spark.SparkGenericCatalog
-spark.sql.catalog.paimon=org.apache.paimon.spark.SparkCatalog
-spark.sql.catalog.paimon.warehouse=/path/to/warehouse
-# 问题: spark_catalog 已经是 Paimon，再配置独立 paimon catalog 会导致混淆
+> **路径修正（已修正）**：旧稿把 Shim 写成 `org.apache.paimon.spark.shims.SparkShim`，实际包名是 **`org.apache.spark.sql.paimon.shims`**；SPI 注册的实现类是 `org.apache.spark.sql.paimon.shims.Spark3Shim` / `Spark4Shim`。旧稿说 `SparkV2FilterConverter.scala` 在 `spark/spark/` 双层目录下，实际在 `org/apache/paimon/spark/SparkV2FilterConverter.scala`；`PaimonScanBuilder`/`PaimonBaseScanBuilder`/`PaimonScan` 在 `org/apache/paimon/spark/` 顶层而非 `read/` 子包（`BaseScan` 才在 `read/`）。
+
+### 1.3 高频生产陷阱
+
+**陷阱 1：`SparkCatalog` 与 `SparkGenericCatalog` 用途混淆。** 前者是独立 Catalog（用自定义名字，如 `paimon`），只管 Paimon 表；后者实现 `CatalogExtension` 用来**替换** `spark_catalog`，能同时访问 Paimon 表和 Hive 表（先查 Paimon 找不到再回退）。两者不要对同一个 catalog 名同时配置。`SparkGenericCatalog` 会强制关闭 `format-table.enabled` 以免与 Spark 原生格式表冲突（`SparkGenericCatalog.java` 的 `autoFillConfigurations`）。
+
+**陷阱 2：以为配了 `spark.sql.extensions` 就万事大吉。** Extensions 只注入语法与规则；Procedure 的实际加载还要靠 Catalog（`SparkBaseCatalog.loadProcedure`，`:61`）。只配 extensions 不配 `SparkCatalog`/`SparkGenericCatalog`，`CALL` 能解析但找不到 Procedure。
+
+**陷阱 3：误以为写入总走 V2。** `useV2Write` 需同时满足：`bucketFunctionType()==DEFAULT`、表是 `FileStoreTable`、BucketMode ∈ {HASH_FIXED（且 `BucketFunction.supportsTable`）, BUCKET_UNAWARE, POSTPONE_MODE（且未开 `postponeBatchWriteFixedBucket`）}、**且无聚类列**（`PaimonSparkTableBase.scala:55-69`）。任一不满足就静默回退 V1。多桶键、非 DEFAULT 桶函数、配了 clustering columns 都会回退——用户不易察觉。
+
+**陷阱 4：动态分区覆盖配置不一致。** `INSERT OVERWRITE` 默认是静态覆盖（删全表/全分区）。要只覆盖涉及分区，需 `write.dynamic-partition-overwrite=true` 或 Spark 端 `spark.sql.sources.partitionOverwriteMode=dynamic`。V2 不支持动态覆盖时由 `PaimonDynamicPartitionOverwrite` 转回 V1 路径执行（§5.4）。
+
+**陷阱 5：生产环境无脑 `CALL sys.compact(table=>'huge')`。** 不带 `partitions`/`where` 会扫全表所有 partition+bucket，可能跑数小时阻塞集群。务必按分区或时间增量压缩。`compact` 是分布式重操作（`parallelize` 到集群），`compact_manifest` 只合并 manifest、开销小，`rescale`（重分桶）会重写全部数据、开销极大。
+
+**陷阱 6：对高基数 / 过多列做 Z-Order。** Z-Order/Hilbert 只在 2~4 列多维查询下有收益；列数过多时高维空间局部性退化、Z-value 计算昂贵，效果反而不如线性 ORDER。排序是**分区内**的，跨分区不保证顺序。排序原理见 `12`。
+
+**陷阱 7：MOW（deletion-vectors）表"刚写的数据查不到"。** MOW 下 Level 0 文件要等 compaction 生成 deletion vector 后才对读可见（机制详见 `01` §7、`04`）。Spark 批写后若依赖独立异步 compaction，会出现可见延迟——这是存储层语义，不是 Spark 集成 bug。
+
+**陷阱 8：流式读未配 checkpointLocation / 限速理解错。** 不配 checkpoint 重启会重读全部；`maxBytesPerTrigger`/`maxFilesPerTrigger`/`maxRowsPerTrigger` 是"满足任一即停"的关系，`minRowsPerTrigger` 必须与 `maxTriggerDelayMs` 成对出现，只配一个会直接报错（`PaimonMicroBatchStream.scala:86`）。
+
+---
+
+## 2. 模块结构与 SparkShim 版本适配
+
+### ① 要解决什么问题
+
+Spark 3.2/3.3/3.4/3.5/4.0/4.1 之间有大量不兼容：`InternalRow`/`ArrayData` 接口变化、`MergeIntoTable` 签名增减参数、Variant 是 4.0 新类型、4.1 把行级命令重写规则挪进了主 Resolution 批次。若每个版本一套完整代码，修一个 bug 要改 5+ 处。
+
+### ② 设计原理与取舍
+
+**四层 + SPI**：`paimon-spark-common`（核心，Java+Scala 混合，数百文件）→ `paimon-spark3-common` / `paimon-spark4-common`（两个分支的适配层）→ `paimon-spark-3.2…3.5 / 4.0 / 4.1`（版本特定，每个仅二三十文件）→ `paimon-spark-ut`（统一测试）。
+
+把所有"随版本变"的方法收进 `SparkShim` trait（`SparkShim.scala:48` 起），由 `Spark3Shim`/`Spark4Shim` 实现，运行时用 SPI 选择：
+
+```scala
+// SparkShimLoader.scala:28-43（精选）
+private lazy val sparkShim: SparkShim = loadSparkShim()
+private def loadSparkShim(): SparkShim = {
+  val shims = ServiceLoader.load(classOf[SparkShim]).asScala
+  if (shims.isEmpty) throw new IllegalStateException("No available spark shim here.")
+  else if (shims.size > 1) throw new IllegalStateException("Found more than one spark shim here.")
+  // ...
+}
 ```
 
-正确配置（二选一）:
+每个版本的 shaded jar 里只有一个 SPI 文件（`META-INF/services/org.apache.spark.sql.paimon.shims.SparkShim`，内容是 `Spark3Shim` 或 `Spark4Shim`），所以"多于一个 shim"只会在错误地把两个版本 jar 混进 classpath 时发生——这条校验正是用来兜住"混用 jar"的事故。
+
+**SparkShim 收纳的典型方法**（`SparkShim.scala`，核对）：`createSparkParser`(:50)、`createCustomResolution`(:52)、`createSparkInternalRow`(:54)、`createSparkArrayData`(:61)、`createMergeIntoTable`(:129)、`toPaimonVariant`(:200) 等。`classicApi`(:48) 抽象掉了 Spark 4 的 Classic/Connect API 分裂。
+
+### ③ 一处值得看的真实复杂性：Spark 4.1 的反射加载
+
+`PaimonSparkSessionExtensions.scala:82-131`（已修正：旧稿完全没提）用反射按需加载三条 Spark 4.1 专属规则（`Spark41UpdateTableRewrite`/`Spark41DeleteMetadataRestore`/`Spark41MergeIntoRewrite`）。原因是 4.1 把 `RewriteUpdateTable` 等挪进主 Resolution 批次并用 `resolveOperators` 短路 `analyzed=true` 节点，导致纯 append-only 表的 UPDATE/MERGE 子树被 Paimon 自己的规则提前标记为已分析、落到物理 planner 被拒。这三条规则的类体引用了 4.1-only 类型，因此不能被 `paimon-spark-common` 静态引用，只能 `SPARK_VERSION >= "4.1"` 门控 + 反射 + 捕获 `ClassNotFoundException`（spark3 构建下静默跳过）。这是"Shim 也兜不住、只能靠反射"的边界案例，值得作为版本适配复杂度的真实样本。
+
+### ④ 风险 / 陷阱 / 边界
+
+- Spark 4.x 必须 JDK ≥ 17、Scala 2.13；3.x 与 4.x 的 shaded jar 绝不能混用（会触发"多于一个 shim"）。
+- 升级 Spark 大版本必须同步换 Paimon Spark 模块 jar，否则 SPI 找不到匹配 shim 直接启动失败。
+
+### ⑤ 收益与代价
+
+收益：核心逻辑单点维护、版本特定模块极薄、编译期类型安全无运行时反射开销（4.1 那三条规则是唯一例外）。代价：模块层级深、构建 profile（`spark3`/`spark4`/`scala-2.13`）多、调试要分清规则落在哪个模块。
+
+---
+
+## 3. SparkCatalog 体系
+
+### ① 要解决什么问题
+
+用户要在一个 Spark Session 里既访问 Paimon 表又访问已有 Hive 表，还要能 `CALL` Procedure、做 Time Travel、管理非 Paimon 格式表。纯独立 Catalog 无法访问 Hive 表，完全替换 SessionCatalog 又会丢 Spark 原生能力。
+
+### ② 设计原理与取舍
+
+两个 Catalog + 一个基座：
+
+| 类 | Spark 接口 | 定位 | 适用 |
+|---|---|---|---|
+| `SparkBaseCatalog` | `TableCatalog`+`SupportsNamespaces`+`ProcedureCatalog`+`WithPaimonCatalog` | 公共基座，统一 Procedure 加载 | 抽象父类 |
+| `SparkCatalog` | 上述 + `FunctionCatalog`/`SupportView`/`SupportV1Function`/`FormatTableCatalog` | 独立 Catalog，只管 Paimon | 纯 Paimon 场景 |
+| `SparkGenericCatalog` | `CatalogExtension` | 替换 `spark_catalog`，委托回退 | Paimon+Hive 混合 |
+
+一句话设计哲学：**用 `CatalogExtension` 的"先 Paimon、找不到再回退 SessionCatalog"实现渐进式迁移，不破坏既有 Hive 工作流。**
+
+**两种部署配置（二选一，不要对同名 catalog 同时配）**：
+
 ```properties
-# 方案 1: 独立 Paimon Catalog（推荐用于纯 Paimon 场景）
+# 方案 A：独立 Paimon Catalog（纯 Paimon 场景）
 spark.sql.catalog.paimon=org.apache.paimon.spark.SparkCatalog
 spark.sql.catalog.paimon.warehouse=/path/to/warehouse
 
-# 方案 2: 替换 spark_catalog（推荐用于混合场景）
+# 方案 B：替换 spark_catalog（Paimon + Hive 混合场景）
 spark.sql.catalog.spark_catalog=org.apache.paimon.spark.SparkGenericCatalog
 spark.sql.catalog.spark_catalog.warehouse=/path/to/warehouse
 ```
 
-**生产环境注意事项**:
-- 使用 `SparkGenericCatalog` 时，`format-table.enabled` 会被强制关闭，避免与 Spark 原生格式表冲突
-- RESTCatalog 模式下才支持 V1 Function（`SupportV1Function` 接口）
-- 阿里云 EMR 环境会自动检测并配置 DLF metastore，注意检查是否符合预期
+无论哪种，要用 `CALL`/TAG/`MERGE INTO` 还得配 `spark.sql.extensions=org.apache.paimon.spark.extensions.PaimonSparkSessionExtensions`（§6）。
 
-**性能陷阱**:
-- `CachingCatalog` 默认启用，但缓存可能导致元数据不一致（多个 Spark 应用同时写入时）
-- Time Travel 查询会创建临时的 `extraOptions`，不会污染原始 Table 对象
+**Time Travel**：`VERSION AS OF`/`TIMESTAMP AS OF` 分别通过 `SCAN_VERSION`（`SparkCatalog.java:315`）和 `SCAN_TIMESTAMP_MILLIS`（`:337`）选项传给底层 `ReadBuilder`，写进临时 `extraOptions` 不污染原 Table 对象。注意 Spark 时间戳是微秒、Paimon 用毫秒，代码里做了换算。
 
-### 核心概念解释
+### ④ 风险 / 陷阱 / 边界
 
-**Catalog vs CatalogExtension**:
-- **Catalog**: Spark 的独立 Catalog 实现，完全独立管理一组表
-- **CatalogExtension**: Spark 的 Catalog 扩展机制，可以"包装"另一个 Catalog，实现委托模式
-- **关系**: `SparkCatalog` 实现 `TableCatalog`，`SparkGenericCatalog` 实现 `CatalogExtension`
+- 两个 Catalog 互斥，混配会让"哪个表归谁"变得不可预测。
+- `SupportV1Function`（V1 Function）只在 RESTCatalog 模式可用。
+- `SparkGenericCatalog.autoFillConfigurations` 会自动补 `warehouse`（取 `spark.sql.warehouse.dir`）、探测 Hive 自动设 `metastore=hive`、探测阿里云 EMR 配 DLF，并**强制** `format-table.enabled=false`——这些隐式行为要在生产环境核对是否符合预期。
+- 默认开启 `CachingCatalog`，多应用并发写同一表时缓存可能短暂不一致。
 
-**Procedure vs Function**:
-- **Function**: 返回值的计算逻辑，可以在 SQL 表达式中使用（如 `SELECT bucket(id) FROM table`）
-- **Procedure**: 执行操作的逻辑，通过 `CALL` 语句调用（如 `CALL sys.compact(...)`）
-- **区别**: Procedure 可以修改表数据和元数据，Function 只能读取
+### ⑤ 收益与代价
 
-**FormatTable**:
-- **定义**: Paimon Catalog 中管理的非 Paimon 格式表（CSV、JSON、ORC、Parquet 等）
-- **实现**: 通过 `FormatTable` 抽象层，转换为 Spark 原生的 `FileTable` 实现
-- **好处**: 统一的 Catalog 管理，无需切换 Catalog 访问不同格式的表
+收益：一套 Catalog 同时支撑独立/替换/混合三种使用模式，Procedure 统一加载，多种表类型透明。代价：配置组合多、隐式自动填充行为多，出错点集中在"配错 Catalog 类型/名字"。
 
-**Time Travel 的两种模式**:
-```sql
--- 模式 1: 按版本号（Snapshot ID）
-SELECT * FROM table VERSION AS OF 12345;
-
--- 模式 2: 按时间戳
-SELECT * FROM table TIMESTAMP AS OF '2024-01-01 00:00:00';
-```
-底层实现: 通过 `SCAN_VERSION` 或 `SCAN_TIMESTAMP_MILLIS` 选项传递给 `ReadBuilder`。
-
-**与其他系统对比**:
-- **Iceberg**: 也使用 CatalogExtension 模式，但 Procedure 实现方式不同（Iceberg 用 `StoredProcedure`）
-- **Delta Lake**: 不支持 CatalogExtension，只能作为独立 Catalog
-- **Hudi**: 不提供 Catalog 实现，依赖 Hive Metastore
-
-### 设计理念
-
-**为什么这样设计**:
-1. **兼容性优先**: 通过 `CatalogExtension` 模式，Paimon 可以与 Spark 生态无缝集成，不破坏已有工作流
-2. **渐进式迁移**: 用户可以先用 `SparkGenericCatalog` 混合访问 Paimon 和 Hive 表，逐步迁移
-3. **功能扩展**: 通过 `ProcedureCatalog` 接口扩展 Spark 不支持的 Procedure 功能
-4. **多态分发**: `loadTable` 根据表类型返回不同的 `SparkTable` 实现，支持多种表类型
-
-**权衡取舍**:
-- **优势**: 灵活性高，支持多种使用模式（独立 Catalog、替换 spark_catalog、混合使用）
-- **劣势**: 配置复杂度高，用户容易配置错误
-- **取舍**: 提供默认配置和自动检测（如 `autoFillConfigurations`），降低配置门槛
-
-**架构演进**:
-- **早期**: 只有 `SparkCatalog`，用户必须显式切换 Catalog
-- **中期**: 引入 `SparkGenericCatalog`，支持替换 `spark_catalog`
-- **现在**: 完善的委托模式，支持 Procedure、View、Function、FormatTable 等扩展功能
-
-**业界对比**:
-- **Iceberg 的做法**: 与 Paimon 类似，提供 `SparkCatalog` 和 `SparkSessionCatalog`（类似 `SparkGenericCatalog`）
-- **Delta Lake 的做法**: 只提供独立 Catalog，不支持替换 `spark_catalog`
-- **Paimon 的优势**: 更完善的委托模式，自动配置填充，更好的 Hive 兼容性
-
-### 2.1 类继承层次
+### 3.1 类继承层次
 
 ```mermaid
 classDiagram
@@ -317,1018 +258,374 @@ classDiagram
     SparkGenericCatalog ..|> CatalogExtension
 ```
 
-### 2.2 SparkBaseCatalog -- 基座
+### 3.2 SparkBaseCatalog：Procedure 统一入口
 
-**源码位置**: `paimon-spark-common/.../catalog/SparkBaseCatalog.java`
+**源码**：`SparkBaseCatalog.java:42`（类声明）、`:61`（`loadProcedure`）
 
 ```java
+// SparkBaseCatalog.java（精选）
 public abstract class SparkBaseCatalog
         implements TableCatalog, SupportsNamespaces, ProcedureCatalog, WithPaimonCatalog {
-    protected String catalogName;
-
-    public Set<TableCatalogCapability> capabilities() {
-        return Collections.singleton(SUPPORT_COLUMN_DEFAULT_VALUE);
-    }
-
     public Procedure loadProcedure(Identifier identifier) throws NoSuchProcedureException {
-        if (isSystemNamespace(identifier.namespace())) {
+        if (isSystemNamespace(identifier.namespace())) {          // 仅 sys 命名空间
             ProcedureBuilder builder = SparkProcedures.newBuilder(identifier.name());
-            if (builder != null) {
-                return builder.withTableCatalog(this).build();
-            }
+            if (builder != null) return builder.withTableCatalog(this).build();
         }
         throw new NoSuchProcedureException(identifier);
     }
 }
 ```
 
-**为什么这么做？**
-- **Procedure 统一加载**: 不论使用 `SparkCatalog` 还是 `SparkGenericCatalog`，Procedure 的注册和加载逻辑完全一致，避免重复。
-- **`ProcedureCatalog` 接口**: 这是 Paimon 自定义的接口，Spark 原生不提供 Procedure 概念，Paimon 借鉴 Iceberg 模式，通过 `CALL sys.xxx()` 语法调用。
+`ProcedureCatalog` 是 Paimon 自定义接口（Spark 原生无 Procedure 概念，模式借鉴 Iceberg），放在基座保证 `SparkCatalog` 与 `SparkGenericCatalog` 共享同一套加载逻辑。`capabilities()`（`:56`）只声明 `SUPPORT_COLUMN_DEFAULT_VALUE`，让 Spark 支持列默认值。
 
-### 2.3 SparkCatalog -- 独立 Paimon Catalog
+### 3.3 SparkCatalog：独立 Paimon Catalog 与多态 loadTable
 
-**源码位置**: `paimon-spark-common/.../SparkCatalog.java`
+**源码**：`SparkCatalog.java`（`initialize`、`loadSparkTable` 在 `:759`）
 
-**核心职责**: 作为一个独立的 Spark Catalog 实例（如 `spark_catalog` 以外的其他名称），只管理 Paimon 表。
+`initialize()` 干五件事：校验必要配置 → `CatalogContext.create()`+`CatalogFactory.createCatalog()` 创建底层 Paimon `Catalog` → 读 `default-database`（默认 `"default"`）→ 判断是否启用 V1 Function（仅 RESTCatalog）→ 默认库不存在则建。
 
-**初始化流程** (`initialize()` 方法):
-1. 调用 `checkRequiredConfigurations()` 校验必要配置
-2. 通过 `CatalogContext.create()` + `CatalogFactory.createCatalog()` 创建底层 Paimon `Catalog` 实例
-3. 读取 `default-database` 选项，默认为 `"default"`
-4. 判断是否启用 V1 Function（仅 RESTCatalog 支持）
-5. 若默认数据库不存在，自动创建
-
-**loadTable 的多态分发**:
+**核心是按表类型多态分发**（`loadSparkTable`，`:759-773`，已核对行号）：
 
 ```java
-protected Table loadSparkTable(Identifier ident, Map<String, String> extraOptions) {
-    Table table = copyWithSQLConf(catalog.getTable(tblIdent), ...);
-    if (table instanceof FormatTable) {
-        return toSparkFormatTable(ident, (FormatTable) table);     // 格式表
-    } else if (table instanceof IcebergTable) {
-        return new SparkIcebergTable(table);                        // Iceberg 兼容表
-    } else if (table instanceof LanceTable) {
-        return new SparkLanceTable(table);                          // Lance 表
-    } else if (table instanceof ObjectTable) {
-        return new SparkObjectTable((ObjectTable) table);           // 对象表
-    } else {
-        return new SparkTable(table);                               // 标准 Paimon 表
-    }
-}
+// SparkCatalog.java:766-774（精选）
+if (table instanceof FormatTable)  return toSparkFormatTable(ident, (FormatTable) table);
+else if (table instanceof IcebergTable) return new SparkIcebergTable(table);
+else if (table instanceof LanceTable)   return new SparkLanceTable(table);
+else if (table instanceof ObjectTable)  return new SparkObjectTable((ObjectTable) table);
+else return new SparkTable(table);   // 标准 Paimon 表
 ```
 
-**为什么这么做？** Paimon 支持多种表类型，每种类型需要不同的 Spark Table 实现来提供不同的 capability（如 ObjectTable 只支持 `BATCH_READ`，SparkTable 支持读/写/流）。
+为什么分发？不同表类型暴露的 capability 不同（如 `ObjectTable` 只支持 `BATCH_READ`，`SparkTable` 支持读/写/流），用不同的 Spark Table 包装类承载。
 
-**Time Travel 支持**:
-- `loadTable(ident, version)`: 通过 `SCAN_VERSION` 选项实现版本查询
-- `loadTable(ident, timestamp)`: 通过 `SCAN_TIMESTAMP_MILLIS` 实现时间旅行。注意 Spark 传入微秒，Paimon 使用毫秒，代码中做了 `/1000` 转换。
+### 3.4 SparkGenericCatalog：CatalogExtension 委托模型
 
-### 2.4 SparkGenericCatalog -- 混合 Catalog (CatalogExtension)
+**源码**：`SparkGenericCatalog.java`
 
-**源码位置**: `paimon-spark-common/.../SparkGenericCatalog.java`
-
-**核心设计**: 实现 `CatalogExtension` 接口，用于替代 Spark 内置的 `spark_catalog`。它内部组合一个 `SparkCatalog` 和一个 `sessionCatalog`（委托 Catalog），实现"优先加载 Paimon 表，找不到再回退到 Session Catalog"的策略。
+实现 `CatalogExtension` 替换内置 `spark_catalog`，内部组合一个 `SparkCatalog` 和一个委托 `sessionCatalog`，核心是"**先 Paimon、找不到再回退**"：
 
 ```java
+// SparkGenericCatalog.java（精选）
 public Table loadTable(Identifier ident) throws NoSuchTableException {
-    try {
-        return sparkCatalog.loadTable(ident);        // 先尝试 Paimon
-    } catch (NoSuchTableException e) {
-        return throwsOldIfExceptionHappens(           // 回退到 Session Catalog
+    try { return sparkCatalog.loadTable(ident); }                 // 先 Paimon
+    catch (NoSuchTableException e) {
+        return throwsOldIfExceptionHappens(                       // 回退 Session Catalog
             () -> asTableCatalog().loadTable(ident), e);
     }
 }
 ```
 
-**为什么这么做？**
-- 用户可以在一个 Spark Session 中同时访问 Paimon 表和 Hive 表
-- `createTable` 时根据 `provider` 属性决定：如果是 `paimon` 或未指定则用 Paimon 建表，否则委托给 Session Catalog
+`createTable` 按 `provider` 决定走向：`paimon` 或未指定走 Paimon，否则委托 SessionCatalog。`autoFillConfigurations()` 的隐式行为见 §3 的"风险/陷阱"。
 
-**自动配置填充** (`autoFillConfigurations()`):
-- 如果未指定 `warehouse`，自动从 `spark.sql.warehouse.dir` 获取
-- 如果未指定 `metastore`，检测 Spark 是否配置了 Hive，自动设为 `hive`
-- 检测阿里云 EMR 环境，自动配置 DLF metastore
-- 强制关闭 format table (`format-table.enabled = false`)
+### 3.5 FormatTable / View / Function 扩展
 
-### 2.5 FormatTableCatalog -- 非 Paimon 格式表支持
-
-**源码位置**: `paimon-spark-common/.../catalog/FormatTableCatalog.java`
-
-通过 Paimon 的 `FormatTable` 抽象，可以在 Paimon Catalog 中管理 CSV、JSON、ORC、Parquet、Text 等原生格式表。加载时转换为 Spark 原生的 `FileTable` 实现（`PartitionedCSVTable`、`PartitionedParquetTable` 等），利用 Spark 原生读写能力。
-
-**好处**: 用户可以在 Paimon Catalog 中统一管理各种格式的表，不用切换 Catalog。
-
-### 2.6 SupportView -- 视图支持
-
-**源码位置**: `paimon-spark-common/.../catalog/SupportView.java`
-
-通过 `WithPaimonCatalog` 接口获取底层 Paimon Catalog 实例，代理视图的 CRUD 操作。视图存储时会以 `spark` 方言保存 SQL 文本，支持多方言（如 Flink 和 Spark 可以有不同的 SQL 表达）。
+- **FormatTableCatalog**（`catalog/FormatTableCatalog.java`）：借 Paimon 的 `FormatTable` 抽象，在 Paimon Catalog 内管理 CSV/JSON/ORC/Parquet/Text 等原生格式表，加载时转成 Spark 原生 `FileTable`（`PartitionedCSVTable`/`PartitionedParquetTable` 等）复用 Spark 读写。好处：不切 Catalog 就能管多格式表。
+- **SupportView**（`catalog/SupportView.java`）：经 `WithPaimonCatalog` 拿底层 Paimon Catalog 代理视图 CRUD；视图以 `spark` 方言保存 SQL 文本，支持多方言（Flink/Spark 各存各的）。
+- **SupportV1Function**：仅 RESTCatalog 暴露 V1 Function。
 
 ---
 
-## 3. DataSource V2 读取
+## 4. DataSource V2 读取与下推
 
-### 解决什么问题
+### ① 要解决什么问题
 
-**核心业务问题**: Spark 需要高效读取 Paimon 表的数据，同时利用 Paimon 的存储优化（分区裁剪、列裁剪、谓词下推、聚合下推、文件统计信息）来减少 I/O 和计算量。如果不做这些优化，Spark 会读取所有数据文件的所有列，然后在内存中过滤和聚合，性能极差。
+Spark 读 Paimon 表，要把 Paimon 存储侧的优化（分区裁剪、列裁剪、谓词下推、聚合下推、文件统计）暴露给 Catalyst，否则会"读所有文件所有列再在内存过滤聚合"。例：`SELECT COUNT(*) FROM t WHERE year=2024` 在有下推时只读 `year=2024` 分区、必要列，甚至直接从 manifest 统计返回 COUNT、0 数据文件读取。
 
-**没有这个设计的后果**:
-```sql
--- 查询: 只需要 2024 年的数据，只需要 id 和 name 列，只需要 COUNT(*)
-SELECT COUNT(*) FROM table WHERE year = 2024;
+### ② 设计原理与取舍
 
--- 没有优化: 读取所有年份、所有列、所有行，然后在 Spark 内存中过滤和聚合
--- 有优化: 只读取 year=2024 分区，只读取必要的列，直接从 Manifest 统计信息返回 COUNT
-```
+走 DataSource V2 的三层抽象：**Scan**（描述怎么扫——列/谓词/统计）→ **Batch**（描述扫什么——InputPartition 列表）→ **PartitionReader**（怎么逐行读出 InternalRow）。逻辑优化（裁剪/下推）落在 Scan 层，物理优化（BinPacking/桶分区）落在 Batch 层；`InputPartition` 只带 Split 的序列化信息，真正读取在 Task 端延迟执行。
 
-**实际场景**:
-- **场景 1**: 大宽表查询（100 列），只需要 5 列 → 列裁剪减少 95% I/O
-- **场景 2**: 分区表查询（1000 个分区），只需要 1 个分区 → 分区裁剪减少 99.9% 扫描
-- **场景 3**: 聚合查询 `SELECT COUNT(*) FROM table` → 聚合下推，0 数据文件读取
-- **场景 4**: TopN 查询 `SELECT * FROM table ORDER BY id LIMIT 100` → TopN 下推，提前终止扫描
+一句话设计哲学：**能在存储层用 manifest 统计跳过的就别读进来，跳不干净的（数据谓词）就用 `postScan` 让 Spark 二次过滤兜底——既省 I/O 又保正确。**
 
-### 有什么坑
+下推按"渐进"顺序尝试：先聚合下推（成则 0 数据文件）→ 再 TopN 下推 → 都不行回退正常扫描。文件级跳过依赖 manifest 的 min/max/nullCount 与文件索引（Bloom/Bitmap/BSI，详见 `13`）。
 
-**误区陷阱**:
-- **误区 1**: 认为所有谓词都能下推到存储层
-- **真相**: 只有能转换为 Paimon `Predicate` 的谓词才能下推，复杂表达式（如 UDF、子查询）无法下推
+### 4.1 读取链路与类继承
 
-**错误配置**:
-```properties
-# 错误: 禁用列裁剪
-spark.sql.optimizer.pruneColumns=false
-# 后果: Paimon 仍会读取所有列，浪费 I/O
+调用链：`SparkTable.newScanBuilder()` → `PaimonScanBuilder` 接受 `pruneColumns`/`pushPredicates`/`pushLimit`/`pushTopN`/`pushAggregation` → `build()` 出 `PaimonScan`（或聚合下推时的 `PaimonLocalScan`）→ `toBatch()` 出 `PaimonBatch` → `planInputPartitions()` 出 `Array[InputPartition]` → `PaimonPartitionReaderFactory` → `PaimonPartitionReader` 逐行出 `InternalRow`。
 
-# 错误: 设置过大的 maxSplitBytes
-spark.sql.files.maxPartitionBytes=10g
-# 后果: 单个 Task 处理过多数据，可能 OOM
-```
-
-**生产环境注意事项**:
-- **BinPacking 优化**: 小文件场景下，`FILES_MAX_PARTITION_BYTES` 配置不当会导致过多或过少的 Task
-- **桶扫描**: `HASH_FIXED` 桶模式下，如果查询不涉及桶键，桶扫描反而会降低性能（AQE 会自动禁用）
-- **聚合下推**: 只有 `FileStoreTable` 且没有 post-scan 谓词时才能下推，否则会回退到正常扫描
-
-**性能陷阱**:
-- **过度裁剪**: 如果查询需要多次访问同一表的不同列，列裁剪可能导致多次扫描
-- **谓词顺序**: 分区谓词应该放在前面，数据谓词放在后面，利用短路求值
-- **元数据列**: 访问 `_file_path`、`_row_index` 等元数据列会禁用某些优化
-
-### 核心概念解释
-
-**DataSource V2 的三层抽象**:
-1. **Scan**: 描述"如何扫描"（列裁剪、谓词、统计信息）
-2. **Batch**: 描述"扫描什么"（InputPartition 列表）
-3. **PartitionReader**: 描述"如何读取"（逐行读取 InternalRow）
-
-**谓词下推的两个阶段**:
-```scala
-// 阶段 1: Spark Optimizer 调用 pushPredicates
-pushPredicates(Array(EqualTo("year", 2024), GreaterThan("id", 100)))
-
-// 阶段 2: 区分分区谓词和数据谓词
-partitionFilters = [EqualTo("year", 2024)]  // 在 Manifest 级别过滤
-dataFilters = [GreaterThan("id", 100)]      // 在文件级别过滤（min/max/bloom filter）
-postScan = [GreaterThan("id", 100)]         // Spark 二次过滤（因为数据谓词不保证精确）
-```
-
-**BinPacking 算法**:
-- **问题**: Paimon 的 Split 粒度是单个数据文件，可能只有几 MB
-- **解决**: 将多个小 Split 合并为一个 `InputPartition`，减少 Task 数量
-- **策略**: 按 partition + bucket 分组，累积大小超过 `maxSplitBytes` 时开始新 partition
-
-**桶分区报告 (Bucketed Scan)**:
-```scala
-// Spark 看到的分区信息
-KeyGroupedPartitioning(
-  clustering = Seq(bucket(hash(bucket_key))),  // 按桶键分区
-  numPartitions = bucketNum                     // 桶数量
-)
-```
-好处: Spark 可以利用这个信息做 Bucket Join，避免 shuffle。
-
-**聚合下推的极端优化**:
-```sql
--- 查询
-SELECT COUNT(*) FROM table WHERE year = 2024;
-
--- 正常流程: 扫描所有数据文件 → 计数 → 返回
--- 聚合下推: 读取 Manifest 统计信息 → 累加 rowCount → 返回（0 数据文件读取）
-```
-
-**与其他系统对比**:
-- **Parquet**: 支持列裁剪、谓词下推（通过 footer 的统计信息）
-- **ORC**: 支持列裁剪、谓词下推、聚合下推（通过 stripe 统计信息）
-- **Paimon**: 支持所有上述优化，额外支持 TopN 下推、桶分区报告、元数据列
-
-### 设计理念
-
-**为什么这样设计**:
-1. **分层优化**: Scan 层做逻辑优化（列裁剪、谓词下推），Batch 层做物理优化（BinPacking、桶分区）
-2. **延迟计算**: `InputPartition` 只包含 Split 的序列化信息，真正的读取在 Task 端执行
-3. **统计信息驱动**: 利用 Manifest 的 min/max/nullCount 统计信息做文件级过滤
-4. **渐进式下推**: 先尝试聚合下推，失败则尝试 TopN 下推，最后回退到正常扫描
-
-**权衡取舍**:
-- **优势**: 最大化利用 Paimon 的存储优化，减少 I/O 和计算量
-- **劣势**: 复杂的下推逻辑增加了代码复杂度和调试难度
-- **取舍**: 通过 `postScan` 机制保证正确性（存储层过滤不精确时，Spark 做二次过滤）
-
-**架构演进**:
-- **早期**: 只支持基本的列裁剪和分区裁剪
-- **中期**: 引入谓词下推和 BinPacking 优化
-- **现在**: 完整的下推体系（聚合、TopN、桶分区报告、元数据列）
-
-**业界对比**:
-- **Iceberg**: 支持类似的下推优化，但聚合下推实现方式不同（Iceberg 用 `DeleteFile` 机制）
-- **Delta Lake**: 支持列裁剪和谓词下推，但不支持聚合下推和 TopN 下推
-- **Paimon 的优势**: 更激进的下推策略，特别是聚合下推可以实现 0 数据文件读取
-
-### 3.1 整体读取流程
-
-```mermaid
-sequenceDiagram
-    participant Spark as Spark Engine
-    participant Table as SparkTable
-    participant SB as PaimonScanBuilder
-    participant Scan as PaimonScan
-    participant Batch as PaimonBatch
-    participant PRF as PaimonPartitionReaderFactory
-    participant PR as PaimonPartitionReader
-
-    Spark->>Table: newScanBuilder(options)
-    Table->>SB: new PaimonScanBuilder(table)
-    Spark->>SB: pruneColumns(requiredSchema)
-    Spark->>SB: pushPredicates(predicates)
-    Spark->>SB: pushLimit(limit)
-    Spark->>SB: pushTopN(orders, limit)
-    Spark->>SB: pushAggregation(agg)
-    Spark->>SB: build()
-    SB->>Scan: PaimonScan(...)
-    Spark->>Scan: toBatch()
-    Scan->>Batch: PaimonBatch(inputPartitions, readBuilder, ...)
-    Spark->>Batch: planInputPartitions()
-    Batch-->>Spark: Array[InputPartition]
-    Spark->>Batch: createReaderFactory()
-    Batch->>PRF: PaimonPartitionReaderFactory(readBuilder, ...)
-    Spark->>PRF: createReader(partition)
-    PRF->>PR: PaimonPartitionReader(readBuilder, partition, ...)
-    loop 逐行读取
-        Spark->>PR: next() / get()
-        PR-->>Spark: InternalRow
-    end
-```
-
-### 3.2 类继承层次
+类继承（已核对包路径——这些类在 `org/apache/paimon/spark/` 顶层，`BaseScan` 在 `read/`）：
 
 ```
-BaseScan (trait)                    -- 基础 Scan 逻辑: 列裁剪/谓词/统计/指标
-  └── PaimonBaseScan (abstract)     -- Paimon 特化: GlobalIndex查询/向量搜索/全文搜索/MicroBatch
-        └── PaimonScan (case class) -- 最终 Scan: 桶分区/排序报告
+BaseScan (trait, read/BaseScan.scala)        列裁剪/谓词/统计/指标
+  └─ PaimonBaseScan (abstract)               GlobalIndex/向量搜索/全文搜索/MicroBatch 特化
+       └─ PaimonScan (case class, PaimonScan.scala)   桶分区报告/排序报告
 
-PaimonBaseScanBuilder (abstract)    -- 基础下推: V2Filter/列裁剪/Limit
-  └── PaimonScanBuilder             -- 聚合下推/TopN下推/build()
+PaimonBaseScanBuilder (abstract, :65 pushPredicates)  谓词三拆/列裁剪
+  └─ PaimonScanBuilder (:43 pushTopN, :98 pushAggregation, :128 build)
 ```
 
-### 3.3 谓词下推 (Predicate Push Down)
+### 4.2 谓词下推：三份谓词的拆分
 
-**源码位置**: `PaimonBaseScanBuilder.scala` 的 `pushPredicates()` 方法
+**源码**：`PaimonBaseScanBuilder.scala:65`（`pushPredicates`）
 
-核心流程:
-1. 将 Spark V2 `Predicate` 通过 `SparkV2FilterConverter` 转换为 Paimon `Predicate`
-2. 使用 `PartitionPredicateVisitor` 区分分区谓词和数据谓词
-3. 分区谓词通过 `splitPartitionPredicatesAndDataPredicates` 拆分后设置到 `pushedPartitionFilters`
-4. 数据谓词设置到 `pushedDataFilters`，同时保留在 `postScan` 中（因为数据谓词不能保证完全由存储层过滤）
-5. 不能转换的谓词也作为 `postScan` 返回
-
-**SparkV2FilterConverter** (`paimon-spark-common/.../spark/SparkV2FilterConverter.scala`) 支持的谓词类型:
-
-| Spark 谓词 | Paimon 谓词 |
-|-----------|------------|
-| `=` | `equal` |
-| `<=>` | `isNull` 或 `isNotNull + equal` |
-| `>`, `>=`, `<`, `<=` | `greaterThan`, `greaterOrEqual`, `lessThan`, `lessOrEqual` |
-| `IN` | `in` |
-| `IS_NULL`, `IS_NOT_NULL` | `isNull`, `isNotNull` |
-| `AND`, `OR`, `NOT` | 组合谓词 |
-| `STARTS_WITH`, `ENDS_WITH`, `CONTAINS` | `startsWith`, `endsWith`, `contains` |
-
-**为什么分区谓词和数据谓词要分开处理？** 分区谓词可以在 Manifest 级别过滤，无需读取数据文件；数据谓词需要在文件级别使用统计信息过滤（min/max/bloom filter），但不能保证精确过滤所有不匹配行，所以同时保留在 postScan 中让 Spark 做二次过滤。
-
-### 3.4 列裁剪 (Column Pruning)
+核心是把传入的 Spark V2 `Predicate` 拆成**三份**而非两份：
 
 ```scala
-override def pruneColumns(requiredSchema: StructType): Unit = {
-    this.requiredSchema = requiredSchema
-}
+// PaimonBaseScanBuilder.scala（流程精选）
+val converter = SparkV2FilterConverter(newRowType)                 // :78
+val partitionPredicateVisitor = new PartitionPredicateVisitor(partitionKeys)  // :79
+// 1) 能转成 Paimon Predicate 且只涉及分区列 → pushedPartitionFilters（manifest 级裁剪，精确）
+// 2) 能转成 Paimon Predicate 但涉及数据列  → pushedDataFilters（文件级跳过，不保证精确）
+//                                          且同一谓词仍放进 postScan
+// 3) 转不了的（UDF/子查询/复杂表达式）     → 直接进 postScan
 ```
 
-在 `BaseScan` 的 `readBuilder` 中:
+| 谓词类别 | 去向 | 作用层 | 是否精确 |
+|---|---|---|---|
+| 分区谓词 | `pushedPartitionFilters`（`:106`） | manifest | 精确，无需 postScan |
+| 数据谓词 | `pushedDataFilters`（`:109`）+ postScan | 文件 min/max/索引 | 不精确，需二次过滤 |
+| 不可转换 | postScan（`:111`） | Spark 引擎 | —— |
+
+为什么数据谓词要"既下推又保留"？文件级统计只能保证"这个文件**可能**有匹配行"，不能保证文件里每行都匹配，所以必须让 Spark 用 `postScan` 再过一遍。`SparkV2FilterConverter`（`org/apache/paimon/spark/SparkV2FilterConverter.scala`，已修正路径）支持 `=`/`<=>`/比较/`IN`/`IS [NOT] NULL`/`AND/OR/NOT`/`STARTS_WITH`/`ENDS_WITH`/`CONTAINS` 等到 Paimon `Predicate` 的映射。
+
+### 4.3 列裁剪
+
+`pruneColumns(requiredSchema)` 只记录所需 schema（`:61`）；真正生效在 `BaseScan` 构造 readBuilder 时把 Spark `requiredSchema` 经 `SparkTypeUtils.prunePaimonRowType()` 映射成精简的 Paimon `RowType`，`newReadBuilder().withReadType(...)` 只读需要的列。列裁剪比例还会反馈给 BinPacking 的文件大小估算（§4.5 的 `readRowSizeRatio`）。
+
+### 4.4 聚合下推与 TopN 下推
+
+**源码**：`PaimonScanBuilder.scala:98`（`pushAggregation`）、`:43`（`pushTopN`）
+
+聚合下推条件（`:103-121`）：① 表是 `FileStoreTable` ② 无 post-scan 谓词 ③ `AggregatePushDownUtils.tryPushdownAggregation()` 成功。命中则返回 `PaimonLocalScan(agg.result(), ...)`——不读任何数据文件，直接从 manifest 统计算出聚合结果（如 `COUNT(*)`）。这是 Paimon 比 Delta 更激进的一点。
+
+TopN 下推（`:43`）：仅 `FileStoreTable`（`:48`）支持，记录 `pushedTopN` 后返回 `false` 表示 best-effort——存储层据排序+limit 缩小扫描范围，Spark 仍做最终排序兜底。注意 `pushLimit` 也复用 `pushAggregation` 的完全下推逻辑（`:93-94`）。
+
+### 4.5 BinPacking：小 Split 合并
+
+**源码**：`read/BinPackingSplits.scala:38`（case class）、`:78`（`pack`）、`:100`（`packDataSplit`）
+
+问题：Paimon 的 Split 粒度是单个数据文件，可能只有几 MB，一个 Split 一个 Task 会产生海量小任务。
+
 ```scala
-val _readBuilder = table.newReadBuilder().withReadType(readTableRowType)
+// BinPackingSplits.scala（流程精选）
+case class BinPackingSplits(coreOptions: CoreOptions, readRowSizeRatio: Double = 1.0)  // :38
+def pack(splits: Array[Split]) =
+  splits.partition { case s: DataSplit => s.rawConvertible() ... }  // :81 区分可重排/不可重排
+// packDataSplit:
+//   maxSplitBytes = min(FILES_MAX_PARTITION_BYTES, 每核平均字节)   // :101, :50
+//   按 partition+bucket 分组，累积 size 超 maxSplitBytes 就开新 partition  // :144
+//   size = fileSize * readRowSizeRatio + openCostInBytes          // :142（列裁剪感知）
 ```
 
-`readTableRowType` 通过 `SparkTypeUtils.prunePaimonRowType()` 将 Spark 的 `requiredSchema` 映射为 Paimon 的精简 `RowType`，只读取需要的列，减少 I/O。
+`readRowSizeRatio` 按"实际读列数/总列数"修正文件大小估算，使列裁剪后的打包更准。只有 `rawConvertible` 的 `DataSplit`（可直接读原始文件、无需 merge）才参与重排打包。
 
-### 3.5 聚合下推 (Aggregate Push Down)
+### 4.6 桶分区报告与元数据列
 
-**源码位置**: `PaimonScanBuilder.scala` 的 `pushAggregation()` 方法
+**桶分区报告**（`PaimonScan.scala`）：当表为 `HASH_FIXED` 且单桶键时，`PaimonScan` 报告 `KeyGroupedPartitioning`（让 Spark 知道数据已按桶分区，可做 Bucket Join 免 shuffle），并在每个 InputPartition 仅含一个按主键排序的 Split 时报告 `outputOrdering()`，Split 按桶号分组进 `PaimonBucketedInputPartition`。`DisableUnnecessaryPaimonBucketedScan`（§6.4）在 AQE 阶段自动关掉不必要的桶扫描（查询不涉及桶键时桶扫描反而拖慢）。
 
-当满足以下条件时可以做聚合下推:
-- 表必须是 `FileStoreTable`
-- 没有 post-scan 谓词
-- `AggregatePushDownUtils.tryPushdownAggregation()` 成功
+**元数据列**（`PaimonSparkTableBase.metadataColumns`，`:111-129`，已核对）：
 
-如果下推成功，返回 `PaimonLocalScan`（不读取数据文件，直接从统计信息中计算聚合结果），这是一种极端优化：例如 `SELECT COUNT(*) FROM table` 可以直接从 manifest 的统计信息得到结果，无需扫描任何数据文件。
-
-### 3.6 TopN 下推
-
-```scala
-override def pushTopN(orders: Array[SortOrder], limit: Int): Boolean = {
-    // 仅 FileStoreTable 且没有 post-scan 谓词时支持
-    pushedTopN = Some(new TopN(sorts.asJava, limit))
-    false  // 返回 false 表示 best-effort，Spark 仍做最终排序
-}
-```
-
-**好处**: 存储层可以根据排序条件和限制数量优化扫描范围，减少需要读取的文件数。
-
-### 3.7 Split 的 BinPacking 优化
-
-**源码位置**: `paimon-spark-common/.../spark/read/BinPackingSplits.scala`
-
-**问题**: Paimon 的 Split 粒度可能很小（单个数据文件），直接每个 Split 一个 Task 会导致过多小任务。
-
-**解决方案**: BinPacking 算法将多个小 Split 合并为一个 `InputPartition`:
-
-1. 区分可重排的 Split（`rawConvertible` 的 `DataSplit`）和不可重排的 Split
-2. 对可重排 Split，计算 `maxSplitBytes`（取 `FILES_MAX_PARTITION_BYTES` 和每核平均字节数的较小值）
-3. 按 partition + bucket 分组，将同组内的小文件打包到一个 `InputPartition` 中
-4. 当累积大小超过 `maxSplitBytes` 时开始新的 partition
-
-**为什么需要列裁剪感知？** `readRowSizeRatio` 参数会根据实际读取列数与总列数的比例调整文件大小估算，使得列裁剪后的 binpacking 更准确。
-
-### 3.8 桶分区报告 (Bucketed Scan)
-
-**源码位置**: `PaimonScan.scala`
-
-当表使用 `HASH_FIXED` 桶模式且只有一个桶键时，`PaimonScan` 会：
-1. 报告 `KeyGroupedPartitioning`，让 Spark 知道数据已按桶分区
-2. 报告排序信息（`outputOrdering()`），当每个 InputPartition 只有一个 Split 且按主键排序时
-3. 按桶号分组 Split 到 `PaimonBucketedInputPartition`
-
-**好处**: Spark 可以利用分区信息避免不必要的 shuffle（如桶 Join），提高查询效率。`DisableUnnecessaryPaimonBucketedScan` 规则会在 AQE (Adaptive Query Execution) 阶段自动禁用不必要的桶扫描。
-
-### 3.9 元数据列 (Metadata Columns)
-
-`PaimonSparkTableBase` 实现了 `SupportsMetadataColumns`，暴露以下元数据列:
-
-| 元数据列 | 条件 | 说明 |
-|---------|------|------|
-| `_row_id` | `rowTrackingEnabled` | 行级唯一标识 |
-| `_sequence_number` | `rowTrackingEnabled` | 序列号 |
-| `_file_path` | 始终可用 | 数据文件路径 |
-| `_row_index` | 始终可用 | 文件内行索引 |
-| `_partition` | 始终可用 | 分区值 |
-| `_bucket` | 始终可用 | 桶号 |
+| 元数据列 | 条件 | 源码 |
+|---|---|---|
+| `_row_id` / `_sequence_number` | `rowTrackingEnabled()` | `:116-118` |
+| `_file_path` / `_row_index` / `_partition` / `_bucket` | 始终可用 | `:121-128` |
 
 ---
 
-## 4. DataSource V2 写入
+## 5. DataSource V2 写入：V1Write vs V2Write
 
-### 解决什么问题
+### ① 要解决什么问题
 
-**核心业务问题**: Spark 写入 Paimon 表时，需要保证数据按分区和桶正确分布，同时保证写入的原子性和一致性。如果数据分布不正确，会导致查询时需要跨桶读取，性能极差；如果没有原子提交，会导致部分写入成功、部分失败，数据不一致。
+Spark 写 Paimon 表要满足两点：① 数据按 (partition, bucket) 正确分布——主键表相同主键必须落同一桶才能 upsert；② 多 Task 并发写要原子提交，不能部分成功。同时 Spark 是批引擎，写完就结束，不像 Flink 能在 writer 里持续后台 compaction。
 
-**没有这个设计的后果**:
+### ② 设计原理与取舍
+
+Paimon 提供**两条写入路径**，按表特征自动选：
+
+| | V1Write | V2Write |
+|---|---|---|
+| 入口 | `WriteIntoPaimonTable`（`RunnableCommand`） | `PaimonV2Write`（`Write` + `RequiresDistributionAndOrdering`） |
+| 分桶谁做 | Paimon 在 Driver 端自管（`PaimonSparkWriter`） | 声明 distribution，Spark 负责 shuffle |
+| AQE | 不利用 | 利用 Spark AQE 优化 shuffle |
+| 兼容性 | 全桶模式、多桶键、非 DEFAULT 桶函数、聚类列都支持 | 条件受限（见下） |
+| 行级操作 | 经 PostHoc 重写走 V1 命令 | 支持 Copy-on-Write（`SupportsRowLevelOperations`） |
+
+V2 启用条件（`PaimonSparkTableBase.scala:55-69`，已核对）：`bucketFunctionType()==DEFAULT` 且表是 `FileStoreTable` 且 BucketMode ∈ {`HASH_FIXED`（须 `BucketFunction.supportsTable`）, `BUCKET_UNAWARE`, `POSTPONE_MODE`（须未开 `postponeBatchWriteFixedBucket`）} 且**无聚类列**。任一不满足静默回退 V1。
+
 ```scala
-// 场景: 写入一个 HASH_FIXED 桶表（4 个桶）
-// 没有正确分布: 每个 Task 写入的数据可能跨越多个桶
-// Task 1 写入: bucket 0, 1, 2, 3
-// Task 2 写入: bucket 0, 1, 2, 3
-// Task 3 写入: bucket 0, 1, 2, 3
-// 结果: 每个桶的数据分散在多个文件中，查询时需要读取所有文件
-
-// 正确分布: 每个 Task 只写入一个桶
-// Task 1 写入: bucket 0
-// Task 2 写入: bucket 1
-// Task 3 写入: bucket 2
-// Task 4 写入: bucket 3
-// 结果: 每个桶的数据集中在少数文件中，查询时只需读取对应桶的文件
+// PaimonSparkTableBase.scala:50-69（精选）
+lazy val useV2Write: Boolean = OptionUtils.useV2Write() && supportsV2Write
+private def supportsV2Write: Boolean =
+  coreOptions.bucketFunctionType() == BucketFunctionType.DEFAULT && {
+    table match {
+      case storeTable: FileStoreTable => storeTable.bucketMode() match {
+        case HASH_FIXED => BucketFunction.supportsTable(storeTable)
+        case BUCKET_UNAWARE => true
+        case POSTPONE_MODE if !coreOptions.postponeBatchWriteFixedBucket() => true
+        case _ => false }
+      case _ => false }
+  } && coreOptions.clusteringColumns().isEmpty
 ```
 
-**实际场景**:
-- **场景 1**: 写入主键表，需要保证相同主键的数据在同一个桶中（否则无法做 Upsert）
-- **场景 2**: 写入分区表，需要保证相同分区的数据在同一起（否则无法做分区覆盖）
-- **场景 3**: 并发写入，需要保证原子提交（否则会出现部分写入成功、部分失败）
-- **场景 4**: 行级操作（DELETE、UPDATE、MERGE INTO），需要读取受影响的文件并重写
+一句话设计哲学：**V1 是"Paimon 自管一切"的万能兜底，V2 是"把分布交给 Spark、换 AQE 优化和行级操作"的快路；用 `useV2Write` 自动选，用户无感知。原子性两条路都靠 Paimon 自己的 snapshot 提交，不依赖 Spark CommitCoordinator。**
 
-### 有什么坑
+### 5.1 两条写入路径与自动选择
 
-**误区陷阱**:
-- **误区 1**: 认为 V1 Write 和 V2 Write 功能完全相同
-- **真相**: V2 Write 有更多限制（不支持多桶键、非 DEFAULT 桶函数、聚类列），但性能更好
+`PaimonSparkTableBase.newWriteBuilder()`（`:143-150`，已核对）按 `useV2Write` 分发到 `PaimonV2WriteBuilder` 或 `PaimonWriteBuilder`：
 
-**错误配置**:
-```properties
-# 错误: 强制使用 V2 Write，但表不支持
-spark.sql.sources.useV1SourceList=
-# 后果: 如果表有聚类列或多桶键，会回退到 V1 Write，但用户不知道
-
-# 错误: 禁用动态分区覆盖
-spark.sql.sources.partitionOverwriteMode=static
-# 后果: OVERWRITE 会删除所有分区，而不是只删除涉及的分区
+```
+newWriteBuilder()
+  ├─ useV2Write=true  → PaimonV2WriteBuilder → PaimonV2Write → PaimonBatchWrite → PaimonV2DataWriter
+  └─ useV2Write=false → PaimonWriteBuilder   → PaimonWrite(V1Write) → WriteIntoPaimonTable(RunnableCommand)
 ```
 
-**生产环境注意事项**:
-- **V2 Write 的启用条件**: 必须满足桶函数为 DEFAULT、桶模式为 HASH_FIXED/BUCKET_UNAWARE/POSTPONE_MODE、无聚类列
-- **动态分区覆盖**: 需要设置 `write.dynamic-partition-overwrite=true` 或 Spark 配置 `partitionOverwriteMode=dynamic`
-- **Commit Coordinator**: Paimon 不使用 Spark 的 Commit Coordinator，因为 Paimon 自身保证原子提交
+V1 路径（`write/PaimonWrite.scala`、`commands/WriteIntoPaimonTable.scala`）：`PaimonWrite extends V1Write`，`toInsertableRelation` 返回一个把数据交给 `WriteIntoPaimonTable.run()` 的闭包；后者在 Driver 端用 `PaimonSparkWriter` 自管分桶，每分区用 `BatchTableWrite` 写。保留它是因为多桶键 / 非 DEFAULT 桶函数 / 聚类列这些 V2 不支持的场景必须有兜底。
 
-**性能陷阱**:
-- **V1 Write 的 shuffle**: V1 模式下，Paimon 在 `PaimonSparkWriter` 中做数据分桶，会引入额外的 shuffle
-- **V2 Write 的 shuffle**: V2 模式下，Spark 根据 `RequiresDistributionAndOrdering` 做 shuffle，可以利用 AQE 优化
-- **小文件问题**: 如果桶数过多或分区过多，会产生大量小文件，影响查询性能
+### 5.2 V2Write 与 RequiresDistributionAndOrdering
 
-### 核心概念解释
+**源码**：`write/PaimonV2Write.scala`、`write/PaimonWriteRequirement.scala`、`write/PaimonBatchWrite.scala`、`write/PaimonV2DataWriter.scala`
 
-**V1 Write vs V2 Write**:
-- **V1 Write**: 通过 `RunnableCommand` 在 Driver 端控制写入流程，Paimon 自己做数据分桶
-- **V2 Write**: 通过 `RequiresDistributionAndOrdering` 声明分布要求，Spark 做 shuffle
+V2 的关键是声明分布要求，让 Spark 在写前自动插 shuffle（`RepartitionByExpression`），把同一 (partition, bucket) 的数据汇到同一 Writer Task：
 
-**RequiresDistributionAndOrdering**:
 ```scala
+// PaimonV2Write（精选）
 class PaimonV2Write extends Write with RequiresDistributionAndOrdering {
-    // 声明数据分布要求: 按分区键 + bucket(桶键) 聚簇
-    override def requiredDistribution(): Distribution = 
-        Distributions.clustered(partitionCols ++ bucketCols)
-    
-    // 声明排序要求: 通常为空（Paimon 内部排序）
-    override def requiredOrdering(): Array[SortOrder] = EMPTY_ORDERING
+  override def requiredDistribution(): Distribution = writeRequirement.distribution
+  override def requiredOrdering(): Array[SortOrder]  = writeRequirement.ordering
 }
-```
-Spark 会在写入前自动插入 `RepartitionByExpression` 算子，保证数据分布。
-
-**Copy-on-Write 行级操作**:
-```scala
-// DELETE/UPDATE/MERGE INTO 的执行流程
-1. PaimonCopyOnWriteScan 读取受影响的文件
-2. 在内存中过滤/更新数据
-3. 写入新文件
-4. Commit 时同时提交新增文件和删除文件的 CommitMessage
+// PaimonWriteRequirement：HASH_FIXED 按 partition + bucket(桶键) 聚簇；
+//                         BUCKET_UNAWARE/POSTPONE 仅按 partition 聚簇
 ```
 
-**动态分区覆盖 vs 静态分区覆盖**:
-```sql
--- 动态分区覆盖: 只覆盖涉及的分区
-INSERT OVERWRITE TABLE table PARTITION (year, month)
-SELECT * FROM source WHERE year = 2024;
--- 结果: 只删除 year=2024 的分区，其他分区不受影响
+数据流：`toBatch()` → `PaimonBatchWrite` → 每 Task 起 `PaimonV2DataWriter`（`writeBuilder.newWrite()`，逐行 `writeAndReturn`）→ `commit()` 出 `WriteTaskResult(commitMessages)` → Driver 端 `batchTableCommit.commit(messages)` 原子提交。
 
--- 静态分区覆盖: 删除所有分区
-INSERT OVERWRITE TABLE table
-SELECT * FROM source WHERE year = 2024;
--- 结果: 删除所有分区，然后写入 year=2024 的数据
-```
+三个关键细节：① `SparkInternalRowWrapper` 把 Spark `InternalRow` 包成 Paimon 行、避免拷贝；② `useCommitCoordinator()` 返回 `false`——Paimon snapshot 提交本身幂等，Task 重试产生的重复 CommitMessage 不会破坏一致性，无需 Spark 协调器；③ `abort()` 目前只关资源（清理未提交文件是 TODO）。
 
-**CommitMessage 的作用**:
-- 每个 Task 写入完成后，返回 `CommitMessage`（包含新增文件、删除文件、统计信息）
-- Driver 端收集所有 `CommitMessage`，调用 `BatchTableCommit.commit()` 原子提交
-- 如果某个 Task 失败，Spark 会重试该 Task，重复的 `CommitMessage` 不会导致数据不一致
+### 5.3 Copy-on-Write 行级操作
 
-**与其他系统对比**:
-- **Iceberg**: 也支持 V1 和 V2 两种写入模式，但 V2 模式的实现方式不同（Iceberg 用 `DistributionMode`）
-- **Delta Lake**: 只支持 V1 写入模式，不支持 `RequiresDistributionAndOrdering`
-- **Hudi**: 支持多种写入模式（COW、MOR），但不支持 Spark DataSource V2
+DELETE/UPDATE/MERGE INTO 在 V2 下走 Copy-on-Write：`SparkTable` 混入 `SupportsRowLevelOperations`，`newRowLevelOperationBuilder` 在 `FileStoreTable && useV2Write` 时返回 `PaimonSparkCopyOnWriteOperation`。它通过 `PaimonCopyOnWriteScan` 读受影响文件 → 内存过滤/更新 → 写新文件 → commit 时同时提交新增与删除文件的 CommitMessage。不满足 V2 时，行级命令由 PostHoc 规则（§6.3）重写成 Paimon 的 V1 命令执行。
 
-### 设计理念
+### 5.4 Overwrite 四种模式
 
-**为什么这样设计**:
-1. **兼容性**: V1 Write 支持所有桶模式和配置，保证向后兼容
-2. **性能**: V2 Write 利用 Spark 的 `RequiresDistributionAndOrdering` 和 AQE 优化，性能更好
-3. **原子性**: 通过 Paimon 的 Snapshot 机制保证原子提交，不依赖 Spark 的 Commit Coordinator
-4. **灵活性**: 支持多种覆盖模式（追加、静态覆盖、动态覆盖、Truncate）
+| 模式 | 行为 | 实现 |
+|---|---|---|
+| InsertInto | 追加 | 不调用 `withOverwrite` |
+| Overwrite(filter) | 按条件覆盖 | filter 转分区映射传 `BatchWriteBuilder.withOverwrite()` |
+| DynamicOverWrite | 动态分区覆盖 | 设 `CoreOptions.DYNAMIC_PARTITION_OVERWRITE=true` |
+| Truncate | 全表覆盖 | `overwritePartitions=Map.empty` |
 
-**权衡取舍**:
-- **优势**: 两种写入模式互补，V1 兼容性好，V2 性能好
-- **劣势**: 两套代码路径增加了维护成本和理解难度
-- **取舍**: 通过 `supportsV2Write` 自动选择合适的模式，用户无需关心
+V2 不支持动态覆盖（表无 `OVERWRITE_DYNAMIC` capability）时，`PaimonAnalysis` 里的 `PaimonDynamicPartitionOverwrite` 匹配器把 `OverwritePartitionsDynamic` 转成 `PaimonDynamicPartitionOverwriteCommand`（走 V1 路径）。注意 `INSERT OVERWRITE` 默认静态覆盖（删全表/全分区），要动态覆盖须配 `write.dynamic-partition-overwrite=true` 或 Spark `partitionOverwriteMode=dynamic`。
 
-**架构演进**:
-- **早期**: 只有 V1 Write，通过 `PaimonSparkWriter` 做数据分桶
-- **中期**: 引入 V2 Write，支持 `RequiresDistributionAndOrdering`
-- **现在**: 完善的两套写入路径，自动选择最优模式
+### ④ 风险 / 陷阱 / 边界
 
-**业界对比**:
-- **Iceberg 的做法**: 与 Paimon 类似，支持 V1 和 V2 两种写入模式
-- **Delta Lake 的做法**: 只支持 V1 写入模式，通过自定义 `OptimisticTransaction` 保证原子性
-- **Paimon 的优势**: V2 Write 的条件判断更精细，自动选择逻辑更智能
+- V2 静默回退 V1：多桶键、非 DEFAULT 桶函数、聚类列、`POSTPONE_MODE` 开了 `postponeBatchWriteFixedBucket`——用户难察觉，性能/行为可能与预期不符。
+- 桶数 / 分区数过多 → 小文件爆炸（小文件治理见 `11`）。
+- 静态覆盖误删：以为只覆盖一个分区，实际删了全表（默认静态）。
 
-### 4.1 写入架构概览 -- V1 Write vs V2 Write
+### ⑤ 收益与代价
 
-Paimon 同时支持两种 Spark 写入模式:
-
-```mermaid
-graph TD
-    A["PaimonSparkTableBase.newWriteBuilder()"]
-    A -->|useV2Write=true| B["PaimonV2WriteBuilder"]
-    A -->|useV2Write=false| C["PaimonWriteBuilder"]
-    B --> D["PaimonV2Write<br/>(RequiresDistributionAndOrdering)"]
-    C --> E["PaimonWrite<br/>(V1Write)"]
-    D --> F["PaimonBatchWrite"]
-    F --> G["PaimonV2DataWriter"]
-    E --> H["WriteIntoPaimonTable<br/>(RunnableCommand)"]
-```
-
-#### V1 Write (旧模式)
-
-**源码位置**: `paimon-spark-common/.../spark/write/PaimonWrite.scala`, `paimon-spark-common/.../spark/commands/WriteIntoPaimonTable.scala`
-
-```scala
-class PaimonWrite extends V1Write {
-    override def toInsertableRelation: InsertableRelation = {
-        (data: DataFrame, overwrite: Boolean) => {
-            WriteIntoPaimonTable(table, saveMode, data, options).run(data.sparkSession)
-        }
-    }
-}
-```
-
-`WriteIntoPaimonTable` 是一个 `RunnableCommand`，在 Driver 端通过 `PaimonSparkWriter` 控制写入流程，在每个分区上使用 Paimon 的 `BatchTableWrite` 写入数据。
-
-**为什么保留 V1 Write？** V1 Write 走的是 Spark 的旧写入路径，不需要 Spark 按特定 distribution 重新分布数据，Paimon 自己在 `PaimonSparkWriter` 中做分桶。这在某些场景下更灵活：
-- 多桶键场景
-- 非 DEFAULT 桶函数
-- 聚类列（clustering columns）场景
-
-#### V2 Write (新模式)
-
-**源码位置**: `PaimonV2Write.scala`, `PaimonBatchWrite.scala`, `PaimonV2DataWriter.scala`
-
-**启用条件** (在 `PaimonSparkTableBase.supportsV2Write` 中判断):
-1. 桶函数类型为 `DEFAULT`
-2. 表类型为 `FileStoreTable`
-3. 桶模式满足以下之一：
-   - `HASH_FIXED`（且 `BucketFunction.supportsTable` 通过）
-   - `BUCKET_UNAWARE`
-   - `POSTPONE_MODE`（且 `postponeBatchWriteFixedBucket` 未启用）
-4. 没有配置聚类列
-
-**V2 Write 的核心优势 -- `RequiresDistributionAndOrdering`**:
-
-```scala
-class PaimonV2Write extends Write with RequiresDistributionAndOrdering {
-    override def requiredDistribution(): Distribution = writeRequirement.distribution
-    override def requiredOrdering(): Array[SortOrder] = writeRequirement.ordering
-}
-```
-
-`PaimonWriteRequirement` 生成分布要求:
-
-```scala
-object PaimonWriteRequirement {
-    def apply(table: FileStoreTable): PaimonWriteRequirement = {
-        // HASH_FIXED: 按分区键 + bucket(桶键) 聚簇
-        // BUCKET_UNAWARE/POSTPONE_MODE: 仅按分区键聚簇
-        val distribution = Distributions.clustered(clusteringExpressions)
-        PaimonWriteRequirement(distribution, EMPTY_ORDERING)
-    }
-}
-```
-
-**为什么这么做？** 通过声明 `RequiresDistributionAndOrdering`，Spark 会在写入前自动进行 shuffle，保证同一个分区+桶的数据发送到同一个 Writer Task。这避免了 V1 模式中 Paimon 自己做数据分桶的开销，同时利用 Spark 的 AQE 优化 shuffle。
-
-### 4.2 V2 Write 的数据流
-
-```mermaid
-sequenceDiagram
-    participant Spark as Spark Engine
-    participant VW as PaimonV2Write
-    participant BW as PaimonBatchWrite
-    participant DW as PaimonV2DataWriter
-    participant TW as TableWriteImpl
-
-    Spark->>VW: toBatch()
-    VW->>BW: PaimonBatchWrite(table, ...)
-    Spark->>BW: createBatchWriterFactory(info)
-    BW-->>Spark: DataWriterFactory (lambda)
-
-    par 每个 Task
-        Spark->>DW: new PaimonV2DataWriter(...)
-        DW->>TW: writeBuilder.newWrite()
-        loop 写入每行
-            Spark->>DW: write(record)
-            DW->>TW: writeAndReturn(rowConverter(record))
-        end
-        Spark->>DW: commit()
-        DW->>TW: prepareCommit()
-        DW-->>Spark: WriteTaskResult(commitMessages)
-    end
-
-    Spark->>BW: commit(messages)
-    BW->>BW: batchTableCommit.commit(commitMessages)
-```
-
-**关键细节**:
-- `SparkInternalRowWrapper` 负责将 Spark 的 `InternalRow` 包装为 Paimon 的行格式，避免数据拷贝
-- `useCommitCoordinator()` 返回 `false`，表示不需要 Spark 的协调器，因为 Paimon 自身保证原子提交
-- `abort()` 时只关闭资源（TODO: 清理未提交文件）
-
-### 4.3 Copy-on-Write 行级操作
-
-对于 DELETE、UPDATE、MERGE INTO 等行级操作，当启用 V2 Write 时:
-
-```scala
-case class SparkTable(override val table: Table)
-    extends PaimonSparkTableBase(table)
-    with SupportsRowLevelOperations {
-
-    override def newRowLevelOperationBuilder(info: RowLevelOperationInfo) = {
-        table match {
-            case t: FileStoreTable if useV2Write =>
-                () => new PaimonSparkCopyOnWriteOperation(t, info)
-        }
-    }
-}
-```
-
-`PaimonSparkCopyOnWriteOperation` 通过 `PaimonCopyOnWriteScan` 读取受影响的文件，然后在 commit 时同时提交新增文件和已删除文件的 `CommitMessage`。
-
-### 4.4 Overwrite 模式
-
-| 模式 | 行为 | 实现方式 |
-|------|------|---------|
-| InsertInto | 追加写入 | 不调用 `withOverwrite` |
-| Overwrite(filter) | 按条件覆盖写入 | 转换 filter 为分区映射，传给 `BatchWriteBuilder.withOverwrite()` |
-| DynamicOverWrite | 动态分区覆盖 | 设置 `CoreOptions.DYNAMIC_PARTITION_OVERWRITE` 为 true |
-| Truncate | 全表覆盖 | `overwritePartitions = Map.empty` |
-
-**V1 模式的动态分区覆盖**: 当 V2 Write 不支持时（表不包含 `OVERWRITE_DYNAMIC` capability），`PaimonAnalysis` 中的 `PaimonDynamicPartitionOverwrite` 匹配器会将 `OverwritePartitionsDynamic` 转换为 `PaimonDynamicPartitionOverwriteCommand`（V1 路径执行）。
+收益：两路互补（V1 全兼容、V2 快且支持行级操作），原子提交不依赖 Spark 协调器、Task 重试幂等安全。代价：两套代码路径维护成本高，回退逻辑隐蔽。
 
 ---
 
-## 5. SQL Extensions
+## 6. SQL Extensions：六个扩展点
 
-### 解决什么问题
+### ① 要解决什么问题
 
-**核心业务问题**: Spark 原生 SQL 不支持 Paimon 特有的功能（CALL 语句、TAG/BRANCH DDL、行级操作的特殊语义、Procedure 调用等）。如果不扩展 Spark 的 SQL 解析和分析能力，用户就无法使用这些功能，或者需要通过复杂的 DataFrame API 来实现。
+Spark 原生 SQL 不认识 `CALL sys.xxx(...)`、`CREATE TAG`、Paimon 的 upsert 语义、`bucket()` 等函数。要在不改 Spark 源码的前提下补上这些能力，只能用 Spark 官方的 `SessionExtensions` 注入扩展。
 
-**没有这个设计的后果**:
-```sql
--- 无法使用 Procedure
-CALL sys.compact(table => 'db.table');  -- 语法错误
+### ② 设计原理与取舍
 
--- 无法使用 TAG 管理
-CREATE TAG tag1 AS OF VERSION 12345;    -- 语法错误
+Spark 把扩展拆成六个注入点，Paimon 全用上，**顺序即语义**——解析 → 分析 → 后置分析 → 优化 → 物理计划 → AQE：
 
--- UPDATE/DELETE/MERGE INTO 语义不正确
-UPDATE table SET col = 1 WHERE id = 1;  -- 可能不支持或语义错误
-```
+| 扩展点 | 注入方法 | Paimon 注入内容 |
+|---|---|---|
+| Parser | `injectParser` | `SparkShim.createSparkParser`（ANTLR 扩展语法）|
+| Resolution | `injectResolutionRule` | `PaimonAnalysis`/`PaimonProcedureResolver`/`PaimonViewResolver`/`PaimonFunctionResolver`/`createCustomResolution`/`PaimonIncompatibleResolutionRules`/`RewriteUpsertTable`（+ Spark4.1 反射规则）|
+| PostHoc | `injectPostHocResolutionRule` | `ReplacePaimonFunctions`/`PaimonPostHocResolutionRules`/`PaimonUpdateTable`/`PaimonDeleteTable`/`PaimonMergeInto` |
+| 函数 | `injectTableFunction`/`injectFunction` | `PaimonTableValuedFunctions`、`BucketExpression` |
+| Optimizer | `injectOptimizerRule` | `ReplacePaimonFunctions`、`OptimizeMetadataOnlyDeleteFromPaimonTable`、`MergePaimonScalarSubqueries` |
+| Planner | `injectPlannerStrategy` | `PaimonStrategy`、`OldCompatibleStrategy` |
+| AQE | `injectQueryStagePrepRule` | `DisableUnnecessaryPaimonBucketedScan` |
 
-**实际场景**:
-- **场景 1**: 定期 Compaction，需要调用 `CALL sys.compact()`
-- **场景 2**: 创建数据快照标签，需要 `CREATE TAG`
-- **场景 3**: 行级更新，需要 `UPDATE` 语句
-- **场景 4**: 复杂的 Upsert 逻辑，需要 `MERGE INTO` 语句
-- **场景 5**: 使用 Paimon 特有函数（如 `bucket()`、`paimon_version()`）
+一句话设计哲学：**先解析语法、再解析语义、行级命令延到 PostHoc 重写成 Paimon 命令、下推优化进 Optimizer、Procedure 进 Planner——每个关注点落到 Spark 提供的恰当阶段，主代码零侵入。**
 
-### 有什么坑
+`CALL` 的四步链路：Parser 出 `PaimonCallStatement` → `PaimonProcedureResolver` 出 `PaimonCallCommand` → `PaimonStrategy` 出 `PaimonCallExec` → `procedure.call(args)` 返回 `InternalRow[]`。
 
-**误区陷阱**:
-- **误区 1**: 认为配置了 `spark.sql.extensions` 就能使用所有 Paimon 功能
-- **真相**: 还需要配置正确的 Catalog（`SparkCatalog` 或 `SparkGenericCatalog`）
+### 6.1 PaimonSparkSessionExtensions 注册全景
 
-**错误配置**:
-```properties
-# 错误: 只配置了 extensions，没有配置 Catalog
-spark.sql.extensions=org.apache.paimon.spark.extensions.PaimonSparkSessionExtensions
-# 后果: CALL 语句可以解析，但找不到 Procedure
-
-# 正确配置
-spark.sql.extensions=org.apache.paimon.spark.extensions.PaimonSparkSessionExtensions
-spark.sql.catalog.paimon=org.apache.paimon.spark.SparkCatalog
-spark.sql.catalog.paimon.warehouse=/path/to/warehouse
-```
-
-**生产环境注意事项**:
-- **Analyzer 规则顺序**: 多个 Analyzer 规则的顺序很重要，`PaimonAnalysis` 必须在 `PaimonProcedureResolver` 之前
-- **Post-Hoc 规则**: `ReplacePaimonFunctions`、`PaimonUpdateTable` 等规则在 Post-Hoc 阶段执行，晚于普通 Analyzer 规则
-- **AQE 规则**: `DisableUnnecessaryPaimonBucketedScan` 在 AQE 阶段执行，只有启用 AQE 才会生效
-
-**性能陷阱**:
-- **OptimizeMetadataOnlyDeleteFromPaimonTable**: 只有 DELETE 条件完全匹配分区时才能优化，否则会回退到全表扫描
-- **MergePaimonScalarSubqueries**: 只合并对同一表的子查询，不同表的子查询不会合并
-
-### 核心概念解释
-
-**Spark SQL 的扩展点**:
-1. **Parser 扩展**: 扩展 SQL 语法（如 `CALL`、`CREATE TAG`）
-2. **Analyzer 扩展**: 扩展逻辑计划分析（如列解析、类型转换）
-3. **Post-Hoc Analyzer 扩展**: 在普通 Analyzer 之后执行（如函数替换、命令重写）
-4. **Optimizer 扩展**: 扩展优化规则（如元数据优化、子查询合并）
-5. **Planner Strategy 扩展**: 扩展物理计划策略（如 Procedure 执行）
-6. **AQE 扩展**: 扩展 Adaptive Query Execution 规则（如禁用不必要的桶扫描）
-
-**ANTLR 语法扩展**:
-```antlr4
-// PaimonSqlExtensions.g4
-statement
-    : CALL multipartIdentifier '(' (callArgument (',' callArgument)*)? ')'  # call
-    | CREATE TAG ...                                                         # createTag
-    | DELETE TAG ...                                                         # deleteTag
-    ;
-```
-通过 `PaimonSqlExtensionsAstBuilder` 将解析树转为逻辑计划。
-
-**Analyzer 规则的执行顺序**:
-```scala
-// 1. Resolution 阶段
-PaimonAnalysis              // 列解析、类型对齐
-PaimonProcedureResolver     // Procedure 解析
-PaimonViewResolver          // View 解析
-PaimonFunctionResolver      // Function 解析
-RewriteUpsertTable          // Upsert 重写
-
-// 2. Post-Hoc Resolution 阶段
-ReplacePaimonFunctions      // 函数替换
-PaimonUpdateTable           // UPDATE 重写
-PaimonDeleteTable           // DELETE 重写
-PaimonMergeInto             // MERGE INTO 重写
-
-// 3. Optimizer 阶段
-OptimizeMetadataOnlyDeleteFromPaimonTable  // 元数据优化
-MergePaimonScalarSubqueries                // 子查询合并
-
-// 4. Planner 阶段
-PaimonStrategy              // 物理计划策略
-
-// 5. AQE 阶段
-DisableUnnecessaryPaimonBucketedScan  // 禁用不必要的桶扫描
-```
-
-**Procedure 的调用流程**:
-```scala
-// 1. Parser 解析 CALL 语句 → PaimonCallStatement
-CALL sys.compact(table => 'db.table')
-
-// 2. PaimonProcedureResolver 解析 Procedure → PaimonCallCommand
-PaimonCallCommand(procedure, args)
-
-// 3. PaimonStrategy 转换为物理计划 → PaimonCallExec
-PaimonCallExec(procedure, args)
-
-// 4. 执行 Procedure
-procedure.call(args) → InternalRow[]
-```
-
-**与其他系统对比**:
-- **Iceberg**: 也使用 SQL Extensions 扩展 Spark，但 Procedure 实现方式不同（Iceberg 用 `StoredProcedure`）
-- **Delta Lake**: 使用 SQL Extensions 扩展 `OPTIMIZE`、`VACUUM` 等命令，但不支持 `CALL` 语句
-- **Hudi**: 不提供 SQL Extensions，依赖 DataFrame API
-
-### 设计理念
-
-**为什么这样设计**:
-1. **非侵入式**: 通过 Spark 的扩展机制，不修改 Spark 源码即可扩展功能
-2. **模块化**: 每个扩展点独立实现，易于维护和测试
-3. **渐进式**: 先解析语法（Parser），再分析语义（Analyzer），最后优化执行（Optimizer/Planner）
-4. **兼容性**: 扩展的语法和语义与 Spark 原生功能兼容，不破坏已有 SQL
-
-**权衡取舍**:
-- **优势**: 灵活性高，可以扩展任意功能
-- **劣势**: 扩展点多，理解成本高，调试困难
-- **取舍**: 通过清晰的分层和命名规范，降低理解成本
-
-**架构演进**:
-- **早期**: 只有 Parser 扩展，支持 `CALL` 语句
-- **中期**: 引入 Analyzer 扩展，支持 UPDATE/DELETE/MERGE INTO
-- **现在**: 完整的扩展体系，支持 Parser/Analyzer/Optimizer/Planner/AQE 所有扩展点
-
-**业界对比**:
-- **Iceberg 的做法**: 与 Paimon 类似，使用 SQL Extensions 扩展 Spark
-- **Delta Lake 的做法**: 使用 SQL Extensions 扩展部分命令，但不支持 Procedure
-- **Paimon 的优势**: 更完整的扩展体系，支持更多的 Paimon 特有功能
-
-### 5.1 PaimonSparkSessionExtensions -- 扩展注册中心
-
-**源码位置**: `paimon-spark-common/.../extensions/PaimonSparkSessionExtensions.scala`
-
-通过 `spark.sql.extensions=org.apache.paimon.spark.extensions.PaimonSparkSessionExtensions` 激活。
-
-注册的扩展点总览:
+**源码**：`extensions/PaimonSparkSessionExtensions.scala:34`（已核对，包名 `org.apache.paimon.spark.extensions`）
 
 ```scala
-class PaimonSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
-    override def apply(extensions: SparkSessionExtensions): Unit = {
-        // 1. Parser 扩展 -- CALL 语句、TAG/BRANCH DDL
-        extensions.injectParser { (_, parser) => SparkShimLoader.shim.createSparkParser(parser) }
-
-        // 2. Analyzer 扩展 -- 列解析、MERGE INTO、UPDATE、DELETE、Procedure、View
-        extensions.injectResolutionRule(spark => new PaimonAnalysis(spark))
-        extensions.injectResolutionRule(spark => PaimonProcedureResolver(spark))
-        extensions.injectResolutionRule(spark => PaimonViewResolver(spark))
-        extensions.injectResolutionRule(spark => PaimonFunctionResolver(spark))
-        extensions.injectResolutionRule(spark => PaimonIncompatibleResolutionRules(spark))
-        extensions.injectResolutionRule(spark => RewriteUpsertTable(spark))
-
-        // 3. Post-Hoc 分析 -- 函数替换、UPDATE/DELETE/MERGE INTO 重写
-        extensions.injectPostHocResolutionRule(spark => ReplacePaimonFunctions(spark))
-        extensions.injectPostHocResolutionRule(_ => PaimonUpdateTable)
-        extensions.injectPostHocResolutionRule(_ => PaimonDeleteTable)
-        extensions.injectPostHocResolutionRule(spark => PaimonMergeInto(spark))
-
-        // 4. Table/Scalar 函数注入
-        PaimonTableValuedFunctions.supportedFnNames.foreach { ... }
-        BucketExpression.supportedFnNames.foreach { ... }
-
-        // 5. 优化器规则
-        extensions.injectOptimizerRule(_ => OptimizeMetadataOnlyDeleteFromPaimonTable)
-        extensions.injectOptimizerRule(_ => MergePaimonScalarSubqueries)
-
-        // 6. 物理计划策略
-        extensions.injectPlannerStrategy(spark => PaimonStrategy(spark))
-        extensions.injectPlannerStrategy(spark => OldCompatibleStrategy(spark))
-
-        // 7. AQE 查询阶段准备
-        extensions.injectQueryStagePrepRule(_ => DisableUnnecessaryPaimonBucketedScan)
-    }
-}
+// PaimonSparkSessionExtensions.scala:36-112（精选，已按真实代码核对）
+extensions.injectParser((_, parser) => SparkShimLoader.shim.createSparkParser(parser))   // :38
+extensions.injectResolutionRule(new PaimonAnalysis(_))                                    // :41
+extensions.injectResolutionRule(PaimonProcedureResolver(_))                               // :42
+extensions.injectResolutionRule(PaimonViewResolver(_))                                    // :43
+extensions.injectResolutionRule(PaimonFunctionResolver(_))                                // :44
+extensions.injectResolutionRule(SparkShimLoader.shim.createCustomResolution(_))           // :45（版本特定规则）
+extensions.injectResolutionRule(PaimonIncompatibleResolutionRules(_))                     // :46
+extensions.injectResolutionRule(RewriteUpsertTable(_))                                    // :47
+extensions.injectPostHocResolutionRule(ReplacePaimonFunctions(_))                         // :49
+extensions.injectPostHocResolutionRule(PaimonPostHocResolutionRules(_))                   // :50
+extensions.injectPostHocResolutionRule(_ => PaimonUpdateTable)                            // :52
+extensions.injectPostHocResolutionRule(_ => PaimonDeleteTable)                            // :53
+extensions.injectPostHocResolutionRule(PaimonMergeInto(_))                               // :54
+// Spark 4.1 反射加载三条规则（:82-87，§2③）
+PaimonTableValuedFunctions / BucketExpression 函数注入                                     // :90-99
+extensions.injectOptimizerRule(ReplacePaimonFunctions(_))                                 // :102
+extensions.injectOptimizerRule(_ => OptimizeMetadataOnlyDeleteFromPaimonTable)            // :103
+extensions.injectOptimizerRule(_ => MergePaimonScalarSubqueries)                          // :104
+extensions.injectPlannerStrategy(PaimonStrategy(_))                                       // :107
+extensions.injectPlannerStrategy(OldCompatibleStrategy(_))                                // :109
+extensions.injectQueryStagePrepRule(_ => DisableUnnecessaryPaimonBucketedScan)            // :112
 ```
 
-### 5.2 Parser 扩展 -- ANTLR 语法
+> **已修正**：旧稿遗漏了 `createCustomResolution`（:45，由 Shim 提供版本特定 Resolution 规则）、`PaimonIncompatibleResolutionRules`、`PaimonPostHocResolutionRules`、以及 Optimizer 阶段也注入了 `ReplacePaimonFunctions`（:102），并把 Spark 4.1 那三条反射规则（§2③）完全漏掉了。
 
-Paimon 使用 ANTLR4 定义扩展语法（`PaimonSqlExtensionsParser`），通过 `PaimonSqlExtensionsAstBuilder` 将解析树转为逻辑计划。
+### 6.2 Parser 扩展（ANTLR）
 
-支持的扩展 SQL 语句:
+Paimon 用 ANTLR4（`PaimonSqlExtensions.g4` → `PaimonSqlExtensionsParser`）定义扩展语法，`PaimonSqlExtensionsAstBuilder` 把解析树转逻辑计划。覆盖：
 
-| SQL 语句 | 逻辑计划 |
-|---------|---------|
+| SQL | 逻辑计划 |
+|---|---|
 | `CALL sys.xxx(...)` | `PaimonCallStatement` |
-| `CREATE TAG ...` | `CreateOrReplaceTagCommand` |
-| `DELETE TAG ...` | `DeleteTagCommand` |
-| `RENAME TAG ...` | `RenameTagCommand` |
-| `SHOW TAGS ...` | `ShowTagsCommand` |
-| `CREATE/ALTER/DROP VIEW ...` | `PaimonViewCommand` 系列 |
-| `CREATE/ALTER/DROP FUNCTION ...` | 函数相关命令 |
+| `CREATE/DELETE/RENAME/SHOW TAG[S]` | `CreateOrReplaceTagCommand`/`DeleteTagCommand`/`RenameTagCommand`/`ShowTagsCommand` |
+| `CREATE/ALTER/DROP VIEW` | `PaimonViewCommand` 系列 |
+| `CREATE/ALTER/DROP FUNCTION` | 函数相关命令 |
 
-**为什么不用 Spark 原生语法？** Spark 不支持 `CALL` 语句和 Paimon 特有的 TAG/BRANCH DDL。通过 Parser 扩展注入，Paimon 在不修改 Spark 源码的情况下支持了这些语法。
+Parser 由 `SparkShim.createSparkParser` 提供（3/4 的 ParserInterface 签名不同，所以收进 Shim）。
 
-### 5.3 关键 Analyzer 规则
+### 6.3 关键 Analyzer / PostHoc 规则
 
-#### PaimonAnalysis
+- **PaimonAnalysis**（Resolution）：写入时的列解析与类型对齐——校验列数/类型，支持 byName/byPosition、嵌套 struct 递归转换；`mergeSchemaEnabled` 时跳过校验留待写入合并。也承载 `PaimonDynamicPartitionOverwrite` 匹配（§5.4）。
+- **RewriteUpsertTable**（Resolution）：目标表有主键时把 `INSERT INTO` 语义改成 upsert。
+- **PaimonUpdateTable / PaimonDeleteTable / PaimonMergeInto**（PostHoc）：把 Spark 标准 `UpdateTable`/`DeleteFromTable`/`MergeIntoTable` 转成 Paimon 命令（`UpdatePaimonTableCommand`/`DeleteFromPaimonTableCommand`/`MergeIntoPaimonTable`）。放 PostHoc 是因为要在 Spark 完成标准分析后再接管。
+- **ReplacePaimonFunctions**：把 Paimon 特有函数表达式替换为可执行实现，Resolution 后置 + Optimizer 两处都注入。
 
-**功能**: 处理写入时的列解析和类型对齐
+> **顺序要点**：行级命令重写放在 PostHoc 而非 Resolution；Spark 4.1 因把重写挪进主 Resolution 批次导致 append-only 表的 UPDATE/MERGE 被提前判定 analyzed、落到物理 planner 被拒，所以才需要 §2③ 的三条反射补丁规则。
 
-- 检查写入查询的列数和类型是否与目标表匹配
-- 支持按名称（byName）和按位置（byPosition）两种列匹配模式
-- 支持嵌套 struct 类型的递归类型转换
-- `mergeSchemaEnabled` 时跳过 schema 验证（后续在写入时合并 schema）
+### 6.4 优化器与 Planner 规则
 
-#### PaimonUpdateTable / PaimonDeleteTable / PaimonMergeInto
+- **OptimizeMetadataOnlyDeleteFromPaimonTable**（Optimizer）：DELETE 条件只涉及分区列且能完全确定分区时，直接经 manifest 元数据删分区，不扫数据文件；条件不满足回退全表扫描。
+- **MergePaimonScalarSubqueries**（Optimizer）：合并对**同一** Paimon 表的多个标量子查询减少重复扫描；不同表不合并。3.4/3.5 各有覆盖版本。
+- **PaimonStrategy**（Planner）：把 Paimon 逻辑节点（`PaimonCallCommand`/`CreateOrReplaceTagCommand`/`PaimonDropPartitions` 等）转物理执行计划（`PaimonCallExec` 等）。
+- **DisableUnnecessaryPaimonBucketedScan**（AQE）：仅启用 AQE 时生效，自动关掉查询不涉及桶键时无谓的桶扫描（§4.6）。
 
-将 Spark 标准的 `UpdateTable`、`DeleteFromTable`、`MergeIntoTable` 转换为 Paimon 特有的命令（`UpdatePaimonTableCommand`、`DeleteFromPaimonTableCommand`、`MergeIntoPaimonTable`）。
+### ④ 风险 / 陷阱 / 边界
 
-#### RewriteUpsertTable
+只配 `spark.sql.extensions` 不配 Catalog → `CALL` 能解析但加载不到 Procedure（§3.2）。AQE 规则只在开 AQE 时生效。`OptimizeMetadataOnlyDeleteFromPaimonTable` 只在条件精确匹配分区时省扫描。
 
-处理 Paimon 的 Upsert 语义：当目标表有主键时，INSERT INTO 行为变为 Upsert（相同主键的行会被更新）。
+### ⑤ 收益与代价
 
-### 5.4 优化器规则
-
-#### OptimizeMetadataOnlyDeleteFromPaimonTable
-
-当 DELETE 条件只涉及分区列且可以完全确定分区时，直接通过 Manifest 元数据删除分区，无需扫描数据文件。
-
-#### MergePaimonScalarSubqueries
-
-合并多个对同一 Paimon 表的标量子查询，减少重复扫描。此规则在不同 Spark 版本中有不同实现（3.4、3.5 各有覆盖版本）。
-
-### 5.5 PaimonStrategy -- 物理计划策略
-
-将 Paimon 特有的逻辑计划节点（`PaimonCallCommand`、`CreateOrReplaceTagCommand`、`PaimonDropPartitions` 等）转换为对应的物理执行计划（`PaimonCallExec`、`CreateOrReplaceTagExec`、`PaimonDropPartitionsExec` 等）。
+收益：零侵入扩展出 Paimon 全套 SQL 能力；各关注点落在恰当阶段、可独立测试。代价：扩展点多、规则顺序敏感、跨版本（尤其 4.1）的规则交互极易踩坑，调试要先定位规则落在哪个阶段/模块。
 
 ---
 
-## 6. Procedures
+## 7. Procedures：37 个运维操作
 
-### 解决什么问题
+### ① 要解决什么问题
 
-**核心业务问题**: Paimon 表需要定期维护操作（Compaction、快照过期、孤立文件清理、分区管理等），这些操作不是标准的 SQL 查询，而是管理命令。如果没有 Procedure 机制，用户需要编写复杂的 Spark 应用程序或使用命令行工具，操作繁琐且容易出错。
+Paimon 表的运维（compaction、快照/标签/分区过期、孤立文件清理、迁移、回滚、重分桶）不是标准查询，而是管理操作。没有 Procedure，用户得写 Spark 程序手工调 `BatchTableWrite`/`BatchTableCommit`，繁琐易错。Procedure 让它们变成一条 `CALL`，且能借 Spark 集群分布式执行重活。
 
-**没有这个设计的后果**:
-```scala
-// 没有 Procedure: 需要编写 Spark 应用程序
-val table = catalog.getTable(Identifier.create("db", "table"))
-val write = table.newBatchWriteBuilder().newWrite()
-// ... 复杂的 Compaction 逻辑
-write.compact(partition, bucket, fullCompact)
-val commitMessages = write.prepareCommit()
-table.newBatchWriteBuilder().newCommit().commit(commitMessages)
+### ② 设计原理与取舍
 
-// 有 Procedure: 一条 SQL 搞定
-CALL sys.compact(table => 'db.table');
-```
+Procedure 模式借鉴 Iceberg：`Procedure` 接口（`parameters()`/`outputType()`/`call(args): InternalRow[]`）→ `BaseProcedure` 抽象基类（持 `SparkSession`/`TableCatalog`，提供 `modifyPaimonTable`/`loadSparkTable` 等）→ 各具体 Procedure。注册在 `SparkProcedures` 的 `ImmutableMap`，由 `SparkBaseCatalog.loadProcedure`（§3.2）按 `sys` 命名空间加载。
 
-**实际场景**:
-- **场景 1**: 每天凌晨做全表 Compaction，减少小文件
-- **场景 2**: 每周清理 30 天前的快照，释放存储空间
-- **场景 3**: 每月清理孤立文件（未被任何快照引用的文件）
-- **场景 4**: 创建数据快照标签，用于审计和回滚
-- **场景 5**: 迁移 Hive 表到 Paimon
+调用支持位置参数和命名参数（推荐命名）：`CALL sys.compact(table=>'db.t', partitions=>'p1=0', compact_strategy=>'full')`。重活（compact/rescale/migrate）内部用 `javaSparkContext.parallelize()` 分发到集群，CommitMessage 收回 Driver 后 `BatchTableCommit.commit()` 原子提交。
 
-### 有什么坑
+一句话设计哲学：**把运维操作 SQL 化 + 分布式化——一条 `CALL` 触发，集群并行执行，Paimon snapshot 原子收尾。**
 
-**误区陷阱**:
-- **误区 1**: 认为 Procedure 是轻量级操作，可以频繁调用
-- **真相**: Compaction、迁移等 Procedure 是重量级操作，会消耗大量计算资源
-
-**错误配置**:
-```sql
--- 错误: 在生产环境做全表 Compaction，没有指定分区
-CALL sys.compact(table => 'huge_table');
--- 后果: 扫描所有分区，可能运行数小时，阻塞其他任务
-
--- 正确: 指定分区或使用 where 条件
-CALL sys.compact(
-    table => 'huge_table',
-    where => 'dt >= "2024-01-01"'
-);
-```
-
-**生产环境注意事项**:
-- **Compaction 的并行度**: 由 Spark 的 `spark.default.parallelism` 控制，设置不当会导致资源浪费或 OOM
-- **快照过期**: `expire_snapshots` 会物理删除文件，操作不可逆，务必确认快照不再需要
-- **孤立文件清理**: `remove_orphan_files` 可能误删正在写入的文件，建议在低峰期执行
-- **迁移操作**: `migrate_table` 会修改表元数据，建议先在测试环境验证
-
-**性能陷阱**:
-- **全表 Compaction**: 如果表很大，全表 Compaction 会非常慢，建议按分区增量 Compaction
-- **Manifest Compaction**: `compact_manifest` 只合并 Manifest 文件，不合并数据文件，开销较小
-- **Rescale**: 重新分桶会重写所有数据，开销极大，只在必要时使用
-
-### 核心概念解释
-
-**Procedure vs Command**:
-- **Procedure**: 通过 `CALL` 语句调用，返回结果集（`InternalRow[]`）
-- **Command**: 通过 DDL/DML 语句调用（如 `CREATE TABLE`、`INSERT INTO`），不返回结果集
-- **区别**: Procedure 更灵活，可以有复杂的参数和返回值
-
-**Procedure 的参数传递**:
-```sql
--- 位置参数
-CALL sys.compact('db.table', 'p1=0,p2=0');
-
--- 命名参数（推荐）
-CALL sys.compact(
-    table => 'db.table',
-    partitions => 'p1=0,p2=0',
-    compact_strategy => 'full'
-);
-```
-
-**Compaction 的三种策略**:
-1. **Full Compaction**: 合并所有文件（包括已排序的文件）
-2. **Minor Compaction**: 只合并小文件，保留大文件
-3. **Auto**: 根据文件大小和数量自动选择策略
-
-**快照管理的三个 Procedure**:
-- `expire_snapshots`: 删除旧快照及其引用的文件
-- `rollback`: 回滚到指定快照（保留快照，但修改当前版本指针）
-- `rollback_to_timestamp`: 回滚到指定时间戳的快照
-
-**标签 vs 分支**:
-- **标签 (Tag)**: 只读的快照引用，用于标记重要版本（如发布版本、审计点）
-- **分支 (Branch)**: 可写的快照引用，用于隔离开发（如特性分支、实验分支）
-
-**与其他系统对比**:
-- **Iceberg**: 使用 `StoredProcedure` 实现类似功能，但参数传递方式不同
-- **Delta Lake**: 使用 `OPTIMIZE`、`VACUUM` 等命令，不支持 `CALL` 语句
-- **Hudi**: 使用 Spark 应用程序或命令行工具，没有 SQL 接口
-
-### 设计理念
-
-**为什么这样设计**:
-1. **SQL 化**: 通过 `CALL` 语句调用，用户无需编写代码，降低使用门槛
-2. **分布式执行**: Procedure 内部使用 Spark 的分布式能力（如 `parallelize`），利用集群资源
-3. **原子提交**: Procedure 的修改通过 Paimon 的 Snapshot 机制原子提交，保证一致性
-4. **可扩展**: 通过 `ProcedureBuilder` 模式，易于添加新的 Procedure
-
-**权衡取舍**:
-- **优势**: 易用性高，用户只需一条 SQL 即可完成复杂操作
-- **劣势**: Procedure 的实现复杂，调试困难
-- **取舍**: 通过清晰的参数定义和错误提示，降低使用难度
-
-**架构演进**:
-- **早期**: 只有少数 Procedure（compact、expire_snapshots）
-- **中期**: 引入标签、分支、全局索引等 Procedure
-- **现在**: 完整的 Procedure 体系，覆盖所有维护操作（37 个 Procedure）
-
-**业界对比**:
-- **Iceberg 的做法**: 与 Paimon 类似，使用 Procedure 实现维护操作
-- **Delta Lake 的做法**: 使用专用命令（`OPTIMIZE`、`VACUUM`），不支持通用 Procedure
-- **Paimon 的优势**: 更完整的 Procedure 体系，支持更多的维护操作
-
-### 6.1 Procedure 体系架构
+### 7.1 Procedure 体系与加载链路
 
 ```mermaid
 classDiagram
@@ -1359,9 +656,9 @@ classDiagram
     BaseProcedure <|-- RollbackProcedure
 ```
 
-### 6.2 完整 Procedure 列表
+### 7.2 完整 Procedure 列表
 
-**源码位置**: `SparkProcedures.java`，共注册 **37 个** Procedure:
+**源码**：`SparkProcedures.java:85-126`（`ImmutableMap` 注册），共 **37 个**（已核对 `grep -c procedureBuilders.put` = 37）：
 
 | 分类 | Procedure 名称 | 功能 |
 |------|---------------|------|
@@ -1403,481 +700,207 @@ classDiagram
 | | `rollback_to_watermark` | 回滚到指定水位线 |
 | | `expire_snapshots` | 过期旧快照 |
 
-### 6.3 CompactProcedure 深度分析
+### 7.3 CompactProcedure：按 BucketMode 分发的分布式压缩
 
-**源码位置**: `CompactProcedure.java`
+**源码**：`procedure/CompactProcedure.java`（调用语法注释在 `:109`，分发逻辑在 `:248-296`，已核对）
 
-**调用语法**:
 ```sql
 CALL sys.compact(
-    table => 'db.table',
-    partitions => 'p1=0,p2=0;p1=0,p2=1',
-    compact_strategy => 'full|minor',
-    order_strategy => 'order|zorder|hilbert',
-    order_by => 'col1,col2',
-    where => 'p1 > 0',
-    options => 'key1=value1,key2=value2',
-    partition_idle_time => '1d'
-)
+    table => 'db.table', partitions => 'p1=0,p2=0;p1=0,p2=1',
+    compact_strategy => 'full|minor', order_strategy => 'order|zorder|hilbert',
+    order_by => 'col1,col2', where => 'p1 > 0',
+    options => 'k1=v1,k2=v2', partition_idle_time => '1d')
 ```
 
-**执行策略根据桶模式分发**:
+按 `OrderType`（无序 NONE / 有序）和 BucketMode 双重分发（`:248-296`，已核对方法名）：
 
-| 桶模式 | 无排序策略 | 有排序策略 |
-|--------|----------|----------|
-| `HASH_FIXED` / `HASH_DYNAMIC` | `compactAwareBucketTable()` | 不支持 |
-| `BUCKET_UNAWARE` | `compactUnAwareBucketTable()` 或 `clusterIncrementalUnAwareBucketTable()` | `sortCompactUnAwareBucketTable()` |
-| `POSTPONE_MODE` | `SparkPostponeCompactProcedure` | 不支持 |
+| BucketMode | 无排序策略（NONE） | 有排序策略（ZORDER/HILBERT/ORDER） |
+|---|---|---|
+| `HASH_FIXED` / `HASH_DYNAMIC` | `compactAwareBucketTable()`（`:262/:306`） | 不支持（排序 compact 仅限 unaware） |
+| `BUCKET_UNAWARE` | `compactUnAwareBucketTable()`（`:277/:386`）或 `clusterIncrementalUnAwareBucketTable()`（`:274/:646`） | `sortCompactUnAwareBucketTable()`（`:293/:610`） |
+| `POSTPONE_MODE` | `SparkPostponeCompactProcedure`（`:281`） | 不支持 |
 
-**compactAwareBucketTable 的 Spark 分布式执行**:
-1. 通过 `SnapshotReader` 获取所有 partition + bucket 对
-2. 序列化为 `List<Pair<byte[], Integer>>`
-3. 用 `javaSparkContext.parallelize()` 分发到集群
-4. 每个 Task 创建 `BatchTableWrite` 执行 `write.compact(partition, bucket, fullCompact)`
-5. 将 `CommitMessage` 序列化收集回 Driver
-6. Driver 端 `BatchTableCommit.commit()` 原子提交
+`order_strategy="none"` 配 `order_by` 列会直接报错（`:167`）。
 
-**为什么在 Spark 端做 Compaction？** 利用 Spark 集群的计算资源做分布式 Compaction，比单机 Compaction 效率高得多。
+`compactAwareBucketTable` 的分布式执行（`:306-339`）：① `SnapshotReader` 取所有 (partition, bucket) 对 → ② 序列化为 `List<Pair<byte[], Integer>>` → ③ `javaSparkContext.parallelize(partitionBuckets, readParallelism)`（`:339`）分发 → ④ 每 Task 起 `BatchTableWrite` 执行 `write.compact(partition, bucket, fullCompact)` → ⑤ CommitMessage 收回 Driver → ⑥ `BatchTableCommit.commit()` 原子提交。
+
+为什么在 Spark 端 compact？借集群算力做分布式压缩，远快于单机；且与表写入共用同一套原子提交。
+
+### ④ 风险 / 陷阱 / 边界
+
+- 不带 `partitions`/`where` 的全表 compact 会扫全部 partition+bucket，可能数小时阻塞集群。
+- `expire_snapshots` 物理删文件、不可逆；`remove_orphan_files` 低峰期执行以免误删在写文件；`rescale` 重写全部数据、开销极大。
+- 排序 compact（§8）仅 `BUCKET_UNAWARE` 支持。
+- 并行度受 `spark.default.parallelism` 等影响，配错会资源浪费或 OOM。
+
+### ⑤ 收益与代价
+
+收益：运维 SQL 化、分布式化、原子提交；新增 Procedure 只需实现 `BaseProcedure` 并在 `SparkProcedures` 注册。代价：重操作消耗大量集群资源，需调度在低峰、按分区增量执行。
 
 ---
 
-## 7. Sort & ZOrder
+---
 
-### 解决什么问题
+## 8. Sort / Z-Order / Hilbert 排序 Compact
 
-**核心业务问题**: 数据的物理布局（文件内的行顺序）直接影响查询性能。如果数据是随机分布的，查询时需要扫描所有文件；如果数据按查询常用的列排序，可以利用文件的 min/max 统计信息跳过大量文件。对于多维查询（涉及多个列的过滤条件），线性排序只能优化第一个列，其他列仍然是随机分布的。
+### ① 要解决什么问题
 
-**没有这个设计的后果**:
-```sql
--- 场景: 大宽表，经常按 user_id 和 event_time 查询
-SELECT * FROM events 
-WHERE user_id = 12345 AND event_time BETWEEN '2024-01-01' AND '2024-01-31';
+文件内的物理行序决定查询能跳过多少文件——靠 manifest 的 min/max（依赖文件索引，见 `13`）。数据随机分布时几乎跳不掉；按查询列排好序，min/max 区间收窄、大量文件被跳过。但线性排序只优化第一列，多维查询（如 `user_id=? AND event_time IN [...]`）其余列仍随机。空间填充曲线（Z-Order/Hilbert）让多列同时保持局部性。
 
--- 没有排序: 扫描所有文件（1000 个文件）
--- 线性排序 (ORDER BY user_id): 只扫描 user_id=12345 的文件（10 个文件），但仍需扫描这 10 个文件的所有行
--- Z-order 排序: 只扫描 user_id=12345 且 event_time 在范围内的文件（2 个文件）
+> 多维曲线的**算法原理**（位交错、Hilbert 递归映射、为什么保局部性）由 `12` 号文档主讲，本节只讲 **Spark 侧的排序器实现与调用入口**。
+
+### ② 设计原理与取舍
+
+三种策略，按查询维度选：
+
+| 策略 | Spark 侧实现 | 适用 | 代价 |
+|---|---|---|---|
+| ORDER（线性） | `OrderSorter` | 单列/前缀查询为主 | 最低 |
+| ZORDER | `ZorderSorter` + `SparkZOrderUDF` | 2~3 列多维查询 | 中（位交错 UDF） |
+| HILBERT | `HilbertSorter` + `SparkHilbertUDF` | 3~4 列多维查询，局部性要求更高 | 高（曲线计算更贵） |
+
+一句话设计哲学：**排序开销大，所以挂到 compaction（而非写入）上做——一次重写既合并小文件又重排物理布局，用 `repartitionByRange + sortWithinPartitions` 把全局有序拆成可并行的分区内有序。**
+
+### 8.1 排序器体系
+
+**源码**：`sort/TableSorter.java:30`（抽象基类）、`:65`（`getSorter` 分发）
+
+```java
+// TableSorter.java:65-72（精选）
+public static TableSorter getSorter(..., OrderType orderType, List<String> columns) {
+    switch (orderType) {
+        case ORDER:   return new OrderSorter(...);    // :68
+        case ZORDER:  return new ZorderSorter(...);   // :70
+        case HILBERT: return new HilbertSorter(...);  // :72
+    } ...
+}
+public abstract Dataset<Row> sort(Dataset<Row> input);  // :63
 ```
 
-**实际场景**:
-- **场景 1**: 用户行为分析表，经常按 user_id 和 event_time 查询
-- **场景 2**: 订单表，经常按 order_id 和 create_time 查询
-- **场景 3**: 日志表，经常按 log_level 和 timestamp 查询
-- **场景 4**: IoT 数据表，经常按 device_id 和 timestamp 查询
+子类：`OrderSorter` / `ZorderSorter` / `HilbertSorter`，均实现 `sort(Dataset<Row>): Dataset<Row>`。
 
-### 有什么坑
+### 8.2 三种排序的 Spark 侧实现
 
-**误区陷阱**:
-- **误区 1**: 认为 Z-order 排序总是比线性排序好
-- **真相**: Z-order 排序只在多维查询场景下有优势，单列查询时线性排序更好
-
-**错误配置**:
-```sql
--- 错误: 对高基数列做 Z-order 排序
-CALL sys.compact(
-    table => 'table',
-    order_strategy => 'zorder',
-    order_by => 'id,name,email,phone'  -- 4 个高基数列
-);
--- 后果: Z-value 计算开销大，排序效果差（高维空间的局部性保持困难）
-
--- 正确: 选择 2-3 个常用的查询列
-CALL sys.compact(
-    table => 'table',
-    order_strategy => 'zorder',
-    order_by => 'user_id,event_time'  -- 2 个常用列
-);
-```
-
-**生产环境注意事项**:
-- **排序列的选择**: 应该选择查询最频繁的列，且列的基数不宜过高（避免过度分散）
-- **排序开销**: Z-order 和 Hilbert 排序的计算开销比线性排序大，适合在 Compaction 时使用，不适合在写入时使用
-- **分区内排序**: 排序是分区内的，不同分区之间不保证顺序
-
-**性能陷阱**:
-- **过多排序列**: Z-order 排序的列数不宜超过 4 个，否则高维空间的局部性保持效果差
-- **数据倾斜**: 如果某个排序列的值分布极不均匀，排序后的文件大小会差异很大
-- **内存开销**: 排序需要在内存中缓存数据，如果数据量大，可能 OOM
-
-### 核心概念解释
-
-**空间填充曲线 (Space-Filling Curve)**:
-- **定义**: 将多维空间映射到一维空间的曲线，保持空间局部性（相邻的多维点在一维空间中也相邻）
-- **Z-order 曲线**: 通过交错多维坐标的二进制位生成一维值
-- **Hilbert 曲线**: 通过递归分割空间生成一维值，局部性保持优于 Z-order
-
-**Z-order 的计算过程**:
-```
-// 示例: 2 维空间，坐标 (x=5, y=3)
-x = 5 = 0b101
-y = 3 = 0b011
-
-// 交错二进制位: y[2] x[2] y[1] x[1] y[0] x[0]
-z = 0b011101 = 29
-
-// 结果: (5, 3) 映射到 z=29
-```
-
-**线性排序 vs Z-order 排序 vs Hilbert 排序**:
-| 排序方式 | 优势 | 劣势 | 适用场景 |
-|---------|------|------|---------|
-| 线性排序 | 简单快速，第一列局部性最好 | 其他列随机分布 | 单列查询为主 |
-| Z-order | 多列局部性较好，计算简单 | 高维空间局部性差 | 2-3 列的多维查询 |
-| Hilbert | 多列局部性最好 | 计算复杂，开销大 | 3-4 列的多维查询 |
-
-**排序在 Compaction 中的应用**:
-```scala
-// 流程
-1. 读取分区的所有数据文件
-2. 按排序策略排序（ORDER/ZORDER/HILBERT）
-3. 写回新文件（覆盖原分区）
-4. 原子提交（删除旧文件，添加新文件）
-```
-
-**与其他系统对比**:
-- **Databricks Delta Lake**: 支持 Z-order 排序（通过 `OPTIMIZE ZORDER BY` 命令）
-- **Iceberg**: 不支持 Z-order 排序，只支持线性排序
-- **Hudi**: 支持 Z-order 排序（通过 `hoodie.layout.optimize.strategy=z-order`）
-
-### 设计理念
-
-**为什么这样设计**:
-1. **多维查询优化**: Z-order 和 Hilbert 排序在多维查询场景下显著提升性能
-2. **灵活性**: 提供三种排序策略，用户根据查询模式选择
-3. **分区内排序**: 排序是分区内的，避免跨分区排序的开销
-4. **Compaction 集成**: 排序与 Compaction 结合，一次操作完成数据合并和排序
-
-**权衡取舍**:
-- **优势**: 多维查询性能显著提升（可减少 90% 以上的文件扫描）
-- **劣势**: 排序开销大，不适合频繁执行
-- **取舍**: 在 Compaction 时排序，而不是在写入时排序，平衡性能和开销
-
-**架构演进**:
-- **早期**: 只支持线性排序
-- **中期**: 引入 Z-order 排序
-- **现在**: 支持三种排序策略（ORDER/ZORDER/HILBERT）
-
-**业界对比**:
-- **Databricks 的做法**: Z-order 排序是 Delta Lake 的核心优化，广泛应用于生产环境
-- **Iceberg 的做法**: 不支持 Z-order 排序，依赖分区裁剪和列裁剪
-- **Paimon 的优势**: 支持三种排序策略，更灵活
-
-### 7.1 排序器体系
-
-```mermaid
-classDiagram
-    class TableSorter {
-        <<abstract>>
-        #table: FileStoreTable
-        #orderColNames: List~String~
-        +sort(input: Dataset~Row~)*: Dataset~Row~
-        +getSorter(table, orderType, columns): TableSorter
-    }
-    class OrderSorter {
-        +sort(input): Dataset~Row~
-    }
-    class ZorderSorter {
-        -Z_COLUMN: String
-        +sort(df): Dataset~Row~
-        -zValue(df): Column
-    }
-    class HilbertSorter {
-        -H_COLUMN: String
-        +sort(df): Dataset~Row~
-        -hilbertValue(df): Column
-    }
-
-    TableSorter <|-- OrderSorter
-    TableSorter <|-- ZorderSorter
-    TableSorter <|-- HilbertSorter
-```
-
-### 7.2 OrderSorter -- 线性排序
-
-**源码位置**: `OrderSorter.java`
+**OrderSorter（线性）**（`sort/OrderSorter.java:38-40`，已核对）：
 
 ```java
 public Dataset<Row> sort(Dataset<Row> input) {
-    Column[] sortColumns = orderColNames.stream().map(input::col).toArray(Column[]::new);
-    return input.repartitionByRange(sortColumns).sortWithinPartitions(sortColumns);
+    Column[] cols = orderColNames.stream().map(input::col).toArray(Column[]::new);
+    return input.repartitionByRange(cols).sortWithinPartitions(cols);
 }
 ```
 
-**步骤**: 按排序列做范围分区 -> 分区内排序。
+为什么 `repartitionByRange + sortWithinPartitions` 而非全局 `sort`？全局排序要单 reducer 无法并行；范围分区让相邻 key 落同分区，分区内排序后，同一输出分区内即全局有序，且可并行。
 
-**为什么用 `repartitionByRange` + `sortWithinPartitions` 而不是全局 `sort`？** 全局排序需要单个 reducer，无法并行化。范围分区保证相邻数据在同一分区内，分区内排序保证局部有序，最终写出的文件在同一分区下是全局有序的。
-
-### 7.3 ZorderSorter -- Z-order 空间填充曲线
-
-**源码位置**: `ZorderSorter.java`, `SparkZOrderUDF.java`
+**ZorderSorter**（`sort/ZorderSorter.java:42-48`，`Z_COLUMN="ZVALUE"` 在 `:34`，已核对）：先算 Z-value 列再按它范围分区+分区内排序，最后 drop 掉临时列：
 
 ```java
-public Dataset<Row> sort(Dataset<Row> df) {
-    Column zColumn = zValue(df);
-    Dataset<Row> zValueDF = df.withColumn(Z_COLUMN, zColumn);
-    return zValueDF.repartitionByRange(zValueDF.col(Z_COLUMN))
+public Dataset<Row> sort(Dataset<Row> df) {           // :42
+    Dataset<Row> zValueDF = df.withColumn(Z_COLUMN, zValue(df));
+    return zValueDF.repartitionByRange(zValueDF.col(Z_COLUMN))   // :46
                    .sortWithinPartitions(zValueDF.col(Z_COLUMN))
-                   .drop(Z_COLUMN);
+                   .drop(Z_COLUMN);                               // :48
 }
 ```
 
-**Z-value 计算过程**:
-1. 对每个排序列，通过 `sortedLexicographically()` 将值转为字节数组（确保字典序等于数值序）
-2. 通过 `interleaveBytes()` 交错多列的字节位生成 Z-value
+Z-value 计算（`zValue`，`:51-67`）：每列经 `sortedLexicographically()` 转为"字典序=数值序"的字节数组 → `SparkZOrderUDF.interleaveBytes()`（`:67`）位交错出 Z-value。**位交错/字典序保序的原理详见 `12`。**
 
-**为什么用 Z-order？** 线性排序只优化第一个排序列的数据局部性。Z-order 在多维度上同时保持数据局部性，使得涉及多列的查询都能受益于文件跳过（通过 min/max 统计信息过滤）。
+**HilbertSorter**（`sort/HilbertSorter.java` + `SparkHilbertUDF.java`）：结构同 Zorder，把 `interleaveBytes` 换成 Hilbert 曲线映射。高维局部性优于 Z-Order，计算更贵。
 
-### 7.4 HilbertSorter -- 希尔伯特曲线
+### 8.3 排序如何挂到 compaction 上
 
-**源码位置**: `HilbertSorter.java`, `SparkHilbertUDF.java`
-
-与 ZorderSorter 结构类似，但使用希尔伯特空间填充曲线代替 Z-order 曲线。
-
-**Hilbert vs Z-order 的区别**: 希尔伯特曲线在高维空间中的局部性保持优于 Z-order 曲线，相邻的曲线点在原始空间中也更倾向于相邻。但计算复杂度略高。
-
-### 7.5 排序在 Compaction 中的应用
-
-在 `CompactProcedure` 的 `sortCompactUnAwareBucketTable()` 中:
+排序只用于 `BUCKET_UNAWARE` 表的 compaction（`CompactProcedure.sortCompactUnAwareBucketTable`，`:610-624`，已核对）：
 
 ```java
+// CompactProcedure.java:624 起（精选）
 TableSorter sorter = TableSorter.getSorter(table, orderType, sortColumns);
-Dataset<Row> datasetForWrite = packedSplits.values().stream()
-    .map(split -> {
-        Dataset<Row> dataset = PaimonUtils.createDataset(spark(), ...);
-        return sorter.sort(dataset);     // 每个分区独立排序
-    })
-    .reduce(Dataset::union)
-    .orElse(null);
+// 按分区分组 packedSplits → 每分区 createDataset → sorter.sort(dataset) → union
+// → 以动态分区覆盖写回（只覆盖涉及分区）
 ```
 
-**流程**:
-1. 按分区分组所有 DataSplit
-2. 每个分区读取数据 -> 排序 -> 写回
-3. 使用动态分区覆盖模式写入（只覆盖涉及到的分区）
+流程：按分区分组所有 DataSplit → 每分区读数据、排序、写回 → 动态分区覆盖提交。所以排序是**分区内**的，跨分区不保证序。
+
+### ④ 风险 / 陷阱 / 边界
+
+- 高基数 / 超过 4 列做 Z-Order：高维局部性退化、UDF 计算昂贵，可能不如线性。
+- 数据倾斜会让排序后文件大小悬殊；排序需在内存缓存数据，量大可能 OOM。
+- 排序 compact 仅 `BUCKET_UNAWARE` 支持（§7.3）；HASH 桶表不支持。
+
+### ⑤ 收益与代价
+
+收益：多维查询可借 min/max + 文件索引跳过大量文件（理想下减少 90%+ 扫描）。代价：排序 compact 是重操作，只宜按需/定期、低峰执行，不适合写入路径。
 
 ---
 
-## 8. 流式读取 (Micro-Batch)
+## 9. 流式读写（Micro-Batch）
 
-### 解决什么问题
+### ① 要解决什么问题
 
-**核心业务问题**: 实时数据处理场景下，需要持续读取 Paimon 表的增量数据（新写入的快照），而不是每次都全量扫描。如果没有流式读取能力，用户只能定期运行批处理任务，延迟高且资源浪费；如果没有限速机制，单次读取过多数据会导致内存溢出或处理延迟。
+实时场景要持续增量读 Paimon 新快照，而非每次全量扫；还要限速防止单批读太多 OOM。Spark Structured Streaming 是 Micro-Batch（秒级、非毫秒级），靠 Offset + checkpoint 做增量与 Exactly-Once。
 
-**没有这个设计的后果**:
-```scala
-// 没有流式读取: 定期批处理
-while (true) {
-    val df = spark.read.format("paimon").load("/path/to/table")
-    df.filter($"timestamp" > lastTimestamp).write.format("sink").save()
-    Thread.sleep(60000)  // 每分钟运行一次
-}
-// 问题: 延迟高（最少 1 分钟），资源浪费（每次全量扫描）
+### ② 设计原理与取舍
 
-// 有流式读取: Structured Streaming
-spark.readStream.format("paimon").load("/path/to/table")
-    .writeStream.format("sink").start()
-// 优势: 低延迟（秒级），增量读取（只读新快照）
-```
+`PaimonMicroBatchStream` 实现 Spark `MicroBatchStream`：`initialOffset()` 定起点 → 循环 `latestOffset()` 发现新快照 → `planInputPartitions(start, end)` 切分 → reader 读取 → `commit(end)`。Offset 用 `PaimonSourceOffset(snapshotId, index, scanSnapshot)` 三元组定位"读到哪个快照的第几个 Split"。限速通过 `PaimonReadLimits` 实现"满足任一即停"。
 
-**实际场景**:
-- **场景 1**: 实时数仓，Flink 写入 Paimon，Spark 流式读取做 ETL
-- **场景 2**: 实时报表，Paimon 作为数据湖，Spark 流式读取做聚合
-- **场景 3**: 数据同步，Paimon 作为中间层，Spark 流式读取同步到下游系统
-- **场景 4**: 增量 ETL，每天凌晨处理前一天的新数据
+一句话设计哲学：**用三元组 Offset 精确记录增量进度、交给 Spark checkpoint 持久化保 Exactly-Once；用多维限速把单批数据量压在内存可控范围。** 注意 Spark Micro-Batch 是秒级延迟、且不支持读 changelog 行级变更流（这是 Flink 的强项，见 §10）。
 
-### 有什么坑
+### 9.1 流式读取架构与 Offset
 
-**误区陷阱**:
-- **误区 1**: 认为 Spark Structured Streaming 是真正的流处理
-- **真相**: Spark Structured Streaming 是 Micro-Batch 模式，有秒级延迟，不是毫秒级
-
-**错误配置**:
-```properties
-# 错误: 设置过大的 maxBytesPerTrigger
-spark.sql.streaming.paimon.read.stream.maxBytesPerTrigger=10g
-# 后果: 单次读取过多数据，可能 OOM 或处理延迟
-
-# 错误: 同时设置多个限速参数，但没有理解组合逻辑
-spark.sql.streaming.paimon.read.stream.maxBytesPerTrigger=1g
-spark.sql.streaming.paimon.read.stream.maxFilesPerTrigger=1000
-spark.sql.streaming.paimon.read.stream.maxRowsPerTrigger=1000000
-# 问题: 三个条件是 OR 关系，满足任一条件就停止，可能不符合预期
-```
-
-**生产环境注意事项**:
-- **Checkpoint 位置**: 必须配置 `checkpointLocation`，否则重启后会重新读取所有数据
-- **初始 Offset**: 默认从最早的快照开始读取，可以通过 `scan.snapshot-id` 或 `scan.timestamp-millis` 指定起始位置
-- **限速策略**: 根据下游处理能力设置合理的限速参数，避免背压或资源浪费
-- **Trigger 模式**: `Trigger.AvailableNow` 适合增量 ETL，`Trigger.ProcessingTime` 适合实时处理
-
-**性能陷阱**:
-- **过小的 Trigger 间隔**: 如果 Trigger 间隔过小（如 1 秒），但每次只有少量数据，会导致大量小批次，开销大
-- **过大的 Trigger 间隔**: 如果 Trigger 间隔过大（如 10 分钟），延迟高，不适合实时场景
-- **没有限速**: 如果不设置限速参数，单次可能读取大量数据，导致 OOM
-
-### 核心概念解释
-
-**Micro-Batch vs 真正的流处理**:
-- **Micro-Batch**: 将流数据切分为小批次，每个批次作为一个 Spark Job 执行（Spark Structured Streaming）
-- **真正的流处理**: 逐条处理数据，无批次概念（Flink）
-- **区别**: Micro-Batch 有秒级延迟，真正的流处理有毫秒级延迟
-
-**Offset 管理**:
-```scala
-case class PaimonSourceOffset(
-    snapshotId: Long,      // 快照 ID
-    index: Long,           // 快照内的 Split 索引
-    scanSnapshot: Boolean  // 是否扫描完整快照
-)
-```
-- `snapshotId`: 当前读取到的快照 ID
-- `index`: 在同一快照内，已读取的 Split 数量
-- `scanSnapshot`: 是否需要扫描完整快照（vs 只读增量变更）
-
-**限速策略的组合逻辑**:
-```scala
-// 满足任一条件就停止当前批次
-if (bytesRead >= maxBytesPerTrigger ||
-    filesRead >= maxFilesPerTrigger ||
-    rowsRead >= maxRowsPerTrigger) {
-    break
-}
-
-// 特殊: minRowsPerTrigger + maxTriggerDelayMs 组合
-if (rowsRead >= minRowsPerTrigger || 
-    elapsedTime >= maxTriggerDelayMs) {
-    break
-}
-```
-
-**Trigger 模式**:
-- **ProcessingTime**: 固定时间间隔触发（如每 10 秒）
-- **AvailableNow**: 处理所有可用数据后停止（适合增量 ETL）
-- **Continuous**: 连续处理模式（Spark 3.x 实验性功能，Paimon 不支持）
-
-**流式写入的输出模式**:
-- **Append**: 追加写入（默认）
-- **Complete**: 全表覆盖写入（适合聚合结果）
-- **Update**: 更新模式（Paimon 不支持）
-
-**与其他系统对比**:
-- **Flink**: 真正的流处理，毫秒级延迟，支持 Changelog 读取
-- **Spark Structured Streaming**: Micro-Batch 模式，秒级延迟，不支持 Changelog 读取
-- **Kafka**: 消息队列，毫秒级延迟，但不支持 SQL 查询
-
-### 设计理念
-
-**为什么这样设计**:
-1. **增量读取**: 通过 Offset 管理，只读取新快照，避免重复读取
-2. **限速机制**: 通过多种限速策略，控制单次读取的数据量，避免 OOM 和背压
-3. **Checkpoint 集成**: 利用 Spark 的 Checkpoint 机制，保证 Exactly-Once 语义
-4. **灵活的 Trigger**: 支持多种 Trigger 模式，适应不同场景
-
-**权衡取舍**:
-- **优势**: 易用性高，与 Spark 生态无缝集成，支持 SQL 查询
-- **劣势**: Micro-Batch 模式有秒级延迟，不适合毫秒级实时场景
-- **取舍**: 牺牲延迟，换取易用性和 SQL 能力
-
-**架构演进**:
-- **早期**: 只支持基本的流式读取，没有限速机制
-- **中期**: 引入限速机制（maxBytesPerTrigger、maxFilesPerTrigger）
-- **现在**: 完整的流式读取体系，支持多种限速策略和 Trigger 模式
-
-**业界对比**:
-- **Iceberg 的做法**: 与 Paimon 类似，支持 Spark Structured Streaming
-- **Delta Lake 的做法**: 与 Paimon 类似，支持 Spark Structured Streaming
-- **Paimon 的优势**: 更灵活的限速策略（支持 minRowsPerTrigger + maxTriggerDelayMs 组合）
-
-### 8.1 流式读取架构
-
-**源码位置**: `paimon-spark-common/.../spark/sources/PaimonMicroBatchStream.scala`, `paimon-spark-common/.../spark/sources/StreamHelper.scala`
-
-```mermaid
-sequenceDiagram
-    participant Spark as Spark Streaming
-    participant Stream as PaimonMicroBatchStream
-    participant SH as StreamHelper
-    participant SS as StreamDataTableScan
-
-    Spark->>Stream: initialOffset()
-    Stream-->>Spark: PaimonSourceOffset(initSnapshotId)
-
-    loop Micro Batch
-        Spark->>Stream: latestOffset(start, limit)
-        Stream->>SH: getLatestOffset(startOffset, ...)
-        SH->>SS: plan() [循环获取新快照]
-        SH-->>Stream: PaimonSourceOffset
-        Stream-->>Spark: offset
-
-        Spark->>Stream: planInputPartitions(start, end)
-        Stream->>SH: getBatch(startOffset, endOffset, ...)
-        SH-->>Stream: IndexedDataSplit[]
-        Stream-->>Spark: Array[InputPartition]
-
-        Spark->>Stream: createReaderFactory()
-        Stream-->>Spark: PaimonPartitionReaderFactory
-
-        Note over Spark: 执行读取...
-
-        Spark->>Stream: commit(end)
-    end
-```
-
-### 8.2 Offset 管理
-
-**PaimonSourceOffset** 包含:
-- `snapshotId`: 快照 ID
-- `index`: 在同一快照内的 Split 索引
-- `scanSnapshot`: 是否需要扫描完整快照（vs 增量变更）
-
-**初始 Offset 计算**:
-```scala
-lazy val initOffset: PaimonSourceOffset = {
-    val initSnapshotId = Math.max(
-        table.snapshotManager().earliestSnapshotId(),
-        streamScanStartingContext.getSnapshotId)
-    PaimonSourceOffset(initSnapshotId, INIT_OFFSET_INDEX, scanSnapshot)
-}
-```
-
-### 8.3 流式读取限速 (Read Limits)
-
-支持多种限速策略（可组合）:
-
-| 配置项 | 功能 |
-|-------|------|
-| `read.stream.maxBytesPerTrigger` | 每批次最大字节数 |
-| `read.stream.maxFilesPerTrigger` | 每批次最大文件数 |
-| `read.stream.maxRowsPerTrigger` | 每批次最大行数 |
-| `read.stream.minRowsPerTrigger` + `read.stream.maxTriggerDelayMs` | 最小行数 + 最大延迟组合 |
-
-**`SupportsTriggerAvailableNow`**: 支持 Trigger.AvailableNow 模式，在 `prepareForTriggerAvailableNow()` 中记录当前最新 offset，后续只消费到这个 offset 就终止。
-
-### 8.4 流式写入 -- PaimonSink
-
-**源码位置**: `paimon-spark-common/.../spark/sources/PaimonSink.scala`
+**源码**：`sources/PaimonMicroBatchStream.scala`、`sources/PaimonSourceOffset.scala:36`、`sources/StreamHelper.scala`
 
 ```scala
-class PaimonSink extends Sink with SchemaHelper {
-    override def addBatch(batchId: Long, data: DataFrame): Unit = {
-        val saveMode = if (outputMode == OutputMode.Complete()) {
-            Overwrite(Some(AlwaysTrue))
-        } else {
-            InsertInto
-        }
-        WriteIntoPaimonTable(originTable, saveMode, newData, options, Some(batchId)).run(...)
-    }
-}
+// PaimonSourceOffset.scala:36（已核对签名）
+case class PaimonSourceOffset(snapshotId: Long, index: Long, scanSnapshot: Boolean)
+//   snapshotId   当前读到的快照
+//   index        该快照内已读的 Split 索引（从 0 起，:32 注释）
+//   scanSnapshot 是否扫完整快照（vs 仅增量变更）
+
+// initialOffset：从 earliestSnapshotId 与 streamScanStartingContext 取 max
+//   PaimonSourceOffset(initSnapshotId, INIT_OFFSET_INDEX, scanSnapshot)  // :53
 ```
 
-支持两种输出模式:
-- **Append**: 追加写入
-- **Complete**: 全表覆盖写入（适合聚合结果的窗口输出）
+`SupportsTriggerAvailableNow` 在 `prepareForTriggerAvailableNow()` 记录当前最新 offset，使 `Trigger.AvailableNow` 消费到此即止（适合增量 ETL）。
+
+### 9.2 限速（Read Limits）
+
+**源码**：`sources/PaimonReadLimits.scala`、`PaimonMicroBatchStream.scala:86`
+
+| 配置（`read.stream.*`） | 含义 |
+|---|---|
+| `maxBytesPerTrigger` / `maxFilesPerTrigger` / `maxRowsPerTrigger` | 每批上限，三者**满足任一即停** |
+| `minRowsPerTrigger` + `maxTriggerDelayMs` | 最小行数 + 最大延迟，必须**成对**出现 |
+
+只配 `minRowsPerTrigger` 或只配 `maxTriggerDelayMs` 会直接报错（`PaimonMicroBatchStream.scala:86`："Can't provide only one of read.stream.minRowsPerTrigger and read.stream.maxTriggerDelayMs."，已核对）。
+
+### 9.3 流式写入 PaimonSink
+
+**源码**：`sources/PaimonSink.scala`
+
+```scala
+// PaimonSink.addBatch（精选）：按 OutputMode 选 saveMode
+val saveMode = if (outputMode == OutputMode.Complete()) Overwrite(Some(AlwaysTrue))
+               else InsertInto
+WriteIntoPaimonTable(originTable, saveMode, newData, options, Some(batchId)).run(...)
+```
+
+`batchId` 作为幂等标识参与提交。支持 `Append`（追加，默认）与 `Complete`（全表覆盖，适合窗口聚合结果）；不支持 `Update`。
+
+### ④ 风险 / 陷阱 / 边界
+
+- 不配 `checkpointLocation` 重启会重读全部数据。
+- 默认从最早快照读，可用 `scan.snapshot-id`/`scan.timestamp-millis` 指定起点。
+- Trigger 间隔过小 → 大量小批次开销；过大 → 延迟高。无限速 → 单批 OOM。
+- Spark 侧不支持 changelog 读、CDC 源、Lookup Join（见 §10）。
+
+### ⑤ 收益与代价
+
+收益：与 Spark 生态无缝、SQL 友好、限速灵活、`Trigger.AvailableNow` 适配增量 ETL。代价：Micro-Batch 秒级延迟，毫秒级实时与 changelog 场景应用 Flink。
 
 ---
 
-## 9. 与 Flink 集成的架构对比
+## 10. 与 Flink 集成的架构对比
 
-### 9.1 Source/Sink 架构差异
+### 10.1 Source/Sink 架构差异
 
 | 维度 | Spark | Flink |
 |------|-------|-------|
@@ -1887,7 +910,7 @@ class PaimonSink extends Sink with SchemaHelper {
 | **流式写入** | `PaimonSink` (Spark Structured Streaming Sink) | 两阶段提交 (`SinkWriter` + `Committer`) |
 | **并行度控制** | 由 Spark 的 `InputPartition` 数量决定 | 由 Flink 的算子并行度决定 |
 
-### 9.2 Checkpoint vs Commit 机制
+### 10.2 Checkpoint vs Commit 机制
 
 | 维度 | Spark | Flink |
 |------|-------|-------|
@@ -1899,7 +922,7 @@ class PaimonSink extends Sink with SchemaHelper {
 
 **为什么 Spark 不像 Flink 那样自动 Compaction？** Spark 是批处理引擎，每个 Job 有明确的开始和结束。Flink 是长期运行的流处理引擎，可以在 Writer 中持续做后台 Compaction。Spark 需要通过独立的 Compaction 任务（`CALL sys.compact()`）来触发。
 
-### 9.3 流式能力差异
+### 10.3 流式能力差异
 
 | 能力 | Spark | Flink |
 |------|-------|-------|
@@ -1923,9 +946,9 @@ class PaimonSink extends Sink with SchemaHelper {
 
 ---
 
-## 10. Scala 测试框架
+## 11. 测试框架（paimon-spark-ut）
 
-### 10.1 测试模块结构
+### 11.1 测试模块结构
 
 **源码位置**: `paimon-spark-ut/` 模块
 
@@ -1940,7 +963,7 @@ paimon-spark-ut/
     └── ...
 ```
 
-### 10.2 测试框架选择
+### 11.2 测试框架选择
 
 Paimon Spark 集成使用 **ScalaTest** 框架（通过 `scalatest-maven-plugin` 运行），而非 JUnit Surefire：
 
@@ -1954,7 +977,7 @@ Paimon Spark 集成使用 **ScalaTest** 框架（通过 `scalatest-maven-plugin`
 - 与 Spark 内部 API 深度集成（如 Catalyst 规则、执行计划）
 - 支持 Scala 特性（模式匹配、case class、隐式转换）
 
-### 10.3 测试执行命令
+### 11.3 测试执行命令
 
 ```bash
 # 运行单个 Scala 测试类
@@ -1965,7 +988,7 @@ mvn -pl paimon-spark/paimon-spark-ut -am -Pfast-build -DfailIfNoTests=false \
 # 注意: 使用 -DwildcardSuites 而非 -Dtest，因为 scalatest-maven-plugin 的参数不同
 ```
 
-### 10.4 常见测试基类
+### 11.4 常见测试基类
 
 | 基类 | 用途 |
 |------|------|
@@ -1978,33 +1001,26 @@ mvn -pl paimon-spark/paimon-spark-ut -am -Pfast-build -DfailIfNoTests=false \
 
 ---
 
-## 11. 设计决策总结
+## 12. 设计决策总结
 
-### 11.1 为什么混合使用 Java 和 Scala？
+| 决策点 | 选择 | 取舍 / 代价 | 收益 |
+|---|---|---|---|
+| 版本适配 | 四层模块 + `SparkShim` trait + SPI（`ServiceLoader`） | 模块层级深、构建 profile 多；Spark 4.1 仍需反射补丁 | 核心逻辑单点维护，版本特定模块极薄，编译期零反射 |
+| Java vs Scala 混用 | Catalog/Procedure/Sorter/工具用 Java；Catalyst 规则/Scan/Write/commands 用 Scala | 双语言心智负担 | Scala 与 Spark 内部 API（模式匹配/case class）天然契合，Java 处类型安全清晰 |
+| Catalog 形态 | `SparkCatalog`（独立）+ `SparkGenericCatalog`（`CatalogExtension`） | 配置组合多、隐式自动填充行为多 | 同时支撑独立/替换/混合三模式，渐进式迁移不破坏 Hive 工作流 |
+| 读下推 | 谓词三拆（partition/data/postScan）+ 聚合/TopN 渐进下推 | 下推逻辑复杂、调试难 | manifest 级精确裁剪 + 聚合 0 文件读取 + postScan 保正确 |
+| 两条写入路径 | `useV2Write` 自动选 V1 / V2 | 两套代码路径、回退隐蔽 | V1 全兼容兜底，V2 借 AQE + 支持行级操作 |
+| 提交协调 | `useCommitCoordinator()=false` | 依赖 Paimon commit 幂等性 | Task 重试安全，省去 Spark 协调器开销 |
+| SQL 扩展 | `SessionExtensions` 六扩展点注入 | 扩展点多、规则顺序敏感、跨版本交互坑多 | 零侵入扩展全套 Paimon SQL 能力，关注点分层可测 |
+| 运维 | 37 个 Procedure，重活 `parallelize` 分布式执行 | 重操作耗集群资源 | 一条 `CALL` 触发集群并行 + 原子收尾 |
+| 数据布局 | Z-Order/Hilbert 排序挂到 compaction（仅 unaware 桶） | 排序重、仅按需执行 | 多维查询大幅减少文件扫描（原理见 `12`） |
+| 流式 | `MicroBatchStream` + 三元组 Offset + checkpoint | 秒级延迟、无 changelog/CDC | 与 Spark 生态无缝、SQL 友好、`AvailableNow` 适配增量 ETL |
 
-- **Java 部分**: Catalog 定义、Procedure 实现、排序器、工具类 -- 这些模块逻辑清晰、类型安全要求高，Java 更合适
-- **Scala 部分**: Catalyst 规则、Table/Scan/Batch/Write 实现、commands -- 需要与 Spark 内部 API 深度交互（Spark 核心用 Scala 编写），使用 Scala 可以利用模式匹配、case class、隐式转换等特性简化代码
+补充说明：
 
-### 11.2 为什么有两种写入路径？
+- **`SparkGenericCatalog` 用 `CatalogExtension` 而非直接替换 SessionCatalog**：保持对 Hive 表/临时表的兼容；"先 Paimon 后回退"保证 Paimon 表优先又不丢已有表；`CREATE_UNDERLYING_SESSION_CATALOG` 选项允许显式创建底层 SessionCatalog 供特殊场景。
+- **Spark 与 Flink 的根本分工**：Spark 是批引擎（Job 有起止，compaction 靠独立 `CALL`），Flink 是常驻流引擎（Writer 内置后台 compaction、支持 CDC/changelog/Lookup Join）。选型按延迟与变更流需求决定。
 
-**V1 Write (旧路径)** 通过 `RunnableCommand` 在 Driver 端完全控制写入流程，Paimon 自己做数据分桶:
-- 兼容所有桶模式
-- 支持聚类列
-- 不依赖 Spark 的 `RequiresDistributionAndOrdering`
+---
 
-**V2 Write (新路径)** 利用 Spark 的 `RequiresDistributionAndOrdering` 声明分布要求:
-- 让 Spark 负责 shuffle，利用 AQE 优化
-- 支持行级操作（Copy-on-Write）
-- 更好的指标集成
-- 但有更多的条件限制
-
-### 11.3 为什么 `useCommitCoordinator()` 返回 false？
-
-Paimon 的 `BatchTableCommit` 本身保证原子提交（通过 snapshot 机制），不需要 Spark 的 commit coordinator 做额外协调。如果某个 Task 失败，Spark 会自动重试该 Task，重复的 CommitMessage 不会导致数据不一致（Paimon 的 commit 是幂等的）。
-
-### 11.4 CatalogExtension 模式的设计考量
-
-`SparkGenericCatalog` 实现 `CatalogExtension` 而非直接替换 SessionCatalog：
-- 保持对 Hive 表、临时表等非 Paimon 表的兼容
-- "先 Paimon 后回退"的策略确保 Paimon 表优先，同时不丢失已有表的可用性
-- `CREATE_UNDERLYING_SESSION_CATALOG` 选项允许显式创建底层 SessionCatalog（用于特殊场景）
+> 交叉引用汇总：LSM/Compaction 基础与 MOW/DV 可见性见 `01`、`04`；多维排序曲线（Z-Order/Hilbert）算法原理见 `12`；文件索引（Bloom/Bitmap/BSI，下推过滤物理依据）见 `13`；小文件治理见 `11`；Tag/Branch 语义见 `17`/`41`；Flink 写入链路见 `15`。

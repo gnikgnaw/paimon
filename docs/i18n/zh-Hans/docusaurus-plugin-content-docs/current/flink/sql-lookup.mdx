@@ -1,0 +1,215 @@
+---
+title: "SQL Lookup"
+sidebar_position: 6
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# Lookup 关联 {#lookup-joins}
+
+[Lookup 关联](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/table/sql/queries/joins/)（Lookup Joins）是流式查询中的一种关联类型。它用于使用从 Paimon 中查询到的数据来丰富一张表。该关联要求其中一张表具有处理时间属性，另一张表则由 Lookup Source 连接器支持。
+
+Paimon 支持在 Flink 中对主键表（primary key table）和 Append 表（追加表）进行 Lookup 关联。下面的示例演示了这一特性。
+
+## 准备 {#prepare}
+
+首先，让我们创建一张 Paimon 表并对其进行实时更新。
+
+```sql
+-- Create a paimon catalog
+CREATE CATALOG my_catalog WITH (
+  'type'='paimon',
+  'warehouse'='hdfs://nn:8020/warehouse/path' -- or 'file://tmp/foo/bar'
+);
+
+USE CATALOG my_catalog;
+
+-- Create a table in paimon catalog
+CREATE TABLE customers (
+    id INT PRIMARY KEY NOT ENFORCED,
+    name STRING,
+    country STRING,
+    zip STRING
+);
+
+-- Launch a streaming job to update customers table
+INSERT INTO customers ...
+
+-- Create a temporary left table, like from kafka
+CREATE TEMPORARY TABLE orders (
+    order_id INT,
+    total INT,
+    customer_id INT,
+    proc_time AS PROCTIME()
+) WITH (
+    'connector' = 'kafka',
+    'topic' = '...',
+    'properties.bootstrap.servers' = '...',
+    'format' = 'csv'
+    ...
+);
+```
+
+## 普通 Lookup {#normal-lookup}
+
+现在你可以在 Lookup 关联查询中使用 `customers` 了。
+
+```sql
+-- enrich each order with customer information
+SELECT o.order_id, o.total, c.country, c.zip
+FROM orders AS o
+JOIN customers
+FOR SYSTEM_TIME AS OF o.proc_time AS c
+ON o.customer_id = c.id;
+```
+
+## 重试 Lookup {#retry-lookup}
+
+如果 `orders`（主表）的记录由于 `customers`（Lookup 表）中对应的数据尚未就绪而关联缺失，
+你可以考虑使用 Flink 的 [Lookup 延迟重试策略](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/table/sql/queries/hints/#3-enable-delayed-retry-strategy-for-lookup)。
+仅适用于 Flink 1.16+。
+
+```sql
+-- enrich each order with customer information
+SELECT /*+ LOOKUP('table'='c', 'retry-predicate'='lookup_miss', 'retry-strategy'='fixed_delay', 'fixed-delay'='1s', 'max-attempts'='600') */
+o.order_id, o.total, c.country, c.zip
+FROM orders AS o
+JOIN customers
+FOR SYSTEM_TIME AS OF o.proc_time AS c
+ON o.customer_id = c.id;
+```
+
+## 异步重试 Lookup {#async-retry-lookup}
+
+同步重试的问题在于，一条记录会阻塞后续记录，从而导致整个作业被阻塞。
+你可以考虑使用 async + allow_unordered 来避免阻塞，关联缺失的记录将不再阻塞
+其他记录。
+
+```sql
+-- enrich each order with customer information
+SELECT /*+ LOOKUP('table'='c', 'retry-predicate'='lookup_miss', 'output-mode'='allow_unordered', 'retry-strategy'='fixed_delay', 'fixed-delay'='1s', 'max-attempts'='600') */
+o.order_id, o.total, c.country, c.zip
+FROM orders AS o
+JOIN customers /*+ OPTIONS('lookup.async'='true', 'lookup.async-thread-number'='16') */
+FOR SYSTEM_TIME AS OF o.proc_time AS c
+ON o.customer_id = c.id;
+```
+
+:::info
+
+如果主表（`orders`）是 CDC 流，`allow_unordered` 将被 Flink SQL 忽略（仅支持 append 流），
+你的流式作业可能会被阻塞。你可以尝试使用 Paimon 的 `audit_log` 系统表特性来规避这一问题
+（将 CDC 流转换为 append 流）。
+
+:::
+
+## 大规模 Lookup（固定分桶） {#large-scale-lookup-fixed-bucket}
+
+默认情况下，每个 Flink 子任务都会存储一份完整的 Lookup 表副本。如果 `customers`
+（Lookup 表）中的数据量对单个子任务来说过大，你可以按如下方式启用 shuffle lookup 优化
+（适用于 Flink 2.0+ 以及固定分桶的 Paimon 表）。该优化能够将同一个桶的数据发送到指定的
+子任务，因此每个 Flink 子任务只需存储全部数据中的一部分。
+
+```sql
+-- enrich each order with customer information
+SELECT /*+ LOOKUP('table'='c', 'shuffle'='true') */
+o.order_id, o.total, c.country, c.zip
+FROM orders AS o
+JOIN customers
+FOR SYSTEM_TIME AS OF o.proc_time AS c
+ON o.customer_id = c.id;
+```
+
+注意，该优化仅在关联键包含全部桶键时才会生效。
+
+## 动态分区 {#dynamic-partition}
+
+在传统数据仓库中，每个分区通常都维护着最新的全量数据，因此这种分区表只
+需关联最新分区即可。Paimon 专门为此场景开发了 `max_pt` 特性。
+
+**创建 Paimon 分区表**
+
+```sql
+CREATE TABLE customers (
+  id INT,
+  name STRING,
+  country STRING,
+  zip STRING,
+  dt STRING,
+  PRIMARY KEY (id, dt) NOT ENFORCED
+) PARTITIONED BY (dt);
+```
+
+**Lookup 关联**
+
+```sql
+SELECT o.order_id, o.total, c.country, c.zip
+FROM orders AS o
+JOIN customers /*+ OPTIONS('scan.partitions'='max_pt()', 'lookup.dynamic-partition.refresh-interval'='1 h') */
+FOR SYSTEM_TIME AS OF o.proc_time AS c
+ON o.customer_id = c.id;
+```
+
+Lookup 节点将自动刷新最新分区，并查询最新分区的数据。
+
+配置项 `scan.partitions` 也可以以 `key1=value1,key2=value2` 的形式指定固定分区。
+多个分区之间应使用分号（`;`）分隔。
+在指定固定分区时，该配置项也可用于批式关联。
+
+配置项 `scan.partitions` 还可以以 `key1=max_pt(),key2=max_pt()` 的形式为父分区指定 max_pt()。
+最新父分区下的所有子分区都将被加载。例如，如果分区键为 `'year', 'day', 'hh'`，
+你可以指定 `year=max_pt()`，它将找到 `year` 的最新分区，并加载其所有子分区用于 Lookup。
+仅支持按层级指定分区。例如，如果设置 `year=max_pt(),hh=max_pt()`，那么 `hh=max_pt()`
+是没有意义的。
+
+## 查询服务 {#query-service}
+
+你可以运行一个 Flink 流式作业来为该表启动查询服务。当 QueryService 存在时，Flink Lookup 关联
+将优先从中获取数据，这能够有效提升查询性能。
+
+<Tabs groupId="query-service">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+```sql
+CALL sys.query_service('database_name.table_name', parallelism);
+```
+
+</TabItem>
+
+<TabItem value="flink-action" label="Flink Action">
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    query_service \
+    --warehouse <warehouse-path> \
+    --database <database-name> \
+    --table <table-name> \
+    [--parallelism <parallelism>] \
+    [--catalog_conf <paimon-catalog-conf> [--catalog_conf <paimon-catalog-conf> ...]]
+```
+
+</TabItem>
+
+</Tabs>

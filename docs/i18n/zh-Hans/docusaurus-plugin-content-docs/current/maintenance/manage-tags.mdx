@@ -1,0 +1,297 @@
+---
+title: "管理标签"
+sidebar_position: 8
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# 管理标签 {#manage-tags}
+
+Paimon 的快照（snapshot）提供了一种查询历史数据的便捷方式。但在大多数场景中，作业会生成过多的快照，并且表会根据表配置使旧快照过期。快照过期同时也会删除旧的数据文件，已过期快照的历史数据将无法再被查询。
+
+为了解决这个问题，你可以基于某个快照创建标签（Tag）。标签会保留该快照的 manifest（清单）文件和数据文件。一种典型用法是每天创建标签，这样你就可以保留每天的历史数据以供批式读取。
+
+## 自动创建 {#automatic-creation}
+
+Paimon 支持在写入作业中自动创建标签。
+
+**第 1 步：选择创建模式**
+
+你可以通过表配置项 `'tag.automatic-creation'` 设置创建模式。支持的取值有：
+- `process-time`：基于机器的时间创建标签（TAG）。
+- `watermark`：基于 Sink 输入的 Watermark 创建标签（TAG）。
+- `batch`：在批处理场景中，当前任务完成后生成一个标签。
+
+:::info
+
+如果你选择 Watermark 模式，可能需要指定 Watermark 的时区；如果 Watermark 不在 UTC 时区，请配置 `'sink.watermark-time-zone'`。
+
+:::
+
+**第 2 步：选择创建周期**
+
+即以什么频率生成标签。你可以为 `'tag.creation-period'` 选择 `'daily'`、`'hourly'` 和 `'two-hours'`。
+
+如果你需要等待迟到数据，可以配置一个延迟时间：`'tag.creation-delay'`。
+
+**第 3 步：自动删除标签**
+
+你可以配置 `'tag.num-retained-max'` 或 `tag.default-time-retained` 来自动删除标签。
+
+例如，配置表在每天 0:10 创建一个标签，最长保留时间为 3 个月：
+
+```sql
+-- Flink SQL
+CREATE TABLE t (
+    k INT PRIMARY KEY NOT ENFORCED,
+    f0 INT,
+    ...
+) WITH (
+    'tag.automatic-creation' = 'process-time',
+    'tag.creation-period' = 'daily',
+    'tag.creation-delay' = '10 m',
+    'tag.num-retained-max' = '90'
+);
+
+INSERT INTO t SELECT ...;
+
+-- Spark SQL
+
+-- Read latest snapshot
+SELECT * FROM t;
+
+-- Read Tag snapshot
+SELECT * FROM t VERSION AS OF '2023-07-26';
+
+-- Read Incremental between Tags
+SELECT * FROM paimon_incremental_query('t', '2023-07-25', '2023-07-26');
+```
+
+更多 Spark 查询方式请参见 [查询表](../spark/sql-query)。
+
+## 创建标签 {#create-tags}
+
+你可以使用指定的名称和快照 ID 创建标签。
+
+<Tabs groupId="create-tag">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+运行以下命令：
+
+```sql
+CALL sys.create_tag(`table` => 'database_name.table_name', tag => 'tag_name', [snapshot_id => <snapshot-id>]);
+```
+
+如果未设置 `snapshot_id`，则 snapshot_id 默认为最新的快照。
+
+</TabItem>
+
+<TabItem value="flink-action" label="Flink Action">
+
+运行以下命令：
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    create_tag \
+    --warehouse <warehouse-path> \
+    --database <database-name> \
+    --table <table-name> \
+    --tag_name <tag-name> \
+    [--snapshot <snapshot_id>] \
+    [--time_retained <time-retained>] \
+    [--catalog_conf <paimon-catalog-conf> [--catalog_conf <paimon-catalog-conf> ...]]
+```
+
+如果未设置 `snapshot`，则 snapshot_id 默认为最新的快照。
+
+</TabItem>
+
+<TabItem value="java-api" label="Java API">
+
+```java
+import org.apache.paimon.table.Table;
+
+public class CreateTag {
+
+    public static void main(String[] args) {
+        Table table = ...;
+        table.createTag("my-tag", 1);
+        table.createTag("my-tag-retained-12-hours", 1, Duration.ofHours(12));
+    }
+}
+```
+
+</TabItem>
+
+<TabItem value="spark" label="Spark">
+
+运行以下 SQL：
+```sql
+CALL sys.create_tag(table => 'test.t', tag => 'test_tag', snapshot => 2);
+```
+
+要创建一个保留 1 天的标签，运行以下 SQL：
+```sql
+CALL sys.create_tag(table => 'test.t', tag => 'test_tag', snapshot => 2, time_retained => '1 d');
+```
+
+要基于最新的快照 ID 创建标签，运行以下 SQL：
+```sql
+CALL sys.create_tag(table => 'test.t', tag => 'test_tag');
+```
+
+</TabItem>
+
+</Tabs>
+
+## 删除标签 {#delete-tags}
+
+你可以通过标签的名称删除标签。
+
+<Tabs groupId="delete-tag">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+运行以下命令：
+
+```sql
+CALL sys.delete_tag(`table` => 'database_name.table_name', tag => 'tag_name');
+```
+
+</TabItem>
+
+<TabItem value="flink-action" label="Flink Action">
+
+运行以下命令：
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    delete_tag \
+    --warehouse <warehouse-path> \
+    --database <database-name> \
+    --table <table-name> \
+    --tag_name <tag-name> \
+    [--catalog_conf <paimon-catalog-conf> [--catalog_conf <paimon-catalog-conf> ...]]
+```
+
+</TabItem>
+
+<TabItem value="java-api" label="Java API">
+
+```java
+import org.apache.paimon.table.Table;
+
+public class DeleteTag {
+
+    public static void main(String[] args) {
+        Table table = ...;
+        table.deleteTag("my-tag");
+    }
+}
+```
+
+</TabItem>
+
+<TabItem value="spark" label="Spark">
+
+运行以下 SQL：
+```sql
+CALL sys.delete_tag(table => 'test.t', tag => 'test_tag');
+```
+
+</TabItem>
+
+</Tabs>
+
+## 回滚到标签 {#rollback-to-tag}
+
+将表回滚到指定的标签。所有快照 ID 大于该标签的快照和标签都将被删除（数据也会被一并删除）。
+
+<Tabs groupId="rollback-to">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+运行以下命令：
+
+```sql
+CALL sys.rollback_to(`table` => 'database_name.table_name', tag => 'tag_name');
+```
+
+</TabItem>
+
+<TabItem value="flink-action" label="Flink Action">
+
+运行以下命令：
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    rollback_to \
+    --warehouse <warehouse-path> \
+    --database <database-name> \
+    --table <table-name> \
+    --version <tag-name> \
+    [--catalog_conf <paimon-catalog-conf> [--catalog_conf <paimon-catalog-conf> ...]]
+```
+
+</TabItem>
+
+<TabItem value="java-api" label="Java API">
+
+```java
+import org.apache.paimon.table.Table;
+
+public class RollbackTo {
+
+    public static void main(String[] args) {
+        // before rollback:
+        // snapshot-3 [expired] -> tag3
+        // snapshot-4 [expired]
+        // snapshot-5 -> tag5
+        // snapshot-6
+        // snapshot-7
+      
+        table.rollbackTo("tag3");
+        
+        // after rollback:
+        // snapshot-3 -> tag3
+    }
+}
+```
+
+</TabItem>
+
+<TabItem value="spark" label="Spark">
+
+运行以下 SQL：
+
+```sql
+CALL sys.rollback(table => 'test.t', version => '2');
+```
+
+</TabItem>
+
+</Tabs>

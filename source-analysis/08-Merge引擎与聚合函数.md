@@ -1,19 +1,27 @@
-# Apache Paimon Merge 引擎与聚合函数体系 -- 源码深度分析
+# Apache Paimon Merge 引擎与聚合函数源码深度分析
 
-> **基于版本**: Apache Paimon 1.5-SNAPSHOT (commit: 55f4fd175)
-> **分析日期**: 2026-04-21
-> **核心源码路径**: `paimon-core/src/main/java/org/apache/paimon/mergetree/compact/`
+> **版本**：1.5-SNAPSHOT　**源码模块**：`paimon-core`（`mergetree.compact` 与 `mergetree.compact.aggregate`；枚举与配置在 `paimon-api` 的 `CoreOptions`）　**核对日期**：2026-06
+
+**一句话定位**：Merge Engine 决定"同一主键的多条版本如何合并成一条结果"——它把 LSM Merge-Tree 这一套通用存储引擎，按配置变身为去重表、宽表拼接表、预聚合表或首行去重表，是 Paimon 主键表语义正确性的核心开关。
+
+读完本文你应能回答：① 四种 merge engine（deduplicate / partial-update / aggregation / first-row）各自的合并语义、适用场景与默认值是什么；② 合并到底发生在**读路径**还是 **compaction**，两者结果会不会不一致；③ partial-update 的 sequence-group 为什么能解决多源乱序，没有它会错在哪；④ aggregation 哪些函数支持 retract、`max`/`min` 为什么不支持、`ignore-retract` 与 `remove-record-on-delete` 如何取舍；⑤ first-row 为什么必须配 lookup、`containsHighLevel` 标记在解决什么；⑥ MergeFunction / Wrapper / FieldAggregator 三层为什么用策略 + 装饰器 + SPI，组合爆炸是怎么被避免的；⑦ 对象复用约束（"第三个 add 覆盖第一个"）在代码里意味着什么、踩坑长什么样。
+
+> 阅读约定：本文每个机制按"① 要解决什么问题 → ② 设计原理与取舍 → ③ 关键源码（精选片段 + `路径:行号`）→ ④ 风险/陷阱/边界 → ⑤ 收益与代价"组织。源码行号以本次核对为准；与旧稿不符处用 `（已修正）` 标注。
+>
+> **交叉引用约定**：LSM/Compaction 基础详见 `01` §3/§8、`23`；DeletionVector 机制详见 `04`、`01` §7.2，本文只讲与 lookup changelog 的协同；**Changelog 产生机制由 `24` 主讲**，本文 §8 只讲 merge engine 视角的四种 producer 语义差异；partial-update 的局部列更新被 `14`（CDC/局部列更新）引用。
 
 ---
 
 ## 目录
 
-- [1. 概述与设计哲学](#1-概述与设计哲学)
-- [2. MergeFunction 接口体系](#2-mergefunction-接口体系)
-  - [2.1 核心接口定义](#21-核心接口定义)
-  - [2.2 MergeFunctionFactory 工厂接口](#22-mergefunctionfactory-工厂接口)
-  - [2.3 MergeFunctionWrapper 包装器接口](#23-mergefunctionwrapper-包装器接口)
-  - [2.4 接口关系全景图](#24-接口关系全景图)
+- [1. 快速理解（核心问题 / 概念速查 / 高频陷阱）](#1-快速理解核心问题--概念速查--高频陷阱)
+  - [1.1 核心问题：一套 LSM 如何承载四种合并语义](#11-核心问题一套-lsm-如何承载四种合并语义)
+  - [1.2 核心概念速查表](#12-核心概念速查表)
+  - [1.3 高频生产陷阱](#13-高频生产陷阱)
+  - [1.4 合并发生在哪里：读路径 vs compaction](#14-合并发生在哪里读路径-vs-compaction)
+- [2. MergeFunction 三层接口体系](#2-mergefunction-三层接口体系)
+  - [2.1 三个接口：MergeFunction / Factory / Wrapper](#21-三个接口mergefunction--factory--wrapper)
+  - [2.2 对象复用约束（最易踩的坑）](#22-对象复用约束最易踩的坑)
 - [3. 四种 MergeEngine 实现](#3-四种-mergeengine-实现)
   - [3.1 Deduplicate 去重引擎](#31-deduplicate-去重引擎)
   - [3.2 PartialUpdate 部分更新引擎](#32-partialupdate-部分更新引擎)
@@ -22,780 +30,161 @@
   - [3.5 四种引擎对比总览](#35-四种引擎对比总览)
 - [4. MergeEngine 的选择与创建流程](#4-mergeengine-的选择与创建流程)
 - [5. LookupMergeFunction 包装机制](#5-lookupmergefunction-包装机制)
-  - [5.1 设计动机](#51-设计动机)
-  - [5.2 核心实现分析](#52-核心实现分析)
-  - [5.3 LookupStrategy 策略](#53-lookupstrategy-策略)
-- [6. 内置聚合函数完整列表](#6-内置聚合函数完整列表)
+- [6. 内置聚合函数体系](#6-内置聚合函数体系)
   - [6.1 FieldAggregator 抽象基类](#61-fieldaggregator-抽象基类)
-  - [6.2 所有内置聚合函数详解](#62-所有内置聚合函数详解)
-  - [6.3 FieldIgnoreRetractAgg 装饰器](#63-fieldignoreretractagg-装饰器)
-- [7. FieldAggregator SPI 注册机制](#7-fieldaggregator-spi-注册机制)
-  - [7.1 Factory 接口设计](#71-factory-接口设计)
-  - [7.2 SPI 服务文件注册](#72-spi-服务文件注册)
-  - [7.3 工厂发现与创建流程](#73-工厂发现与创建流程)
-- [8. PartialUpdate Sequence Group 详解](#8-partialupdate-sequence-group-详解)
-  - [8.1 设计动机与问题背景](#81-设计动机与问题背景)
-  - [8.2 配置方式与解析流程](#82-配置方式与解析流程)
-  - [8.3 更新逻辑深度分析](#83-更新逻辑深度分析)
-  - [8.4 回撤逻辑 retractWithSequenceGroup](#84-回撤逻辑-retractwithsequencegroup)
-  - [8.5 Sequence Group 中的聚合函数](#85-sequence-group-中的聚合函数)
-- [9. Changelog 四种模式](#9-changelog-四种模式)
-  - [9.1 NONE 模式](#91-none-模式)
-  - [9.2 INPUT 模式](#92-input-模式)
-  - [9.3 FULL_COMPACTION 模式](#93-full_compaction-模式)
-  - [9.4 LOOKUP 模式](#94-lookup-模式)
-  - [9.5 四种模式对比](#95-四种模式对比)
-- [10. MergeFunctionWrapper 体系](#10-mergefunctionwrapper-体系)
-  - [10.1 ReducerMergeFunctionWrapper](#101-reducermergefunctionwrapper)
-  - [10.2 FullChangelogMergeFunctionWrapper](#102-fullchangelogmergefunctionwrapper)
-  - [10.3 LookupChangelogMergeFunctionWrapper](#103-lookupchangelogmergefunctionwrapper)
-  - [10.4 FirstRowMergeFunctionWrapper](#104-firstrowmergefunctionwrapper)
-- [11. CompactRewriter 体系](#11-compactrewriter-体系)
-  - [11.1 继承层次](#111-继承层次)
-  - [11.2 ChangelogMergeTreeRewriter](#112-changelogmergetreerewriter)
-  - [11.3 FullChangelogMergeTreeCompactRewriter](#113-fullchangelogmergetreecompactrewriter)
-  - [11.4 LookupMergeTreeCompactRewriter](#114-lookupmergetreecompactrewriter)
-- [12. 跨分区更新](#12-跨分区更新)
-  - [12.1 判定条件](#121-判定条件)
-  - [12.2 GlobalIndexAssigner 机制](#122-globalindexassigner-机制)
-- [13. SortMergeReader 体系](#13-sortmergereader-体系)
-  - [13.1 MinHeap 实现](#131-minheap-实现)
-  - [13.2 LoserTree 实现](#132-losertree-实现)
-  - [13.3 选择策略与性能对比](#133-选择策略与性能对比)
-- [14. 设计决策总结](#14-设计决策总结)
+  - [6.2 内置聚合函数清单与 retract 支持](#62-内置聚合函数清单与-retract-支持)
+  - [6.3 FieldIgnoreRetractAgg 装饰器](#63-fieldignoreretractagg-装饰器让不可逆函数也能容忍回撤)
+  - [6.4 SPI 注册与扩展](#64-spi-注册与扩展)
+- [7. PartialUpdate Sequence Group 详解](#7-partialupdate-sequence-group-详解)
+  - [7.1 问题：全局序列号下的多源乱序覆盖](#71-问题全局序列号下的多源乱序覆盖)
+  - [7.2 配置与解析校验](#72-配置与解析校验)
+  - [7.3 更新逻辑 updateWithSequenceGroup](#73-更新逻辑-updatewithsequencegroup)
+  - [7.4 回撤逻辑 retractWithSequenceGroup 与部分删除](#74-回撤逻辑-retractwithsequencegroup-与部分删除)
+  - [7.5 Sequence Group 中的聚合函数](#75-sequence-group-中的聚合函数)
+- [8. Changelog 四种 producer（merge engine 视角）](#8-changelog-四种-producermerge-engine-视角)
+  - [8.1 NONE / INPUT：不经合并的两端](#81-none--input不经合并的两端)
+  - [8.2 FULL_COMPACTION：合并到最高层时产 changelog](#82-full_compaction合并到最高层时产-changelog)
+  - [8.3 LOOKUP：涉及 L0 的 compaction 即产 changelog](#83-lookup涉及-l0-的-compaction-即产-changelog)
+  - [8.4 四种 producer 对比与 row-deduplicate](#84-四种-producer-对比与-row-deduplicate)
+- [9. MergeFunctionWrapper 与 Changelog 生成](#9-mergefunctionwrapper-与-changelog-生成)
+  - [9.1 ReducerMergeFunctionWrapper](#91-reducermergefunctionwrapper单条记录直返优化)
+  - [9.2 FullChangelogMergeFunctionWrapper](#92-fullchangelogmergefunctionwrapperfull-compaction-产-changelog)
+  - [9.3 LookupChangelogMergeFunctionWrapper](#93-lookupchangelogmergefunctionwrapperlookup-产-changelog)
+  - [9.4 FirstRowMergeFunctionWrapper](#94-firstrowmergefunctionwrapperfirst-row-专用仅产-insert)
+- [10. CompactRewriter 体系](#10-compactrewriter-体系)
+- [11. 跨分区更新](#11-跨分区更新)
+- [12. SortMergeReader 多路归并](#12-sortmergereader-多路归并)
+- [13. 设计决策总结](#13-设计决策总结)
 
 ---
 
-## 1. 概述与设计哲学
+## 1. 快速理解（核心问题 / 概念速查 / 高频陷阱）
 
-### 解决什么问题
+### 1.1 核心问题：一套 LSM 如何承载四种合并语义
 
-**核心业务问题**: 在实时数据湖场景中，同一主键的数据会被多次更新，这些更新分散在 LSM-Tree 的不同层级和文件中。如何将这些分散的版本合并为一条最终结果？不同业务场景对"合并"的语义需求完全不同。
+**① 要解决什么问题**
 
-**没有这个设计的后果**:
-- CDC 数据入湖时，无法去重保留最新值，会产生大量冗余数据
-- 多源宽表拼接时，无法按字段独立更新，后到的数据会覆盖先到的有效字段
-- 实时指标预聚合时，无法在存储层做 SUM/COUNT，必须在查询时聚合，性能极差
-- 日志去重场景无法只保留首次出现的记录，导致下游重复处理
+主键表里同一主键会被反复写。在 LSM Merge-Tree 中（详见 `01` §3），同一主键的多个版本散落在不同 Level、不同文件里。读取或 compaction 时，必须把"同 key 的多条 KeyValue"折叠成一条。但"折叠"的语义随业务千差万别：
 
-**实际场景举例**:
-```sql
--- 场景1: 电商订单表 CDC 入湖 (需要 Deduplicate)
--- 同一订单号的多次状态变更，只保留最新状态
-INSERT: order_id=1001, status='created',  amount=100, update_time='2024-01-01 10:00:00'
-UPDATE: order_id=1001, status='paid',     amount=100, update_time='2024-01-01 10:05:00'
-UPDATE: order_id=1001, status='shipped',  amount=100, update_time='2024-01-01 11:00:00'
--- 最终结果: order_id=1001, status='shipped', amount=100
+| 业务场景 | 想要的语义 | merge engine |
+|---|---|---|
+| CDC 入湖（订单状态流转）| 留最新一条 | `deduplicate`（默认）|
+| 多源宽表拼接（画像：基础源+行为源+风控源各更新几列）| 每列取各自最新非 null 值 | `partial-update` |
+| 实时指标预聚合（PV 累加、UV bitmap 合并）| 每列按聚合函数累计 | `aggregation` |
+| 日志/事件去重（只关心首次出现）| 留第一条，忽略后续 | `first-row` |
 
--- 场景2: 用户画像宽表 (需要 PartialUpdate)
--- 源A更新基础信息，源B更新行为标签，源C更新风控评分
-源A: user_id=1001, name='Alice', age=25,   tags=null,      risk_score=null
-源B: user_id=1001, name=null,    age=null, tags=['vip'],   risk_score=null
-源C: user_id=1001, name=null,    age=null, tags=null,      risk_score=85
--- 最终结果: user_id=1001, name='Alice', age=25, tags=['vip'], risk_score=85
+如果存储层不支持这些语义，业务就得在计算层用 state 维护，或者每查一次全量重算——延迟和成本都不可接受。
 
--- 场景3: 实时 UV/PV 统计 (需要 Aggregation)
--- 每个页面的访问次数和独立访客数预聚合
-page_id='home', pv=100, uv_bitmap=<bitmap1>
-page_id='home', pv=50,  uv_bitmap=<bitmap2>
--- 最终结果: page_id='home', pv=150, uv_bitmap=<bitmap1 OR bitmap2>
+**② 设计原理与取舍：策略 + 装饰 + SPI，避免组合爆炸**
 
--- 场景4: 用户首次访问记录 (需要 FirstRow)
--- 只记录用户第一次访问的时间和来源
-user_id=1001, first_visit='2024-01-01', source='google'
-user_id=1001, first_visit='2024-01-02', source='facebook'  -- 忽略
--- 最终结果: user_id=1001, first_visit='2024-01-01', source='google'
-```
+Paimon 把"合并"抽象成 `MergeFunction` 接口（策略模式），四种引擎是四个实现；把"顺带产生 changelog"抽象成 `MergeFunctionWrapper`（装饰器模式），与引擎正交；把聚合函数做成 `FieldAggregator` + Java SPI（开放扩展）。
 
-### 有什么坑
+一句话设计哲学：**合并语义、changelog 产生、聚合算子是三个正交维度，分别用策略 / 装饰 / SPI 解耦，让 N×M×K 的组合只需 N+M+K 个类。** 4 种引擎 × 4 种 changelog producer 若硬编码需 16 个类，现在 4+4 个类加组合即可。
 
-**误区陷阱**:
-1. **混淆 MergeEngine 和 ChangelogProducer**: MergeEngine 决定如何合并数据，ChangelogProducer 决定如何产生变更日志。两者是正交的，不要认为 `merge-engine=deduplicate` 就自动有准确的 changelog
-2. **PartialUpdate 误用全局序列号**: 多源场景下用全局序列号会导致源间互相覆盖。必须用 Sequence Group 为每个源独立控制
-3. **Aggregation 引擎误用不可回撤函数**: `max`/`min` 等函数不支持精确回撤，在有 DELETE 消息的场景下会产生错误结果
+代价是：① 概念多、学习曲线陡（用户要同时理解 merge-engine、sequence-group、changelog-producer 三套配置才能配对）；② 对象在引擎间高频复用以省 GC，带来"引用安全"这一类隐蔽陷阱（见 §2.2）。
 
-**错误配置示例**:
-```sql
--- 错误1: PartialUpdate 多源场景未配置 Sequence Group
-CREATE TABLE user_profile (
-    user_id BIGINT PRIMARY KEY NOT ENFORCED,
-    version BIGINT,  -- 全局序列号
-    name STRING,     -- 源A负责
-    age INT,         -- 源A负责
-    tags ARRAY<STRING>,  -- 源B负责
-    score DECIMAL    -- 源C负责
-) WITH (
-    'merge-engine' = 'partial-update',
-    'sequence.field' = 'version'  -- 错误! 会导致源间互相覆盖
-);
+**③ 与其他湖格式的定位差异**
 
--- 正确配置:
-CREATE TABLE user_profile (
-    user_id BIGINT PRIMARY KEY NOT ENFORCED,
-    version_a BIGINT,  -- 源A序列号
-    version_b BIGINT,  -- 源B序列号
-    version_c BIGINT,  -- 源C序列号
-    name STRING,
-    age INT,
-    tags ARRAY<STRING>,
-    score DECIMAL
-) WITH (
-    'merge-engine' = 'partial-update',
-    'fields.version_a.sequence-group' = 'name,age',
-    'fields.version_b.sequence-group' = 'tags',
-    'fields.version_c.sequence-group' = 'score'
-);
+Hudi 靠自定义 `Payload`（写 Java）实现非去重语义；Iceberg/Delta 存储层只有去重，partial-update / 预聚合要在计算层做。Paimon 是少数在存储层用配置就能切换四种语义、且支持字段级序列号（sequence-group）的格式——这是它在多源融合、实时数仓预聚合场景的核心竞争力。
 
--- 错误2: Aggregation 引擎对不支持回撤的函数使用 DELETE
-CREATE TABLE metrics (
-    metric_id STRING PRIMARY KEY NOT ENFORCED,
-    max_value DOUBLE,
-    min_value DOUBLE
-) WITH (
-    'merge-engine' = 'aggregation',
-    'fields.max_value.aggregate-function' = 'max',
-    'fields.min_value.aggregate-function' = 'min'
-);
--- 如果上游发送 DELETE 消息，max/min 无法精确回撤，结果会错误
--- 解决方案: 配置 'fields.max_value.ignore-retract' = 'true'
-```
+### 1.2 核心概念速查表
 
-**生产环境注意事项**:
-1. **对象复用陷阱**: MergeFunction 内部大量复用对象，不要在 List 中保存 KeyValue 引用，第三个对象会覆盖第一个
-2. **内存压力**: Lookup 模式需要维护 lookup 索引，大表场景下内存占用可能达到数 GB，需要配置足够的堆内存
-3. **启动延迟**: 跨分区更新场景需要 bootstrap 全局索引，大表首次启动可能需要数十分钟
-4. **Compaction 风暴**: Full Compaction changelog 模式会在全量合并时产生大量 changelog 文件，可能导致存储 I/O 飙升
+| 概念 | 一句话定义 | 关键源码 |
+|---|---|---|
+| **MergeFunction** | 折叠同 key 多版本的接口：`reset` / `add(kv)` / `getResult` / `requireCopy` | `MergeFunction.java:37` |
+| **MergeFunctionFactory** | 创建 MergeFunction 的工厂，`create(readType)` 支持列裁剪、`adjustReadType` 声明需补读的列 | `MergeFunctionFactory.java` |
+| **MergeFunctionWrapper** | 在 MergeFunction 外再套一层，返回类型可换成 `ChangelogResult`，正交叠加 changelog 生成 | `MergeFunctionWrapper.java` |
+| **MergeEngine** | 四种合并语义枚举，`merge-engine` 选择 | `CoreOptions.java:3910`（已修正）|
+| **Deduplicate** | 留 sequence 最大的一条 | `DeduplicateMergeFunction.java:32` |
+| **PartialUpdate** | 每列取最新非 null，配 sequence-group 做字段级序列控制 | `PartialUpdateMergeFunction.java` |
+| **Aggregation** | 每列用一个 `FieldAggregator` 累计 | `AggregateMergeFunction.java:49` |
+| **FirstRow** | 留第一条，默认拒绝 DELETE，`requireCopy=true` | `FirstRowMergeFunction.java:32` |
+| **FieldAggregator** | 单字段聚合算子基类：`agg` / `retract` / `aggReversed` / `reset` | `FieldAggregator.java:26` |
+| **Sequence Group** | 把列分组、每组配独立序列字段，只有该组序列更大才更新该组列 | `PartialUpdateMergeFunction.java:190` |
+| **LookupMergeFunction** | lookup compaction 下的包装：只把 L0 + 最低高层记录喂给真正的 MergeFunction | `LookupMergeFunction.java:130` |
+| **ChangelogProducer** | none / input / full-compaction / lookup 四种 changelog 产生策略 | `CoreOptions.java:4051`（已修正）|
 
-**性能陷阱**:
-```java
-// 陷阱: 在 PartialUpdate 中对每个字段都配置聚合函数
-'fields.field1.aggregate-function' = 'last_non_null_value',
-'fields.field2.aggregate-function' = 'last_non_null_value',
-// ... 100个字段都配置
-// 问题: last_non_null_value 就是 PartialUpdate 的默认行为，
-// 显式配置反而会创建 100 个 FieldAggregator 对象，增加内存和 CPU 开销
+> **路径修正**：`MergeEngine` / `ChangelogProducer` 枚举、`lookupStrategy()` 都在 **`paimon-api` 的 `CoreOptions`**；旧稿标的行号（3807 / 3948 / 3112）已过时，现为 3910 / 4051 / 3193（已修正）。
 
-// 正确做法: 只为需要特殊聚合的字段配置
-'fields.amount.aggregate-function' = 'sum',
-'fields.count.aggregate-function' = 'sum'
-// 其他字段使用默认的 PartialUpdate 行为
-```
+### 1.3 高频生产陷阱
 
-### 核心概念解释
+**陷阱 1：把 merge-engine 当成 changelog 的保证。** `merge-engine` 决定"数据怎么合"，`changelog-producer` 决定"变更日志怎么产"，两者完全正交。配了 `deduplicate` 不等于下游能拿到准确的 UPDATE_BEFORE/AFTER——那要靠 `changelog-producer=lookup`/`full-compaction`。详见 §8 与 `24`。
 
-**MergeFunction (合并函数)**:
-- 定义: 接收同一主键的多条 KeyValue 记录，输出一条合并后的结果
-- 接口: `reset()` 重置状态, `add(KeyValue)` 添加记录, `getResult()` 获取结果
-- 类比: 类似 SQL 的聚合函数，但工作在存储层而非查询层
+**陷阱 2：partial-update 多源用单一全局序列号。** 用一个 `sequence.field` 时，源 B 推一条大序列号会把源 A 后到的小序列号"压制"，导致源 A 的列永远更新不上。必须为每个源配独立 `fields.<seq>.sequence-group`（见 §7.1 的乱序反例）。
 
-**MergeEngine (合并引擎)**:
-- 定义: MergeFunction 的具体实现策略，通过 `merge-engine` 配置项选择
-- 四种实现: Deduplicate(去重), PartialUpdate(部分更新), Aggregation(聚合), FirstRow(首行)
-- 类比: 类似数据库的存储引擎(InnoDB/MyISAM)，但针对的是合并语义而非存储结构
+**陷阱 3：aggregation 对 `max`/`min` 这类不可逆函数依赖 retract。** `sum`/`product`/`collect` 等能精确回撤（减/除/移除元素），但 `max`/`min`/`first_value` 等**无法从聚合结果还原**，`FieldAggregator.retract` 默认抛 `UnsupportedOperationException`（`FieldAggregator.java:47`）。上游有 DELETE/UPDATE_BEFORE 时，要么用 `fields.<f>.ignore-retract=true`（接受不精确），要么用 `aggregation.remove-record-on-delete=true`（整行删）——两者互斥（`FieldAggregatorFactory` 里 `checkState`）。
 
-**Sequence Number (序列号)**:
-- 定义: 标识记录的时间顺序，用于确定哪条记录"更新"
-- 两种来源: 系统自动分配的 `sequenceNumber` 或用户指定的 `sequence.field`
-- 类比: 类似数据库的事务 ID 或 LSN(Log Sequence Number)
+**陷阱 4：first-row 用在需要更新的场景。** first-row 只保留首条、忽略后续，且默认**拒绝 DELETE**（`FirstRowMergeFunction.java:56` 直接抛异常）。用它做维表/可更新表会"改不动"。它适合"只关心第一次出现"的去重，且必须配 lookup 才能正确产 INSERT changelog（见 §3.4）。
 
-**Sequence Group (序列组)**:
-- 定义: 将列分组，每组有独立的序列字段，只有序列号更大时才更新该组的列
-- 配置: `fields.${seq_field}.sequence-group = field1,field2,...`
-- 类比: 类似乐观锁的版本号，但每组列有独立的版本号
+**陷阱 5：partial-update 给每个字段都显式配 `last_non_null_value`。** 这本就是 partial-update 的默认行为，显式配置反而为每列实例化一个 `FieldAggregator`，白增内存/CPU。只给真正需要聚合（sum 等）的字段配。
 
-**Changelog (变更日志)**:
-- 定义: 记录数据变化的日志，包含 INSERT/UPDATE_BEFORE/UPDATE_AFTER/DELETE 四种类型
-- 用途: 下游系统通过 changelog 增量消费数据变化，而非全量扫描
-- 类比: 类似 MySQL 的 binlog 或 Kafka 的消息
+**陷阱 6：聚合函数没放进 sequence group。** 除 `last_non_null_value` 外，partial-update 里任何聚合函数都必须落在某个 sequence-group 内，否则 `getAggFuncName` 的 `checkArgument` 直接报错（`PartialUpdateMergeFunction.java:680`）。原因：聚合在乱序下需要序列号保护才语义正确。
 
-**与其他系统对比**:
-| 特性 | Paimon MergeEngine | Hudi MergeOnRead | Iceberg MergeOnRead | Delta Lake |
-|------|-------------------|------------------|---------------------|------------|
-| **合并策略** | 4种可插拔引擎 | 固定 Deduplicate | 固定 Deduplicate | 固定 Deduplicate |
-| **部分更新** | 原生支持(PartialUpdate) | 需要自定义 Payload | 不支持 | 不支持 |
-| **预聚合** | 原生支持(Aggregation) | 不支持 | 不支持 | 不支持 |
-| **Sequence Group** | 支持 | 不支持 | 不支持 | 不支持 |
-| **Changelog** | 4种模式 | 仅 CDC | 仅 CDC | 仅 CDC |
+**陷阱 7：误以为合并只在 compaction 发生。** 合并同时发生在**读路径**（merge-on-read）和 **compaction**（见 §1.4）。两处用的是同一套 MergeFunction，但 lookup/first-row 的 changelog 只在 compaction 产生；读路径只产生数据结果不产 changelog。
 
-### 设计理念
+### 1.4 合并发生在哪里：读路径 vs compaction
 
-**为什么这样设计**:
-1. **策略模式的选择**: 将合并逻辑抽象为 MergeFunction 接口，而非硬编码在存储引擎中。这使得一套 LSM-Tree 存储引擎可以支持多种业务语义，避免了为每种场景维护独立的存储引擎
-2. **接口泛型设计**: `MergeFunction<T>` 的泛型参数虽然当前都是 KeyValue，但为将来扩展预留了空间(如返回 ChangelogResult)
-3. **对象复用机制**: 在高吞吐量的 Compaction 场景下，每条记录创建新对象会导致严重的 GC 压力。通过对象复用，显著降低 GC 开销
+这是理解全篇的关键。同一套 `MergeFunction` 在两个时机被调用，结果**最终一致**，但触发条件和副产物不同：
 
-**权衡取舍**:
-- **灵活性 vs 复杂度**: 提供 4 种 MergeEngine 和 4 种 Changelog 模式的组合，增加了用户的学习成本，但换来了对不同业务场景的精确支持
-- **性能 vs 内存**: 对象复用提升了性能，但增加了代码复杂度和对象引用安全性的要求
-- **准确性 vs 延迟**: Lookup changelog 模式提供低延迟准确 changelog，但需要维护 lookup 索引；Full Compaction 模式延迟高但成本低
+| 维度 | 读路径（merge-on-read）| compaction |
+|---|---|---|
+| 触发 | 每次查询，对扫到的多个 SortedRun 现场归并 | 后台异步/同步，把多层文件合并写回 |
+| 谁驱动 | `SortMergeReader` + `ReducerMergeFunctionWrapper`（§12、§9）| `MergeTreeCompactRewriter` 系列（§10）|
+| 产出 | 只产合并后的数据行，**不产 changelog** | 可同时产数据文件 + changelog 文件 |
+| 副作用 | 无 | lookup 模式生成 changelog、DV 模式生成 deletion vector、文件 upgrade |
+| 谁能跳过合并 | 单 SortedRun 命中时走 raw read（详见 `01` §5.4）| `ReducerMergeFunctionWrapper` 单条记录直返 |
 
-**架构演进**:
-```
-v0.1: 只支持 Deduplicate (类似 Hudi/Iceberg)
-  ↓
-v0.3: 增加 PartialUpdate (支持多源宽表拼接)
-  ↓
-v0.5: 增加 Aggregation (支持实时预聚合)
-  ↓
-v0.7: 增加 Sequence Group (解决多源乱序问题)
-  ↓
-v1.0: 增加 FirstRow (支持去重保留首条)
-  ↓
-v1.2: 增加 Lookup Changelog (低延迟准确 changelog)
-  ↓
-v1.5: 增加 21 种内置聚合函数 + SPI 扩展机制
-```
-
-**业界对比**:
-- **Hudi**: 通过自定义 Payload 实现合并逻辑，但需要编写 Java 代码，不如配置化灵活
-- **Iceberg**: 只支持 Deduplicate，不支持 PartialUpdate 和 Aggregation
-- **Delta Lake**: 通过 MERGE INTO 语法实现更新，但在存储层仍是 Deduplicate
-- **Paimon**: 通过可插拔的 MergeEngine 在存储层原生支持多种合并语义，是业界最灵活的设计
+要点：**changelog 是 compaction 的副产物**，不是读路径的产物。所以 `changelog-producer=lookup`/`full-compaction` 的延迟，本质受 compaction 频率支配（详见 §8 与 `24`）。first-row / deletion-vector 的"可见性"也因此依赖 compaction——L0 文件在 compaction 前对这两类语义不可见。
 
 ---
 
-Apache Paimon 的 Merge 引擎体系是其主键表(Primary Key Table)的核心，负责定义当多条拥有相同主键的记录在 LSM-Tree 合并时，如何产生最终结果。这一体系直接决定了 Paimon 在实时数据湖场景下的语义正确性和性能表现。
+## 2. MergeFunction 三层接口体系
 
-**为什么需要 Merge 引擎?**
+### 2.1 三个接口：MergeFunction / Factory / Wrapper
 
-Paimon 采用 LSM-Tree 存储结构，写入时数据追加到 Level-0 层的有序文件中，相同主键的不同版本可能分布在不同 Level 的不同文件中。在 Compaction(合并压缩)和 Read(读取)时，需要将同一主键的多条记录合并为一条最终结果。不同的业务场景对"合并"有不同的语义需求:
+**① 要解决什么问题**：让"去重/拼接/聚合/首行"四种算法、"列裁剪"优化、"产 changelog"三件事互不耦合，且新增任一维度不改其余代码。
 
-- **CDC 数据入湖**: 需要去重，保留最新值 --> Deduplicate
-- **多源宽表拼接**: 每个源只更新部分列 --> PartialUpdate
-- **实时指标预聚合**: 对数值型字段做 SUM/COUNT --> Aggregation
-- **去重保留首条**: 只关心第一次出现的值 --> FirstRow
+**② 设计原理**：三个接口各管一件事。
 
-**设计好处**: 通过将合并策略抽象为可插拔的 `MergeFunction` 接口，Paimon 在一套 LSM-Tree 存储引擎之上支持了多种业务语义，避免了为每种场景维护独立的存储引擎。
-
-**核心源码包结构**:
-
-```
-paimon-core/.../mergetree/compact/
-├── MergeFunction.java              // 核心接口
-├── MergeFunctionFactory.java       // 工厂接口
-├── MergeFunctionWrapper.java       // 包装器接口
-├── DeduplicateMergeFunction.java   // 去重合并
-├── PartialUpdateMergeFunction.java // 部分更新合并
-├── FirstRowMergeFunction.java      // 首行合并
-├── LookupMergeFunction.java        // Lookup包装
-├── ReducerMergeFunctionWrapper.java
-├── FullChangelogMergeFunctionWrapper.java
-├── LookupChangelogMergeFunctionWrapper.java
-├── FirstRowMergeFunctionWrapper.java
-├── SortMergeReader.java            // 排序合并读取器接口
-├── SortMergeReaderWithMinHeap.java // 最小堆实现
-├── SortMergeReaderWithLoserTree.java // 败者树实现
-├── ChangelogResult.java
-├── MergeTreeCompactRewriter.java   // 合并压缩重写器
-├── ChangelogMergeTreeRewriter.java // Changelog 压缩重写器
-├── FullChangelogMergeTreeCompactRewriter.java
-├── LookupMergeTreeCompactRewriter.java
-└── aggregate/                      // 聚合函数子包
-    ├── AggregateMergeFunction.java
-    ├── FieldAggregator.java        // 聚合器抽象基类
-    ├── FieldSumAgg.java            // 20+ 聚合实现
-    ├── ...
-    └── factory/                    // SPI 工厂子包
-        ├── FieldAggregatorFactory.java
-        ├── FieldSumAggFactory.java
-        └── ...
-```
-
----
-
-## 2. MergeFunction 接口体系
-
-### 解决什么问题
-
-**核心业务问题**: 如何定义一个通用的接口来描述"合并"操作，使得不同的合并策略(去重/部分更新/聚合/首行)可以统一处理？
-
-**没有这个设计的后果**:
-- 每种合并策略都需要独立的代码路径，导致 Compaction 逻辑分散在多处
-- 无法在运行时动态切换合并策略，必须重新编译代码
-- 新增合并策略需要修改大量现有代码，违反开放-封闭原则
-
-**实际场景**:
-```java
-// 没有统一接口的情况 (反例):
-if (mergeEngine == DEDUPLICATE) {
-    result = deduplicateMerge(kv1, kv2, kv3);
-} else if (mergeEngine == PARTIAL_UPDATE) {
-    result = partialUpdateMerge(kv1, kv2, kv3);
-} else if (mergeEngine == AGGREGATION) {
-    result = aggregationMerge(kv1, kv2, kv3);
-}
-// 每增加一种引擎，所有调用处都要修改
-
-// 有统一接口的情况 (正例):
-MergeFunction<KeyValue> mf = factory.create();
-mf.reset();
-mf.add(kv1);
-mf.add(kv2);
-mf.add(kv3);
-KeyValue result = mf.getResult();
-// 新增引擎只需实现接口，调用处无需修改
-```
-
-### 有什么坑
-
-**误区陷阱**:
-1. **保存 KeyValue 引用到 List**: 由于对象复用机制，第三个 add 的对象会覆盖第一个对象的数据
-2. **忘记调用 reset()**: 处理不同 key 时必须先 reset，否则会混入上一个 key 的数据
-3. **误解 requireCopy() 的含义**: 返回 true 表示需要拷贝输入，而非输出需要拷贝
-
-**错误代码示例**:
-```java
-// 错误1: 保存 KeyValue 引用
-public class WrongMergeFunction implements MergeFunction<KeyValue> {
-    private List<KeyValue> kvList = new ArrayList<>();
-    
-    @Override
-    public void add(KeyValue kv) {
-        kvList.add(kv);  // 错误! 对象会被复用
-    }
-    
-    @Override
-    public KeyValue getResult() {
-        // 此时 kvList 中的所有元素可能都指向同一个对象
-        return kvList.get(kvList.size() - 1);
-    }
-}
-
-// 正确做法: 只保存字段值
-public class CorrectMergeFunction implements MergeFunction<KeyValue> {
-    private GenericRow row = new GenericRow(3);
-    
-    @Override
-    public void add(KeyValue kv) {
-        for (int i = 0; i < 3; i++) {
-            Object field = getter.getFieldOrNull(kv.value());
-            if (field != null) {
-                row.setField(i, field);  // 保存字段值，不保存引用
-            }
-        }
-    }
-}
-
-// 错误2: 忘记 reset
-SortMergeReader reader = ...;
-MergeFunction<KeyValue> mf = factory.create();
-while (reader.hasNext()) {
-    // mf.reset();  // 忘记调用! 会混入上一个 key 的数据
-    for (KeyValue kv : reader.nextKey()) {
-        mf.add(kv);
-    }
-    KeyValue result = mf.getResult();
-}
-```
-
-**生产环境注意事项**:
-1. **对象复用的边界**: 前两个 add 的 KeyValue 是安全的，从第三个开始可能复用第一个的对象
-2. **字段级引用安全**: 可以安全保存字段级引用(如 BinaryString, Decimal)，字段不会复用对象
-3. **性能监控**: 如果 requireCopy() 返回 true，会触发对象拷贝，增加 GC 压力，需要监控 GC 指标
-
-### 核心概念解释
-
-**MergeFunction 接口**:
-- 定义: 描述如何将同一主键的多条记录合并为一条结果的接口
-- 三个核心方法: `reset()` 重置状态, `add(KeyValue)` 添加记录, `getResult()` 获取结果
-- 泛型参数 `<T>`: 当前都是 KeyValue，但为将来扩展预留空间
-
-**MergeFunctionFactory 工厂接口**:
-- 定义: 创建 MergeFunction 实例的工厂，支持列裁剪优化
-- `create(RowType readType)`: 根据实际读取的列类型创建 MergeFunction
-- `adjustReadType(RowType)`: 声明需要额外读取的列(如 Sequence Group 的序列字段)
-
-**MergeFunctionWrapper 包装器接口**:
-- 定义: 在 MergeFunction 外层增加额外逻辑(如 changelog 生成)的装饰器
-- 泛型参数 `<T>`: 可以不同于 MergeFunction 的返回类型(如 ChangelogResult)
-- 装饰器模式: 将数据合并和 changelog 生成正交分离
-
-**对象复用机制**:
-```
-add(kv1)  --> kv1 对象安全
-add(kv2)  --> kv2 对象安全
-add(kv3)  --> kv3 可能复用 kv1 的对象
-add(kv4)  --> kv4 可能复用 kv2 的对象
-add(kv5)  --> kv5 可能复用 kv3 的对象
-...
-```
-
-**与其他系统对比**:
-| 特性 | Paimon MergeFunction | Hudi Payload | Flink ProcessFunction |
-|------|---------------------|--------------|----------------------|
-| **抽象层次** | 存储层 | 存储层 | 计算层 |
-| **对象复用** | 是(性能优化) | 否 | 否 |
-| **泛型设计** | 支持 | 不支持 | 支持 |
-| **工厂模式** | 支持列裁剪 | 不支持 | 不适用 |
-| **包装器** | 装饰器模式 | 不支持 | 不适用 |
-
-### 设计理念
-
-**为什么这样设计**:
-1. **策略模式**: 将合并算法抽象为接口，使得算法可以独立于使用它的客户端变化。新增合并策略只需实现接口，无需修改调用代码
-2. **泛型参数**: `MergeFunction<T>` 的泛型设计为将来扩展预留空间。虽然当前都返回 KeyValue，但 Wrapper 可以返回 ChangelogResult
-3. **工厂模式**: 通过 Factory 创建 MergeFunction，支持列裁剪优化。Factory 可以根据 readType 调整内部结构，避免处理不需要的列
-4. **装饰器模式**: MergeFunctionWrapper 通过装饰器模式在不修改 MergeFunction 的情况下增加 changelog 生成逻辑
-
-**权衡取舍**:
-- **对象复用 vs 代码复杂度**: 对象复用大幅降低 GC 压力，但增加了代码复杂度和对象引用安全性的要求。在高吞吐量场景下，性能收益远大于复杂度成本
-- **泛型灵活性 vs 类型安全**: 泛型参数提供了灵活性，但也降低了类型安全性。通过明确的接口约定和文档注释来弥补
-- **接口简洁性 vs 功能完整性**: 只保留 4 个核心方法，保持接口简洁。额外功能通过 Wrapper 和 Factory 提供
-
-**架构演进**:
-```
-v0.1: 硬编码的 Deduplicate 逻辑
-  ↓
-v0.2: 抽象出 MergeFunction 接口
-  ↓
-v0.3: 增加 MergeFunctionFactory 支持列裁剪
-  ↓
-v0.5: 增加 MergeFunctionWrapper 支持 changelog
-  ↓
-v0.7: 增加泛型参数支持 ChangelogResult
-  ↓
-v1.0: 完善对象复用机制和文档注释
-```
-
-**业界对比**:
-- **Hudi Payload**: 通过 `combineAndGetUpdateValue()` 方法合并，但不支持对象复用，性能较差
-- **Iceberg**: 没有类似的抽象，合并逻辑硬编码在 MergeOnRead 实现中
-- **Delta Lake**: 通过 MERGE INTO 语法在计算层合并，不在存储层抽象
-- **Paimon**: 在存储层抽象 MergeFunction 接口，配合对象复用和装饰器模式，是业界最优雅的设计
-
----
-
-### 2.1 核心接口定义
-
-**源码路径**: `paimon-core/.../mergetree/compact/MergeFunction.java`
+`MergeFunction<T>`（`MergeFunction.java:37`）——核心策略，四个方法：
 
 ```java
 public interface MergeFunction<T> {
-    void reset();           // 重置到初始状态
-    void add(KeyValue kv);  // 添加一条 KeyValue 记录
-    T getResult();          // 获取合并结果
-    boolean requireCopy();  // 是否需要复制输入 KV
+    void reset();           // 换 key 前必须调用，清空上一个 key 的累积状态
+    void add(KeyValue kv);  // 按序喂入同一 key 的各版本
+    T getResult();          // 取合并结果
+    boolean requireCopy();  // 是否需要拷贝输入 kv（见 §2.2）
 }
 ```
 
-**为什么泛型参数是 `<T>` 而不是固定返回 `KeyValue`?**
+泛型 `<T>` 不是花架子：四种 `MergeFunction` 实现都返回 `KeyValue`，但 Wrapper 把 `T` 换成 `ChangelogResult`（数据 + changelog 列表），这正是 changelog 生成与数据合并解耦的支点。
 
-虽然所有当前实现的 `T` 都是 `KeyValue`，但泛型设计为将来可能的扩展预留了空间。更重要的是，这使得 `MergeFunctionWrapper` 可以将返回类型改为 `ChangelogResult`，从而在合并过程中同时产生数据结果和 Changelog 记录。
+`MergeFunctionFactory<T>`（`MergeFunctionFactory.java`）——`create(@Nullable RowType readType)` 让引擎按"实际读的列"重映射字段索引（列裁剪）；`adjustReadType(RowType)` 让引擎声明"我还需要补读哪些列"。**partial-update 必须靠它把 sequence 字段加回读列**——否则裁剪掉序列字段后无法判断新旧。
 
-**关于对象复用的重要约束** (源码注释):
-- 不要保存 `KeyValue` 和 `InternalRow` 的引用到 List 中
-- 前两个 add 的 KeyValue 对象及其内部 InternalRow 是安全的
-- 第三个对象的引用可能覆盖第一个对象
-- 可以安全保存字段级引用，字段不会复用对象
+`MergeFunctionWrapper<T>`（`MergeFunctionWrapper.java`）——同样是 `reset`/`add`/`getResult`，但 `getResult` 可返回 `@Nullable T`（null 表示这条 key 无输出）。四个实现见 §9。
 
-**好处**: 这种对象复用策略大幅减少了 GC 压力，在高吞吐量场景下性能提升显著。
+**③ 收益**：策略 + 工厂 + 装饰三件套让"四引擎 × 四 changelog"组合只需 4+4 个类；列裁剪与语义正确性兼得。**代价**：`reset` 漏调会把上个 key 的状态混进当前 key（有状态聚合器尤甚）；这是接口契约必须遵守的隐性约束。
 
-### 2.2 MergeFunctionFactory 工厂接口
+### 2.2 对象复用约束（最易踩的坑）
 
-**源码路径**: `paimon-core/.../mergetree/compact/MergeFunctionFactory.java`
+**① 问题**：compaction 每秒处理百万级记录，若每条 `add` 都 new 对象，GC 直接拖垮吞吐。Paimon 选择在迭代器层复用 `KeyValue` 与其内部 `InternalRow`。
 
-```java
-@FunctionalInterface
-public interface MergeFunctionFactory<T> extends Serializable {
-    default MergeFunction<T> create() { return create(null); }
-    MergeFunction<T> create(@Nullable RowType readType);
-    default RowType adjustReadType(RowType readType) { return readType; }
-}
-```
+**② 契约**（`MergeFunction.java:26-33` 的 JavaDoc 原文）：
 
-**为什么 Factory 需要 `readType` 参数?**
+- **不要把 `KeyValue` / `InternalRow` 引用存进 List**：前两个 add 进来的对象是安全的，但第三个对象的引用可能覆盖第一个。
+- **可以安全保存字段级引用**（`BinaryString`、`Decimal` 等）：字段不复用对象。
 
-当进行列裁剪(Column Pruning)时，读取的列可能只是表全部列的子集。`create(readType)` 允许 MergeFunction 根据实际读取的列类型来调整内部结构，例如重新映射字段索引。`adjustReadType()` 则允许 MergeFunction 声明它需要额外的列(如 PartialUpdate 需要 Sequence Group 中的序列字段)。
+所以四种引擎的写法都是"把需要的字段值拷进自己的 `GenericRow`"，而非攒 KeyValue 列表。`first-row` 是例外：它要长期持有"第一条"的整行引用，无法只存字段，于是 `requireCopy()` 返回 `true`（`FirstRowMergeFunction.java:76`），由上游对输入做拷贝；其余三种返回 `false`。
 
-**好处**: 支持列裁剪优化的同时保证语义正确性，避免因缺少必要字段导致合并结果错误。
+**③ 风险/陷阱**：自定义或阅读源码时，看到 `kvList.add(kv)` 这类写法基本是 bug——第三条起会读到错乱数据。判断一个引擎是否需要 `requireCopy=true`，标准就是"它是否需要跨多次 add 持有某条 KeyValue 的整体引用"。
 
-### 2.3 MergeFunctionWrapper 包装器接口
-
-**源码路径**: `paimon-core/.../mergetree/compact/MergeFunctionWrapper.java`
-
-```java
-public interface MergeFunctionWrapper<T> {
-    void reset();
-    void add(KeyValue kv);
-    @Nullable T getResult();
-}
-```
-
-**为什么需要 Wrapper 而不是直接使用 MergeFunction?**
-
-Wrapper 的泛型 `<T>` 可以不同于 MergeFunction 的返回类型。关键场景:
-- `ReducerMergeFunctionWrapper` 返回 `KeyValue`，包装后只有一条记录时跳过合并
-- `FullChangelogMergeFunctionWrapper` 返回 `ChangelogResult`，包含数据结果 + changelog 记录
-- `LookupChangelogMergeFunctionWrapper` 返回 `ChangelogResult`，通过 lookup 生成 changelog
-
-**好处**: 通过装饰器模式，将数据合并和 changelog 生成正交分离，任何 MergeFunction 都可以组合任何 Wrapper 来获得不同的 changelog 行为。
-
-### 2.4 接口关系全景图
-
-```mermaid
-classDiagram
-    class MergeFunction~T~ {
-        <<interface>>
-        +reset()
-        +add(KeyValue kv)
-        +getResult() T
-        +requireCopy() boolean
-    }
-
-    class MergeFunctionFactory~T~ {
-        <<interface>>
-        +create() MergeFunction~T~
-        +create(RowType readType) MergeFunction~T~
-        +adjustReadType(RowType) RowType
-    }
-
-    class MergeFunctionWrapper~T~ {
-        <<interface>>
-        +reset()
-        +add(KeyValue kv)
-        +getResult() T
-    }
-
-    MergeFunction <|.. DeduplicateMergeFunction
-    MergeFunction <|.. PartialUpdateMergeFunction
-    MergeFunction <|.. AggregateMergeFunction
-    MergeFunction <|.. FirstRowMergeFunction
-    MergeFunction <|.. LookupMergeFunction
-
-    MergeFunctionWrapper <|.. ReducerMergeFunctionWrapper
-    MergeFunctionWrapper <|.. FullChangelogMergeFunctionWrapper
-    MergeFunctionWrapper <|.. LookupChangelogMergeFunctionWrapper
-    MergeFunctionWrapper <|.. FirstRowMergeFunctionWrapper
-
-    MergeFunctionFactory --> MergeFunction : creates
-
-    ReducerMergeFunctionWrapper --> MergeFunction : wraps
-    FullChangelogMergeFunctionWrapper --> MergeFunction : wraps
-    LookupChangelogMergeFunctionWrapper --> LookupMergeFunction : wraps
-    FirstRowMergeFunctionWrapper --> FirstRowMergeFunction : wraps
-    LookupMergeFunction --> MergeFunction : delegates
-```
+**④ 收益与代价**：显著降低 GC、提升 compaction 吞吐；代价是把"引用生命周期"变成隐性契约，阅读/扩展代码时必须时刻警惕。
 
 ---
 
 ## 3. 四种 MergeEngine 实现
 
-### 解决什么问题
-
-**核心业务问题**: 不同业务场景对"合并"的语义需求完全不同，如何用统一的接口支持多种合并策略？
-
-**没有这个设计的后果**:
-- CDC 数据入湖只能保留所有版本，无法去重，存储成本爆炸
-- 多源宽表拼接时后到的数据会覆盖先到的有效字段，导致数据丢失
-- 实时指标必须在查询时聚合，无法在存储层预聚合，查询性能极差
-- 日志去重无法只保留首次出现的记录，导致下游重复处理
-
-**实际场景对比**:
-```sql
--- 场景1: 订单表 CDC (Deduplicate)
--- 需求: 只保留订单的最新状态
-CREATE TABLE orders (
-    order_id BIGINT PRIMARY KEY NOT ENFORCED,
-    status STRING,
-    amount DECIMAL(10,2),
-    update_time TIMESTAMP
-) WITH (
-    'merge-engine' = 'deduplicate'
-);
-
--- 场景2: 用户画像宽表 (PartialUpdate)
--- 需求: 多个源独立更新不同列，互不覆盖
-CREATE TABLE user_profile (
-    user_id BIGINT PRIMARY KEY NOT ENFORCED,
-    version_basic BIGINT,
-    name STRING,        -- 基础信息源
-    age INT,
-    version_behavior BIGINT,
-    tags ARRAY<STRING>, -- 行为标签源
-    version_risk BIGINT,
-    risk_score INT      -- 风控评分源
-) WITH (
-    'merge-engine' = 'partial-update',
-    'fields.version_basic.sequence-group' = 'name,age',
-    'fields.version_behavior.sequence-group' = 'tags',
-    'fields.version_risk.sequence-group' = 'risk_score'
-);
-
--- 场景3: 实时 UV/PV 统计 (Aggregation)
--- 需求: 在存储层预聚合，查询时直接返回结果
-CREATE TABLE page_metrics (
-    page_id STRING PRIMARY KEY NOT ENFORCED,
-    pv BIGINT,
-    uv_bitmap VARBINARY
-) WITH (
-    'merge-engine' = 'aggregation',
-    'fields.pv.aggregate-function' = 'sum',
-    'fields.uv_bitmap.aggregate-function' = 'rbm64'
-);
-
--- 场景4: 用户首次访问记录 (FirstRow)
--- 需求: 只记录用户第一次访问，忽略后续访问
-CREATE TABLE user_first_visit (
-    user_id BIGINT PRIMARY KEY NOT ENFORCED,
-    first_visit_time TIMESTAMP,
-    first_source STRING
-) WITH (
-    'merge-engine' = 'first-row'
-);
-```
-
-### 有什么坑
-
-**误区陷阱**:
-1. **Deduplicate 误用 ignore-delete**: 设置 `ignore-delete=true` 后 DELETE 消息会被忽略，导致下游无法感知删除
-2. **PartialUpdate 未配置 Sequence Group**: 多源场景下用全局序列号会导致源间互相覆盖
-3. **Aggregation 对不可回撤函数使用 DELETE**: `max`/`min` 等函数不支持精确回撤，会产生错误结果
-4. **FirstRow 误用于更新场景**: FirstRow 只保留第一条记录，后续更新会被忽略，不适合需要更新的场景
-
-**错误配置示例**:
-```sql
--- 错误1: Deduplicate + ignore-delete 导致删除丢失
-CREATE TABLE orders (
-    order_id BIGINT PRIMARY KEY NOT ENFORCED,
-    status STRING
-) WITH (
-    'merge-engine' = 'deduplicate',
-    'deduplicate.ignore-delete' = 'true'  -- 错误! 下游无法感知订单删除
-);
-
--- 错误2: PartialUpdate 多源未配置 Sequence Group
-CREATE TABLE user_profile (
-    user_id BIGINT PRIMARY KEY NOT ENFORCED,
-    version BIGINT,  -- 全局序列号
-    name STRING,     -- 源A
-    tags ARRAY<STRING>  -- 源B
-) WITH (
-    'merge-engine' = 'partial-update',
-    'sequence.field' = 'version'  -- 错误! 源A和源B会互相覆盖
-);
--- 正确做法: 为每个源配置独立的 Sequence Group
-
--- 错误3: Aggregation + max/min + DELETE
-CREATE TABLE metrics (
-    metric_id STRING PRIMARY KEY NOT ENFORCED,
-    max_value DOUBLE
-) WITH (
-    'merge-engine' = 'aggregation',
-    'fields.max_value.aggregate-function' = 'max'
-);
--- 如果上游发送 DELETE 消息，max 无法精确回撤
--- 解决方案: 配置 'fields.max_value.ignore-retract' = 'true'
-
--- 错误4: FirstRow 用于需要更新的场景
-CREATE TABLE user_info (
-    user_id BIGINT PRIMARY KEY NOT ENFORCED,
-    name STRING,
-    age INT
-) WITH (
-    'merge-engine' = 'first-row'
-);
--- 用户信息更新后不会生效，因为 FirstRow 只保留第一条
--- 应该使用 'merge-engine' = 'deduplicate'
-```
-
-**生产环境注意事项**:
-1. **Deduplicate 的 sequence.field**: 如果不配置，使用系统 sequenceNumber，可能与业务时序不一致
-2. **PartialUpdate 的 null 语义**: null 值不会覆盖非 null 值，但如果需要将字段置为 null，需要特殊处理
-3. **Aggregation 的初始值**: 聚合函数的初始值是 null，第一条记录的值就是初始累加器
-4. **FirstRow 的 changelog**: 需要配合 lookup changelog 模式才能正确生成 INSERT changelog
-
-**性能陷阱**:
-```java
-// 陷阱1: PartialUpdate 字段过多导致性能下降
-// 1000个字段的宽表，每次合并都要遍历1000个字段
-// 解决方案: 考虑垂直拆分表，或使用嵌套类型
-
-// 陷阱2: Aggregation 使用复杂聚合函数
-'fields.nested_array.aggregate-function' = 'nested_update'
-// nested_update 需要遍历数组并比较每个元素，性能较差
-// 解决方案: 评估是否真的需要嵌套更新，或在计算层处理
-
-// 陷阱3: FirstRow + 高更新频率
-// FirstRow 需要判断是否包含高层记录，每次都要检查
-// 如果同一 key 频繁更新，会产生大量无效检查
-// 解决方案: 确保业务场景确实是"只关心首次"
-```
-
-### 核心概念解释
-
-**Deduplicate (去重引擎)**:
-- 定义: 保留同一主键的最后一条记录(按序列号排序)
-- 适用场景: CDC 数据入湖、事件流去重
-- 关键配置: `ignore-delete` 是否忽略删除记录
-
-**PartialUpdate (部分更新引擎)**:
-- 定义: 对每个字段取最新的非 null 值，适用于多源宽表拼接
-- 适用场景: 用户画像、多源数据融合
-- 关键配置: `sequence-group` 为每组列指定独立序列字段
-
-**Aggregation (聚合引擎)**:
-- 定义: 每个字段使用独立的聚合函数进行预聚合
-- 适用场景: 实时指标统计、预聚合报表
-- 关键配置: `fields.${field}.aggregate-function` 指定聚合函数
-
-**FirstRow (首行引擎)**:
-- 定义: 只保留第一条记录，忽略后续的所有更新
-- 适用场景: 日志去重、首次事件记录
-- 关键配置: `ignore-delete` 是否忽略删除(默认不支持删除)
-
-**requireCopy() 的含义**:
-- Deduplicate/PartialUpdate/Aggregation: 返回 false，不需要拷贝
-- FirstRow: 返回 true，需要拷贝第一条记录
-
-**与其他系统对比**:
-| 引擎 | Paimon | Hudi | Iceberg | Delta Lake |
-|------|--------|------|---------|------------|
-| **Deduplicate** | 原生支持 | 原生支持 | 原生支持 | 原生支持 |
-| **PartialUpdate** | 原生支持 | 需自定义 Payload | 不支持 | 不支持 |
-| **Aggregation** | 原生支持 | 不支持 | 不支持 | 不支持 |
-| **FirstRow** | 原生支持 | 不支持 | 不支持 | 不支持 |
-| **Sequence Group** | 支持 | 不支持 | 不支持 | 不支持 |
-
-### 设计理念
-
-**为什么这样设计**:
-1. **四种引擎覆盖主流场景**: Deduplicate(CDC)、PartialUpdate(多源融合)、Aggregation(预聚合)、FirstRow(去重)覆盖了实时数据湖的主流业务场景
-2. **统一接口不同实现**: 四种引擎都实现 MergeFunction 接口，使得 Compaction 逻辑可以统一处理，无需为每种引擎编写独立代码
-3. **配置化而非编程**: 通过配置项选择引擎和聚合函数，而非编写 Java 代码，降低了使用门槛
-
-**权衡取舍**:
-- **灵活性 vs 复杂度**: 提供 4 种引擎和丰富的配置项，增加了学习成本，但换来了对不同场景的精确支持
-- **性能 vs 功能**: PartialUpdate 需要遍历所有字段，Aggregation 需要调用聚合函数，性能略低于 Deduplicate，但提供了更强大的功能
-- **准确性 vs 简单性**: Sequence Group 增加了配置复杂度，但解决了多源乱序问题，保证了数据准确性
-
-**架构演进**:
-```
-v0.1: 只支持 Deduplicate
-  ↓
-v0.3: 增加 PartialUpdate (基础版，无 Sequence Group)
-  ↓
-v0.5: 增加 Aggregation (支持 sum/max/min)
-  ↓
-v0.7: PartialUpdate 增加 Sequence Group
-  ↓
-v1.0: 增加 FirstRow
-  ↓
-v1.2: Aggregation 增加 21 种聚合函数
-  ↓
-v1.5: PartialUpdate 支持聚合函数 + Sequence Group 组合
-```
-
-**业界对比**:
-- **Hudi**: 只支持 Deduplicate，通过自定义 Payload 实现其他语义，但需要编写 Java 代码
-- **Iceberg**: 只支持 Deduplicate，不支持 PartialUpdate 和 Aggregation
-- **Delta Lake**: 只支持 Deduplicate，通过 MERGE INTO 在计算层实现更新
-- **Paimon**: 在存储层原生支持 4 种引擎，是业界功能最丰富的设计
-
----
-
-MergeEngine 在 `CoreOptions` 中定义为枚举:
-
-**源码路径**: `paimon-api/.../CoreOptions.java` (第 3807 行)
+`merge-engine` 在 `CoreOptions.MergeEngine`（`CoreOptions.java:3910`，已修正）定义为四值枚举：
 
 ```java
 public enum MergeEngine implements DescribedEnum {
@@ -806,1702 +195,614 @@ public enum MergeEngine implements DescribedEnum {
 }
 ```
 
+下面逐个走五段式。读完应能一眼判断：给定业务该选哪种、配错会怎样。
+
 ### 3.1 Deduplicate 去重引擎
 
-**源码路径**: `paimon-core/.../mergetree/compact/DeduplicateMergeFunction.java`
+**源码**：`DeduplicateMergeFunction.java:32`
 
-**核心逻辑**: 保留最后一条记录(按 sequence number 排序后最大的)。
+**① 语义**：同 key 多版本里，留 sequence 最大的一条（输入已按 sequence 升序喂入，所以"最后 add 的就是最新")。这是默认 merge engine，对应"CDC 入湖只要最新状态"。
+
+**② 实现极简**——核心就两行：
 
 ```java
-public class DeduplicateMergeFunction implements MergeFunction<KeyValue> {
-    private final boolean ignoreDelete;
-    private KeyValue latestKv;
-
-    @Override
-    public void add(KeyValue kv) {
-        if (ignoreDelete && kv.valueKind().isRetract()) {
-            return;  // 配置忽略删除时跳过回撤记录
-        }
-        latestKv = kv;  // 始终保留最后一条
-    }
-
-    @Override
-    public KeyValue getResult() { return latestKv; }
-
-    @Override
-    public boolean requireCopy() { return false; }
+public void add(KeyValue kv) {
+    if (ignoreDelete && kv.valueKind().isRetract()) return; // 配了 ignore-delete 才跳过回撤
+    latestKv = kv;                                          // 否则始终覆盖为最新
 }
+public KeyValue getResult() { return latestKv; }
+public boolean requireCopy() { return false; }  // 只持有最后一条引用，无需拷贝
 ```
 
-**为什么 `requireCopy()` 返回 false?** Deduplicate 只保存 `latestKv` 引用，不需要拷贝，因为它只关心最后添加的那条记录，之前的记录可以被安全覆盖。
+注意 `DeduplicateMergeFunction.java:49` 的注释：0.7- 版本即使配了 ignore-delete 也可能把 DELETE 写进数据文件，所以这里仍要兜底判断 `isRetract()`。
 
-**输入输出示例**:
+输入 `(pk=1,seq=1)→(pk=1,seq=3)→(pk=1,seq=5)`，结果取 seq=5 那条（哪怕它的某些字段是 null——deduplicate 是整行替换，不做字段级保护，这点与 partial-update 截然不同）。
 
-| 操作 | Key | Value | SequenceNumber | Level |
-|------|-----|-------|----------------|-------|
-| add | pk=1 | {name="A", age=20} | 1 | 2 |
-| add | pk=1 | {name="B", age=25} | 3 | 0 |
-| add | pk=1 | {name="C", age=null} | 5 | 0 |
-| **getResult** | pk=1 | **{name="C", age=null}** | **5** | **0** |
+**③ 陷阱**：
+- `ignore-delete=true`（`CoreOptions.IGNORE_DELETE`）会吞掉 DELETE，下游永远看不到删除——只在"上游 DELETE 是噪声"时才开。
+- deduplicate 整行替换，所以**它无法做局部列更新**；想"后到的 null 不覆盖已有值"必须改用 partial-update。
 
-**配置参数**:
-- `ignore-delete`: 是否忽略 DELETE/UPDATE_BEFORE 记录 (默认 false)
+**④ 收益与代价**：实现最轻、CPU 最省、`requireCopy=false` 无拷贝开销；代价是语义最弱，多源/聚合一概不支持。
 
 ### 3.2 PartialUpdate 部分更新引擎
 
-**源码路径**: `paimon-core/.../mergetree/compact/PartialUpdateMergeFunction.java`
+**源码**：`PartialUpdateMergeFunction.java`（关键方法 `add:122` / `updateNonNullFields:177` / `updateWithSequenceGroup:190` / `retractWithSequenceGroup:271`）。本引擎是 §7 的主角，这里讲基本模式，sequence-group 细节见 §7。`14`（局部列更新/CDC）会引用本节。
 
-**核心逻辑**: 对每个字段取最新的非 null 值，适用于多源宽表拼接场景。
+**① 问题**：多个数据源各自只写宽表的几列（画像：基础源写 name/age、行为源写 tags、风控源写 score），每条输入大量字段是 null。要的是"非 null 才覆盖、null 不抹掉已有值"。
 
-**关键字段**:
-```java
-private final InternalRow.FieldGetter[] getters;         // 字段提取器
-private final boolean ignoreDelete;                       // 是否忽略删除
-private final List<WrapperWithFieldIndex<FieldsComparator>> fieldSeqComparators; // Sequence Group 比较器
-private final List<WrapperWithFieldIndex<FieldAggregator>> fieldAggregators;     // 字段聚合器
-private final boolean removeRecordOnDelete;               // 是否在删除时移除整行
-private final Set<Integer> sequenceGroupPartialDelete;    // 基于 Sequence Group 的部分删除
-```
+**② 设计**：维护一个 `GenericRow row` 作累加器，逐字段"非 null 覆盖"：
 
-**基本更新逻辑 (无 Sequence Group)**:
 ```java
 private void updateNonNullFields(KeyValue kv) {
     for (int i = 0; i < getters.length; i++) {
         Object field = getters[i].getFieldOrNull(kv.value());
         if (field != null) {
-            row.setField(i, field);  // 非 null 字段覆盖旧值
+            row.setField(i, field);  // 仅非 null 覆盖；null 保留旧值
         }
     }
 }
 ```
 
-**输入输出示例 (基本模式)**:
+`(name=Alice,_,_) → (_,age=25,_) → (_,_,city=Beijing)` 合并出 `(Alice,25,Beijing)`。这条"null 即不更新"的语义，和 deduplicate 的整行替换是本质区别。
 
-| 操作 | Key | name | age | city |
-|------|-----|------|-----|------|
-| add(源1) | pk=1 | "Alice" | null | null |
-| add(源2) | pk=1 | null | 25 | null |
-| add(源3) | pk=1 | null | null | "Beijing" |
-| **getResult** | pk=1 | **"Alice"** | **25** | **"Beijing"** |
+**③ 关键设计点：删除有三种互斥策略**（构造期 `checkState` 校验，见 §7.2）：
 
-**删除处理的三种策略**:
+| 策略 | 配置 | 语义 |
+|---|---|---|
+| 忽略删除 | `ignore-delete=true` | 丢弃所有回撤记录，宽表只增不删 |
+| 整行删除 | `partial-update.remove-record-on-delete=true` | 收到 DELETE 删整行（`add:146`）|
+| 按源删除 | `partial-update.remove-record-on-sequence-group=<seq>` | 只有指定源的 DELETE 才删整行（见 §7.4）|
 
-1. **`ignore-delete=true`**: 忽略所有回撤记录
-2. **`partial-update.remove-record-on-delete=true`**: 收到 DELETE 时删除整行
-3. **`sequence-group` + `partial-update.remove-record-on-sequence-group`**: 基于 Sequence Group 的精细化删除
+为什么要三种：维表拼接通常不希望某个源的删除波及整行（忽略）；CDC 主源的删除应清空整行（整行删）；多主多从场景只允许"权威源"删（按源删）。三者**不能同时启用**——语义会冲突。
 
-**为什么提供三种删除策略?** 不同业务场景对删除语义的需求不同。CDC 场景通常需要精确处理删除；维表拼接场景可以忽略删除；而多源独立更新场景则需要按 Sequence Group 粒度控制删除行为。
+**④ 陷阱**：
+- **null 无法显式置空**：基本模式下 null 永远当作"不更新"，想把字段真正设回 null 得靠 sequence-group + 序列字段（见 §7.4 普通字段回撤置 null）。
+- 多源**必须**配 sequence-group，否则全局序列号会让源间互相压制（§7.1）。
+- 字段越多 `add` 越慢（每条都遍历全字段），千列宽表考虑垂直拆分。
 
-**好处**: 灵活的删除策略使 PartialUpdate 能适应从简单到复杂的各种业务场景。
+**⑤ 收益与代价**：原生支持多源拼接，是 Paimon 相对 Iceberg/Delta 的独特能力；代价是配置复杂、全字段遍历的 CPU 开销。
 
 ### 3.3 Aggregation 聚合引擎
 
-**源码路径**: `paimon-core/.../mergetree/compact/aggregate/AggregateMergeFunction.java`
+**源码**：`AggregateMergeFunction.java:49`，每字段一个 `FieldAggregator`（§6）。
 
-**核心逻辑**: 每个字段使用独立的聚合函数进行预聚合。
+**① 问题**：实时指标想在存储层就把 PV 累加、UV bitmap 求并，而不是每次查询全量重算。
+
+**② 设计**：`add` 对每个字段调用对应聚合器的 `agg`（或回撤时 `retract`）：
 
 ```java
-public class AggregateMergeFunction implements MergeFunction<KeyValue> {
-    private final FieldAggregator[] aggregators;
-
-    @Override
-    public void add(KeyValue kv) {
-        boolean isRetract = kv.valueKind().isRetract();
-        for (int i = 0; i < getters.length; i++) {
-            Object accumulator = getters[i].getFieldOrNull(row);
-            Object inputField = getters[i].getFieldOrNull(kv.value());
-            Object mergedField = isRetract
-                    ? fieldAggregator.retract(accumulator, inputField)
-                    : fieldAggregator.agg(accumulator, inputField);
-            row.setField(i, mergedField);
-        }
+public void add(KeyValue kv) {
+    latestKv = kv;
+    currentDeleteRow = removeRecordOnDelete && kv.valueKind() == RowKind.DELETE;
+    if (currentDeleteRow) { row = new GenericRow(...); initRow(row, kv.value()); return; }
+    boolean isRetract = kv.valueKind().isRetract();
+    for (int i = 0; i < getters.length; i++) {
+        Object acc = getters[i].getFieldOrNull(row);
+        Object in  = getters[i].getFieldOrNull(kv.value());
+        row.setField(i, isRetract ? aggregators[i].retract(acc, in) : aggregators[i].agg(acc, in));
     }
 }
 ```
 
-**字段聚合函数选择逻辑** (源码路径: `AggregateMergeFunction.getAggFuncName()`):
+**字段→聚合函数的选择**（`AggregateMergeFunction.getAggFuncName:179`，已核对）：① sequence 字段 → `last_value`（只覆盖不聚合）；② 主键字段 → `primary-key`（恒取最新）；③ 用户 `fields.<f>.aggregate-function`；④ `fields.default-aggregate-function`；⑤ 都没配 → `last_non_null_value`（最终默认）。
 
-```
-1. sequence 字段 --> last_value (仅覆盖，不聚合)
-2. 主键字段 --> primary-key (直接取最新值)
-3. 用户通过 fields.${name}.aggregate-function 指定 --> 用户配置
-4. fields.default-aggregate-function 指定 --> 默认聚合
-5. 以上都未配置 --> last_non_null_value (最终默认)
-```
+为什么默认 `last_non_null_value` 而非 `last_value`：避免后到的 null 抹掉已聚合的有效值——和 partial-update 的直觉一致。
 
-**为什么默认是 `last_non_null_value` 而不是 `last_value`?** 因为 `last_non_null_value` 在聚合引擎中更安全，可以避免 null 值意外覆盖有效的聚合结果。
+**③ 陷阱（重点）：retract 支持是分函数的**。`isRetract` 分支会调 `FieldAggregator.retract`，但基类默认抛 `UnsupportedOperationException`（`FieldAggregator.java:47`）。`sum`/`product`/`collect`/`merge_map` 等覆写了 retract（减/除/移除元素），而 `max`/`min`/`first_value`/`rbm*`/`*_sketch` 等**不可逆**，没覆写。所以：
 
-**输入输出示例**:
+- 上游有 DELETE/UPDATE_BEFORE 且字段聚合函数不支持 retract → 运行时抛异常。
+- 解法二选一：`fields.<f>.ignore-retract=true`（接受不精确，回撤被丢弃）或 `aggregation.remove-record-on-delete=true`（DELETE 整行删，`add:84`）。二者互斥。
+- 即便支持 retract 的函数也有坑：`product` 回撤是除法，输入为 0 会除零异常（见 §6.2）。
 
-假设配置: `fields.amount.aggregate-function = sum`, `fields.count.aggregate-function = sum`
-
-| 操作 | Key | amount (sum) | count (sum) | name (last_non_null_value) |
-|------|-----|-------------|-------------|---------------------------|
-| add(INSERT) | pk=1 | 100 | 1 | "order_A" |
-| add(INSERT) | pk=1 | 200 | 1 | null |
-| add(INSERT) | pk=1 | 50 | 1 | "order_C" |
-| **getResult** | pk=1 | **350** | **3** | **"order_C"** |
-
-**删除处理**: Aggregation 引擎同样支持 `aggregation.remove-record-on-delete` 配置。当收到 DELETE 记录时可以选择删除整行。
+**④ 收益与代价**：把聚合下沉到存储层，查询直接读结果；代价是 retract 语义受限于函数可逆性，是 aggregation 区别于其它引擎最容易出错的点。
 
 ### 3.4 FirstRow 首行引擎
 
-**源码路径**: `paimon-core/.../mergetree/compact/FirstRowMergeFunction.java`
+**源码**：`FirstRowMergeFunction.java:32`
 
-**核心逻辑**: 仅保留第一条记录，忽略后续的所有更新。
+**① 问题**：日志/事件去重只想保留"第一次出现"，后续重复全部丢弃，并且只在首次触发下游。
+
+**② 设计**：
 
 ```java
-public class FirstRowMergeFunction implements MergeFunction<KeyValue> {
-    private KeyValue first;
-    public boolean containsHighLevel;  // 重要标记: 是否包含高层记录
-
-    @Override
-    public void add(KeyValue kv) {
-        if (kv.valueKind().isRetract()) {
-            if (ignoreDelete) return;
-            else throw new IllegalArgumentException(...);  // 默认不接受删除
-        }
-        if (first == null) {
-            this.first = kv;  // 只保存第一条
-        }
-        if (kv.level() > 0) {
-            containsHighLevel = true;  // 标记是否有高层记录
-        }
+public void add(KeyValue kv) {
+    if (kv.valueKind().isRetract()) {           // 默认拒绝 DELETE/UPDATE_BEFORE
+        if (ignoreDelete) return;
+        else throw new IllegalArgumentException("First row merge engine can not accept DELETE...");
     }
+    if (first == null) this.first = kv;          // 只记第一条
+    if (kv.level() > 0) containsHighLevel = true; // 标记：候选里有高层记录
 }
+public boolean requireCopy() { return true; }    // 跨多次 add 持有 first，必须拷贝
 ```
 
-**为什么 `requireCopy()` 返回 true?** FirstRow 需要保留第一条记录的引用，而后续的 `add()` 调用不会更新它。由于对象复用机制，如果不拷贝，第一条记录的数据可能被后续记录覆盖。
+两个关键设计：
+- **`requireCopy()=true`**：first 要长期持有，受对象复用约束（§2.2），必须拷贝，否则会被后续 add 覆盖。这是四引擎里唯一返回 true 的。
+- **`containsHighLevel` 标记**：高层（level>0）记录代表"这个 key 已经持久化存在过"。该标记交给 `FirstRowMergeFunctionWrapper`（§9）判断要不要产 INSERT changelog——若候选里已有高层记录，说明不是首次，不产 changelog。
 
-**为什么需要 `containsHighLevel` 标记?** 这个标记用于 `FirstRowMergeFunctionWrapper` 中的 Changelog 生成: 如果合并中包含高层(已持久化)记录，说明这个 key 已经存在于存储中，不需要生成 INSERT changelog; 只有全是 Level-0 的记录且 lookup 未找到历史记录时，才生成 INSERT changelog。
+`(seq=1,level=2) → (seq=3,level=0) → (seq=5,level=0)` 结果取第一条 `seq=1`，且因含 level=2 记录而 `containsHighLevel=true`。
 
-**好处**: FirstRow 引擎特别适合数据去重场景(如日志去重)，配合 lookup changelog 模式，可以高效地做到"仅在首次出现时触发下游"。
+**③ 陷阱**：
+- **默认拒绝删除**：直接抛异常，不是静默忽略。要容忍 DELETE 得显式配 `ignore-delete`。
+- **必须配 lookup**：first-row 的"是否首次"判断要查更高层是否已存在该 key，所以它强制走 lookup（`LookupStrategy.isFirstRow → needLookup`，§5）。不配 lookup 无法正确产 INSERT changelog，下游会重复处理。
+- **不适合可更新表**：只留首条、忽略一切后续更新，用错场景会"改不动"。
 
-**输入输出示例**:
-
-| 操作 | Key | Value | SequenceNumber | Level |
-|------|-----|-------|----------------|-------|
-| add | pk=1 | {name="A", age=20} | 1 | 2 |
-| add | pk=1 | {name="B", age=25} | 3 | 0 |
-| add | pk=1 | {name="C", age=30} | 5 | 0 |
-| **getResult** | pk=1 | **{name="A", age=20}** | **1** | **2** |
+**④ 收益与代价**：高效的"仅首次触发"语义（lookup 只需返回 boolean，传输量极小，见 §9）；代价是只读不更、删除受限，场景很专一。
 
 ### 3.5 四种引擎对比总览
 
-| 特性 | Deduplicate | PartialUpdate | Aggregation | FirstRow |
+| 维度 | Deduplicate | PartialUpdate | Aggregation | FirstRow |
 |------|-------------|---------------|-------------|----------|
-| **配置值** | `deduplicate` | `partial-update` | `aggregation` | `first-row` |
-| **合并语义** | 保留最新一条 | 按字段取最新非 null 值 | 按字段聚合 | 保留第一条 |
-| **requireCopy** | false | false | false | true |
-| **支持删除** | 原生支持 | 需配置策略 | 需配置策略 | 默认不支持 |
-| **支持回撤** | 原生支持 | 部分(需 seq group) | 聚合函数各异 | 默认不支持 |
-| **Sequence Group** | 不适用 | 支持 | 不适用 | 不适用 |
-| **典型场景** | CDC 数据入湖 | 多源宽表拼接 | 实时指标聚合 | 日志/事件去重 |
+| **配置值** | `deduplicate`（默认）| `partial-update` | `aggregation` | `first-row` |
+| **合并语义** | 整行替换为最新 | 逐字段非 null 覆盖 | 逐字段聚合 | 留第一条 |
+| **保留哪条** | sequence 最大 | 各字段最新非 null | 累加结果 | sequence 最小（首条）|
+| **requireCopy** | false | false | false | **true** |
+| **删除处理** | ignore-delete | 三种互斥策略（§3.2）| ignore-retract / 整行删 | 默认抛异常，需 ignore-delete |
+| **retract 支持** | 整行替换天然支持 | 序列字段置 null / 聚合字段 retract | **取决于聚合函数可逆性** | 不支持 |
+| **Sequence Group** | 不适用 | 支持（§7）| 不适用（用 sequence.field）| 不适用 |
+| **是否强制 lookup** | 否 | 否 | 否 | **是** |
+| **典型场景** | CDC 入湖 | 多源宽表拼接 | 实时预聚合 | 日志/事件去重 |
+
+一句话选型：**只要最新→deduplicate；多源拼列→partial-update；要累计→aggregation；只要首次→first-row。**
 
 ---
 
 ## 4. MergeEngine 的选择与创建流程
 
-**源码路径**: `paimon-core/.../table/PrimaryKeyTableUtils.java` (第 58 行)
+**① 谁来选**：`PrimaryKeyTableUtils.createMergeFunctionFactory`（`PrimaryKeyTableUtils.java:58`，已核对）读 `merge-engine` 配置，switch 出对应工厂：
 
 ```java
-public static MergeFunctionFactory<KeyValue> createMergeFunctionFactory(TableSchema tableSchema) {
-    Options conf = Options.fromMap(tableSchema.options());
-    CoreOptions options = new CoreOptions(conf);
-    CoreOptions.MergeEngine mergeEngine = options.mergeEngine();
-
-    switch (mergeEngine) {
-        case DEDUPLICATE: return DeduplicateMergeFunction.factory(conf);
-        case PARTIAL_UPDATE: return PartialUpdateMergeFunction.factory(conf, rowType, primaryKeys);
-        case AGGREGATE: return AggregateMergeFunction.factory(conf, rowType, primaryKeys);
-        case FIRST_ROW: return FirstRowMergeFunction.factory(conf);
-        default: throw new UnsupportedOperationException(...);
-    }
+switch (mergeEngine) {
+    case DEDUPLICATE:     return DeduplicateMergeFunction.factory(conf);
+    case PARTIAL_UPDATE:  return PartialUpdateMergeFunction.factory(conf, rowType, primaryKeys);
+    case AGGREGATE:       return AggregateMergeFunction.factory(conf, rowType, primaryKeys);
+    case FIRST_ROW:       return FirstRowMergeFunction.factory(conf);
 }
 ```
 
-**整体创建链路**:
-
-```mermaid
-sequenceDiagram
-    participant Table as PrimaryKeyFileStoreTable
-    participant Utils as PrimaryKeyTableUtils
-    participant Factory as MergeFunctionFactory
-    participant LookupWrap as LookupMergeFunction
-    participant Store as KeyValueFileStore
-
-    Table->>Utils: createMergeFunctionFactory(tableSchema)
-    Utils->>Utils: 读取 merge-engine 配置
-    Utils->>Factory: 创建对应的 Factory
-
-    alt needLookup() == true
-        Table->>LookupWrap: LookupMergeFunction.wrap(factory, ...)
-        Note over LookupWrap: 除 FirstRow 外都包装
-    end
-
-    Table->>Store: new KeyValueFileStore(..., mfFactory, ...)
-```
-
-**源码路径**: `paimon-core/.../table/PrimaryKeyFileStoreTable.java` (第 82-101 行)
+**② 何时再套一层 lookup 包装**：`PrimaryKeyFileStoreTable.java:83-85`——若 `needLookup()`，把工厂包进 `LookupMergeFunction.wrap`：
 
 ```java
 MergeFunctionFactory<KeyValue> mfFactory = PrimaryKeyTableUtils.createMergeFunctionFactory(tableSchema);
 if (options.needLookup()) {
     mfFactory = LookupMergeFunction.wrap(mfFactory, options, keyType, rowType);
 }
-lazyStore = new KeyValueFileStore(..., mfFactory, ...);
 ```
 
-**为什么 `needLookup()` 时要额外包装?** Lookup 模式下，Compaction 需要查询历史数据来正确合并。LookupMergeFunction 作为包装器，负责管理候选记录的缓冲和高层记录的查找逻辑。
+**③ 为什么要包装**：lookup compaction 只合并涉及 L0 的部分层，更高层的历史值要靠 lookup 现查补齐（见 §5）。但 first-row 在 `wrap` 里被显式跳过——它有专门的 wrapper（§3.4 / §5）。
+
+整条链路：`merge-engine` 配置 → 选基础工厂（4 选 1）→ `needLookup()` 决定是否套 `LookupMergeFunction` → 交给 `KeyValueFileStore` 在读路径/compaction 中调用。
 
 ---
 
 ## 5. LookupMergeFunction 包装机制
 
-### 5.1 设计动机
+**① 要解决什么问题**：标准（full）compaction 会把同 key 的**所有层**一起归并，成本极高。lookup compaction 只合并涉及 L0 的少数层，那"更高层的历史值"从哪来？答案：现场 lookup 查出来补进合并。`LookupMergeFunction` 就是这套"先缓冲候选、再挑出必要的高层记录喂给真正引擎"的包装器。
 
-在标准的 LSM-Tree Compaction 中，SortMergeReader 会按 key 有序读取所有参与合并的文件，相同 key 的所有版本都会参与合并。但在 Lookup Compaction 中，只有 Level-0 和少量高层文件参与合并，更高层的历史数据需要通过 lookup 查询获取。
-
-**为什么不简单查询所有层?** 因为全层合并(Full Compaction)成本极高，Lookup Compaction 只合并涉及 Level-0 的部分层，用 lookup 补齐缺失的历史记录，兼顾了性能和正确性。
-
-### 5.2 核心实现分析
-
-**源码路径**: `paimon-core/.../mergetree/compact/LookupMergeFunction.java`
+**② 设计原理**（`LookupMergeFunction.java`，`wrap:130`）：
 
 ```java
-public class LookupMergeFunction implements MergeFunction<KeyValue> {
-    private final MergeFunction<KeyValue> mergeFunction;  // 被包装的实际合并函数
-    private final KeyValueBuffer candidates;               // 候选记录缓冲区
-    private boolean containLevel0;
-
-    @Override
-    public void add(KeyValue kv) {
-        currentKey = kv.key();
-        if (kv.level() == 0) {
-            containLevel0 = true;
-        }
-        candidates.put(kv);  // 所有记录先缓冲
-    }
-
-    public KeyValue pickHighLevel() {
-        // 从候选中找到最低高层(level > 0)的记录
-        // 因为最低高层的记录是最近一次合并的结果
-    }
-
-    @Override
-    public KeyValue getResult() {
-        mergeFunction.reset();
-        KeyValue highLevel = pickHighLevel();
-        // 只将 level-0 记录和选中的高层记录传给实际 MergeFunction
-        try (CloseableIterator<KeyValue> iterator = candidates.iterator()) {
-            while (iterator.hasNext()) {
-                KeyValue kv = iterator.next();
-                if (kv.level() <= 0 || kv == highLevel) {
-                    mergeFunction.add(kv);
-                }
-            }
-        }
-        return mergeFunction.getResult();
-    }
+public void add(KeyValue kv) {
+    if (kv.level() == 0) containLevel0 = true;
+    candidates.put(kv);                 // 所有候选先进缓冲，不立即合并
+}
+public KeyValue getResult() {
+    mergeFunction.reset();
+    KeyValue highLevel = pickHighLevel();   // 选 level 最低的那条高层记录
+    // 只把 L0 记录 + 选中的那条高层记录喂给真正的 MergeFunction
+    ... if (kv.level() <= 0 || kv == highLevel) mergeFunction.add(kv); ...
+    return mergeFunction.getResult();
 }
 ```
 
-**关键设计决策**: `pickHighLevel()` 选择 level 最低的高层记录(而非最高层)。
+**关键决策：`pickHighLevel` 选 level 最低的高层记录**。在 LSM 里 level 越低越新，最低的高层记录就是"上一次 compaction 合出来的最新已确认状态"，用它当历史基准最准确。其余更高层记录因为更旧，可以不参与本轮合并。
 
-**为什么?** 因为在 LSM-Tree 中，level 越低的数据越新。高层记录代表的是之前 compaction 的合并结果，level 最低的高层记录是最近一次合并的结果，是最新的"已确认"状态。
+**③ FirstRow 的特殊豁免**（`LookupMergeFunction.java:135`）：
 
-**特殊处理 FirstRow**: LookupMergeFunction.wrap() 中明确排除了 FirstRow:
 ```java
-public static MergeFunctionFactory<KeyValue> wrap(...) {
-    if (wrapped.create() instanceof FirstRowMergeFunction) {
-        return wrapped;  // FirstRow 不需要包装
-    }
-    return new Factory(wrapped, options, keyType, valueType);
+if (wrapped.create() instanceof FirstRowMergeFunction) {
+    return wrapped;   // first-row 不套 LookupMergeFunction
 }
 ```
 
-**为什么 FirstRow 不需要 Lookup 包装?** FirstRow 只保留第一条记录，不需要与历史记录合并。它有自己专门的 `FirstRowMergeFunctionWrapper` 来处理 changelog 生成。
+first-row 只留首条、不与历史值"合并"，它要的只是"这个 key 在更高层是否已存在"（boolean），由 `FirstRowMergeFunctionWrapper` 单独处理（§9）。所以这里直接返回原工厂。
 
-**KeyValueBuffer 缓冲机制**: LookupMergeFunction 使用 `KeyValueBuffer` (HybridBuffer) 缓冲候选记录。当记录数量少时使用内存 List，超过阈值时自动切换到基于磁盘的 Binary 缓冲区，避免 OOM。
+**④ 候选缓冲防 OOM**：候选用 `KeyValueBuffer.createHybridBuffer`（`LookupMergeFunction.java:52`）——量小走内存 List，超阈值切到磁盘二进制缓冲。否则热点 key 的海量候选会撑爆堆。
 
-### 5.3 LookupStrategy 策略
-
-**源码路径**: `paimon-api/.../lookup/LookupStrategy.java`
+**⑤ 何时启用 lookup：LookupStrategy**（`paimon-api/.../lookup/LookupStrategy.java:24`，已核对）：
 
 ```java
-public class LookupStrategy {
-    public final boolean needLookup;
-    public final boolean isFirstRow;
-    public final boolean produceChangelog;
-    public final boolean deletionVector;
-
-    // needLookup = produceChangelog || deletionVector || isFirstRow || forceLookup
-}
+needLookup = produceChangelog || deletionVector || isFirstRow || forceLookup;
 ```
 
-触发 Lookup 的四种条件:
-1. **`changelog-producer = lookup`**: 需要通过 lookup 生成 changelog
-2. **`deletion-vectors.enabled = true`**: 需要通过 lookup 维护删除向量
-3. **`merge-engine = first-row`**: FirstRow 引擎需要 lookup 判断 key 是否已存在
-4. **`force-lookup = true`**: 强制开启 lookup
+四个触发源（`CoreOptions.lookupStrategy()` 在 `CoreOptions.java:3193`，已修正——旧稿标 3112）：
 
-**创建代码** (源码路径: `CoreOptions.java` 第 3112 行):
-```java
-public LookupStrategy lookupStrategy() {
-    return LookupStrategy.from(
-            mergeEngine().equals(MergeEngine.FIRST_ROW),
-            changelogProducer().equals(ChangelogProducer.LOOKUP),
-            deletionVectorsEnabled(),
-            options.get(FORCE_LOOKUP));
-}
-```
+| 触发条件 | 配置 | 为什么需要 lookup |
+|---|---|---|
+| 产 lookup changelog | `changelog-producer=lookup` | 要查历史值算出 UPDATE_BEFORE |
+| deletion vector | `deletion-vectors.enabled=true` | lookup 到旧记录位置后标记删除（见 §8.3 协同）|
+| first-row | `merge-engine=first-row` | 查 key 是否已存在以决定是否产 INSERT |
+| 强制 | `force-lookup=true` | 显式开启 |
+
+**收益与代价**：lookup 用"现查少量历史"换掉"全层合并"，大幅降低 compaction 成本同时拿到准确 changelog/DV；代价是维护 lookup 索引（内存/IO，见 §8.4 陷阱）。
 
 ---
 
-## 6. 内置聚合函数完整列表
+## 6. 内置聚合函数体系
 
 ### 6.1 FieldAggregator 抽象基类
 
-**源码路径**: `paimon-core/.../mergetree/compact/aggregate/FieldAggregator.java`
+**① 角色**：aggregation 引擎（§3.3）和 partial-update 的聚合字段（§7.5）都靠它——每个聚合字段一个 `FieldAggregator` 实例。
+
+**② 接口**（`FieldAggregator.java:26`，已核对）：
 
 ```java
 public abstract class FieldAggregator implements Serializable {
-    protected final DataType fieldType;  // 字段数据类型
-    protected final String name;         // 聚合函数标识名
-
-    // 正向聚合: 合并 accumulator 和 inputField
-    public abstract Object agg(Object accumulator, Object inputField);
-
-    // 反向聚合: 用于 PartialUpdate 中旧序列号的处理
-    public Object aggReversed(Object accumulator, Object inputField) {
-        return agg(inputField, accumulator);  // 默认交换参数顺序
-    }
-
-    // 重置状态 (有状态聚合函数需要重写)
-    public void reset() {}
-
-    // 回撤: 从 accumulator 中撤回 retractField 的贡献
-    public Object retract(Object accumulator, Object retractField) {
-        throw new UnsupportedOperationException(...);  // 默认不支持
+    public abstract Object agg(Object accumulator, Object inputField);    // 正向聚合
+    public Object aggReversed(Object acc, Object in) { return agg(in, acc); } // 反向：默认交换参数
+    public void reset() {}                                                 // 有状态聚合器需覆写
+    public Object retract(Object acc, Object retractField) {               // 回撤：默认不支持
+        throw new UnsupportedOperationException("... does not support retraction ...");
     }
 }
 ```
 
-**为什么需要 `aggReversed`?** 在 PartialUpdate + Sequence Group 场景中，当新记录的序列号小于旧记录时，需要"反向"聚合: 将新值作为 accumulator，旧值作为 input。对于 SUM 这类满足交换律的函数无影响，但对于 `collect` 等非交换函数则有区别。`FieldCollectAgg` 覆写了 `aggReversed` 使其直接调用 `agg`，因为 accumulator 已经去重过，跳过重新去重可以提升性能。
+**③ 三个非显然的方法**：
+- **`retract`**：默认抛 `UnsupportedOperationException`（第 47 行）。这就是 §3.3 陷阱的根源——只有覆写了 retract 的函数才能精确回撤。
+- **`aggReversed`**：partial-update + sequence-group 下，新记录序列号**小于**旧记录时调用，把"新值当 acc、旧值当 input"。对 `sum` 这类可交换函数无差别；对 `collect` 这类非交换函数有差别（`FieldCollectAgg.java:86` 覆写 `aggReversed` 直接调 `agg`，因为 acc 已去重，省一次去重）。
+- **`reset`**：有状态聚合器（`first_value`/`first_non_null_value`）靠它在换 key 时清 `initialized` 标记，由 MergeFunction.reset 级联触发。
 
-### 6.2 所有内置聚合函数详解
+### 6.2 内置聚合函数清单与 retract 支持
 
-以下是 Paimon 内置的 **21** 种聚合函数完整列表（注: `first_not_null_value` 是 `first_non_null_value` 的旧名兼容别名，实际只有21个独立实现）:
+> SPI 服务文件里注册了 **22** 个工厂（`META-INF/services/org.apache.paimon.factories.Factory`，已核对计数），其中 `first_not_null_value` 是 `first_non_null_value` 的旧名兼容工厂（`FieldFirstNonNullValueAggLegacyFactory`），底层是同一实现，故独立语义为 21 种，外加内部专用的 `primary-key`。
 
-| # | 标识名 | 实现类 | 数据类型约束 | 支持回撤 | 说明 |
-|---|--------|--------|-------------|---------|------|
-| 1 | `sum` | `FieldSumAgg` | 数值类型(Numeric) | 是(减法) | 累加求和 |
-| 2 | `product` | `FieldProductAgg` | 数值类型(Numeric) | 是(除法) | 累乘求积 |
-| 3 | `max` | `FieldMaxAgg` | 可比较类型 | 否 | 取最大值 |
-| 4 | `min` | `FieldMinAgg` | 可比较类型 | 否 | 取最小值 |
-| 5 | `last_value` | `FieldLastValueAgg` | 任意类型 | 是(置null) | 取最后一个值(含null) |
-| 6 | `last_non_null_value` | `FieldLastNonNullValueAgg` | 任意类型 | 是(条件置null) | 取最后一个非null值 |
-| 7 | `first_value` | `FieldFirstValueAgg` | 任意类型 | 否 | 取第一个值(有状态) |
-| 8 | `first_non_null_value` | `FieldFirstNonNullValueAgg` | 任意类型 | 否 | 取第一个非null值(有状态) |
-| 9 | `first_not_null_value` | (Legacy) `FieldFirstNonNullValueAgg` | 任意类型 | 否 | `first_non_null_value` 的旧名兼容 |
-| 10 | `listagg` | `FieldListaggAgg` | `VARCHAR(MAX)` | 否 | 字符串拼接(可配分隔符/去重) |
-| 11 | `bool_and` | `FieldBoolAndAgg` | `BOOLEAN` | 否 | 布尔与 |
-| 12 | `bool_or` | `FieldBoolOrAgg` | `BOOLEAN` | 否 | 布尔或 |
-| 13 | `collect` | `FieldCollectAgg` | `ARRAY<T>` | 是(移除元素) | 收集元素到数组(可去重) |
-| 14 | `merge_map` | `FieldMergeMapAgg` | `MAP<K,V>` | 是(按key移除) | 合并两个Map |
-| 15 | `merge_map_with_keytime` | `FieldMergeMapWithKeyTimeAgg` | `MAP<K,ROW>` | 否 | 按时间戳字段合并Map |
-| 16 | `nested_update` | `FieldNestedUpdateAgg` | `ARRAY<ROW>` | 是(按key/全匹配) | 嵌套表更新 |
-| 17 | `nested_partial_update` | `FieldNestedPartialUpdateAgg` | `ARRAY<ROW>` | 否 | 嵌套表部分更新 |
-| 18 | `rbm32` | `FieldRoaringBitmap32Agg` | `VARBINARY` | 否 | 32位RoaringBitmap OR合并 |
-| 19 | `rbm64` | `FieldRoaringBitmap64Agg` | `VARBINARY` | 否 | 64位RoaringBitmap OR合并 |
-| 20 | `hll_sketch` | `FieldHllSketchAgg` | `VARBINARY` | 否 | HyperLogLog Sketch Union |
-| 21 | `theta_sketch` | `FieldThetaSketchAgg` | `VARBINARY` | 否 | Theta Sketch Union |
-| 22 | `primary-key` | `FieldPrimaryKeyAgg` | 任意类型 | 是(直接取新值) | 主键字段专用(总取最新值) |
+| 标识名 | 实现类 | 类型约束 | retract | 说明 |
+|--------|--------|---------|---------|------|
+| `sum` | `FieldSumAgg` | 数值 | ✅ 减法 | 累加；retract 是减法 |
+| `product` | `FieldProductAgg` | 数值 | ✅ 除法 | 累乘；**retract 除法，除数为 0 会抛异常** |
+| `max` | `FieldMaxAgg` | 可比较 | ❌ | 取最大；不可逆 |
+| `min` | `FieldMinAgg` | 可比较 | ❌ | 取最小；不可逆 |
+| `last_value` | `FieldLastValueAgg` | 任意 | ✅ 置 null | 取最后值（含 null）|
+| `last_non_null_value` | `FieldLastNonNullValueAgg` | 任意 | ✅ 条件置 null | 取最后非 null；**partial-update/aggregation 的默认**|
+| `first_value` | `FieldFirstValueAgg` | 任意 | ❌ | 取第一个值（**有状态**）|
+| `first_non_null_value` | `FieldFirstNonNullValueAgg` | 任意 | ❌ | 取第一个非 null（**有状态**）|
+| `listagg` | `FieldListaggAgg` | `VARCHAR` | ❌ | 字符串拼接（可配分隔符/去重）|
+| `bool_and` / `bool_or` | `FieldBoolAndAgg`/`FieldBoolOrAgg` | `BOOLEAN` | ❌ | 布尔与/或 |
+| `collect` | `FieldCollectAgg` | `ARRAY<T>` | ✅ 移除元素 | 收集成数组（可去重）|
+| `merge_map` | `FieldMergeMapAgg` | `MAP<K,V>` | ✅ 按 key 移除 | 合并 Map，同 key 后者覆盖 |
+| `merge_map_with_keytime` | `FieldMergeMapWithKeyTimeAgg` | `MAP<K,ROW>` | ❌ | 按时间戳合并，value=null 删 key |
+| `nested_update` | `FieldNestedUpdateAgg` | `ARRAY<ROW>` | ✅ 按 key/全匹配 | 嵌套表整行更新 |
+| `nested_partial_update` | `FieldNestedPartialUpdateAgg` | `ARRAY<ROW>` | ❌ | 嵌套表非 null 部分更新 |
+| `rbm32` / `rbm64` | `FieldRoaringBitmap32Agg`/`64Agg` | `VARBINARY` | ❌ | RoaringBitmap OR 合并 |
+| `hll_sketch` / `theta_sketch` | `FieldHllSketchAgg`/`FieldThetaSketchAgg` | `VARBINARY` | ❌ | HLL/Theta sketch union（近似基数）|
+| `primary-key` | `FieldPrimaryKeyAgg` | 任意 | — | 内部专用，主键字段恒取最新 |
 
-**各函数详细分析**:
+**核心要点：retract 支持是分函数的，这决定了能否用在有 DELETE 的流上。**
 
-#### sum (FieldSumAgg)
+- **可逆**（覆写了 retract）：`sum`/`product`/`last_value`/`last_non_null_value`/`collect`/`merge_map`/`nested_update`。它们能精确回撤。
+- **不可逆**（用基类默认 retract，会抛异常）：`max`/`min`/`first_*`/`listagg`/`bool_*`/`rbm*`/`*_sketch` 等。聚合结果丢失了还原所需信息（如 max 减一个值无法还原次大值）。
 
-**源码路径**: `paimon-core/.../aggregate/FieldSumAgg.java`
+几个值得记的实现细节：
+- `sum.agg` 遵循 SQL NULL 语义——acc 或 in 为 null 时返回非 null 的那个；retract 时若 acc 为 null 而 in 非 null，返回 `negative(in)`（"减一个值"语义）。
+- `last_value` vs `last_non_null_value`：前者让 null 覆盖有效值（`agg` 直接返回 in），后者忽略 null 输入（`in==null?acc:in`）。这正是 aggregation 默认选后者的原因——防止 null 抹掉已聚合值。
+- `first_value`/`first_non_null_value` 有状态，靠 `initialized` 标记 + `reset()` 工作；这也是它们不支持 retract 的间接原因。
+- `nested_update`/`nested_partial_update`：嵌套表（`ARRAY<ROW>`）场景，可配 `nested-key`（按子表主键更新行）；前者整行替换、后者非 null 部分更新。注意防数组无限增长（用 nested-key 去重）。
 
-支持的类型: `DECIMAL`, `TINYINT`, `SMALLINT`, `INTEGER`, `BIGINT`, `FLOAT`, `DOUBLE`
+### 6.3 FieldIgnoreRetractAgg 装饰器：让不可逆函数也能容忍回撤
+
+**① 问题**：上游偶有 DELETE，但字段用的是不可逆函数（如 `max`），又不想整行删。
+
+**② 设计**（`FieldIgnoreRetractAgg.java`，装饰器）：
 
 ```java
-// 聚合: accumulator + inputField
-public Object agg(Object accumulator, Object inputField) {
-    if (accumulator == null || inputField == null) {
-        return accumulator == null ? inputField : accumulator;  // null 安全处理
-    }
-    // 按类型分别处理加法...
-}
-
-// 回撤: accumulator - inputField
-public Object retract(Object accumulator, Object inputField) {
-    if (accumulator == null || inputField == null) {
-        return accumulator == null ? negative(inputField) : accumulator;
-    }
-    // 按类型分别处理减法...
-}
+public Object agg(Object acc, Object in) { return aggregator.agg(acc, in); } // 正向透传
+public Object retract(Object acc, Object retractField) { return acc; }       // 回撤直接吞掉
 ```
 
-**为什么 null 处理逻辑是"返回非 null 的那个"?** 这遵循 SQL 的 NULL 语义: NULL 不参与聚合。当 accumulator 为 null(初始状态)时，结果就是第一个非 null 的输入值。
+配 `fields.<f>.ignore-retract=true` 即给该字段套上这个装饰器（创建逻辑见 §6.4）。回撤被静默丢弃——结果不再精确，但不会抛异常、不会整行删。
 
-**回撤时 `negative()` 的作用**: 当 accumulator 为 null 但 inputField 不为 null 时，回撤的语义是"减去一个值"，此时结果应为 inputField 的负值。
+**③ 取舍**：正交组合，任意聚合函数 × 是否忽略回撤都能搭配，无需改聚合函数本身。代价是 ignore-retract 与 `aggregation.remove-record-on-delete` 语义冲突，**两者互斥**（§6.4 的 `checkState`）。
 
-#### product (FieldProductAgg)
+### 6.4 SPI 注册与扩展
 
-**源码路径**: `paimon-core/.../aggregate/FieldProductAgg.java`
+**① 为什么用 SPI 而非 if-else/Map**：聚合需求因业务而异，内置函数覆盖不全。SPI 让用户**不改 Paimon 源码**就能加自定义聚合：实现 `FieldAggregatorFactory`、在 `META-INF/services` 注册即可（开放-封闭原则）。
 
-累乘聚合，回撤通过除法实现。支持与 sum 相同的数值类型。
+**② 接口**（`aggregate/factory/FieldAggregatorFactory.java`）：`create(DataType, CoreOptions, String field)` + 继承自 `Factory` 的 `identifier()`（返回 "sum"、"max" 等唯一名）。22 个工厂与 `CatalogFactory` 等共用同一个 `org.apache.paimon.factories.Factory` 服务文件。
 
-**注意**: 除法回撤在 inputField 为 0 时会抛出算术异常(除零错误)。这是该聚合函数的已知限制。
-
-#### last_value / last_non_null_value
-
-**源码路径**: `paimon-core/.../aggregate/FieldLastValueAgg.java`, `FieldLastNonNullValueAgg.java`
-
-```java
-// FieldLastValueAgg
-public Object agg(Object accumulator, Object inputField) { return inputField; }
-public Object retract(Object accumulator, Object retractField) { return null; }
-
-// FieldLastNonNullValueAgg
-public Object agg(Object accumulator, Object inputField) {
-    return (inputField == null) ? accumulator : inputField;
-}
-public Object retract(Object accumulator, Object retractField) {
-    return retractField != null ? null : accumulator;
-}
-```
-
-**两者的关键区别**: `last_value` 会让 null 覆盖有效值，而 `last_non_null_value` 忽略 null 输入。
-
-#### first_value / first_non_null_value
-
-**源码路径**: `paimon-core/.../aggregate/FieldFirstValueAgg.java`, `FieldFirstNonNullValueAgg.java`
-
-这两个聚合器是**有状态**的，内部维护 `boolean initialized` 标记:
-
-```java
-// FieldFirstValueAgg
-public Object agg(Object accumulator, Object inputField) {
-    if (!initialized) {
-        initialized = true;
-        return inputField;     // 第一次调用: 返回 inputField
-    } else {
-        return accumulator;    // 后续调用: 忽略 inputField
-    }
-}
-
-public void reset() { this.initialized = false; }
-```
-
-**为什么需要 `reset()` 方法?** 有状态聚合器在处理不同 key 时需要重置状态。MergeFunction 的 `reset()` 会触发所有 aggregator 的 `reset()`。
-
-#### collect (FieldCollectAgg)
-
-**源码路径**: `paimon-core/.../aggregate/FieldCollectAgg.java`
-
-支持 `distinct` 模式。对于复合类型(如 ROW)使用 `RecordEqualiser`(代码生成) 进行等值比较:
-
-```java
-public Object agg(Object accumulator, Object inputField) {
-    if (equaliser != null) {
-        List<Object> collection = new ArrayList<>();
-        collect(collection, accumulator);           // accumulator 已去重，直接添加
-        collectWithEqualiser(collection, inputField); // 输入需要与已有元素去重比较
-        return new GenericArray(collection.toArray());
-    } else {
-        Collection<Object> collection = distinct ? new HashSet<>() : new ArrayList<>();
-        collect(collection, accumulator);
-        collect(collection, inputField);
-        return new GenericArray(collection.toArray());
-    }
-}
-```
-
-支持回撤: 遍历 retract 数组，从 accumulator 中移除匹配的元素。
-
-#### merge_map (FieldMergeMapAgg)
-
-**源码路径**: `paimon-core/.../aggregate/FieldMergeMapAgg.java`
-
-合并两个 Map，相同 key 时后者覆盖前者。支持回撤(按 key 移除)。
-
-#### merge_map_with_keytime (FieldMergeMapWithKeyTimeAgg)
-
-**源码路径**: `paimon-core/.../aggregate/FieldMergeMapWithKeyTimeAgg.java`
-
-在 merge_map 基础上增加了时间戳比较: Map 的 value 类型必须是 ROW，其中指定的字段作为时间戳，相同 key 时只保留时间戳更大的值。如果 value 为 null 则删除该 key。
-
-#### nested_update (FieldNestedUpdateAgg)
-
-**源码路径**: `paimon-core/.../aggregate/FieldNestedUpdateAgg.java`
-
-用于嵌套表(`ARRAY<ROW>`)场景。可配置:
-- `nested-key`: 指定嵌套表的主键列，按 key 更新行
-- `count-limit`: 限制数组最大长度，防止 OOM
-
-#### nested_partial_update (FieldNestedPartialUpdateAgg)
-
-**源码路径**: `paimon-core/.../aggregate/FieldNestedPartialUpdateAgg.java`
-
-与 `nested_update` 类似但对相同 key 的行执行**部分更新**(非 null 字段覆盖):
-
-```java
-private void partialUpdate(GenericRow toUpdate, InternalRow input) {
-    for (int i = 0; i < fieldGetters.length; i++) {
-        Object field = fieldGetter.getFieldOrNull(input);
-        if (field != null) {
-            toUpdate.setField(i, field);  // 非 null 覆盖
-        }
-    }
-}
-```
-
-#### rbm32 / rbm64 (RoaringBitmap)
-
-**源码路径**: `paimon-core/.../aggregate/FieldRoaringBitmap32Agg.java`, `FieldRoaringBitmap64Agg.java`
-
-对 RoaringBitmap 的序列化字节数组执行 OR 合并。内部复用 bitmap 对象避免频繁创建:
-```java
-roaringBitmapAcc.deserialize(ByteBuffer.wrap((byte[]) accumulator));
-roaringBitmapInput.deserialize(ByteBuffer.wrap((byte[]) inputField));
-roaringBitmapAcc.or(roaringBitmapInput);
-return roaringBitmapAcc.serialize();
-```
-
-#### hll_sketch / theta_sketch (近似去重)
-
-**源码路径**: `paimon-core/.../aggregate/FieldHllSketchAgg.java`, `FieldThetaSketchAgg.java`
-
-调用 `HllSketchUtil.union()` / `ThetaSketch.union()` 合并两个 sketch 的序列化字节数组。用于近似基数(distinct count)估算。
-
-### 6.3 FieldIgnoreRetractAgg 装饰器
-
-**源码路径**: `paimon-core/.../aggregate/FieldIgnoreRetractAgg.java`
-
-```java
-public class FieldIgnoreRetractAgg extends FieldAggregator {
-    private final FieldAggregator aggregator;
-
-    @Override
-    public Object agg(Object accumulator, Object inputField) {
-        return aggregator.agg(accumulator, inputField);  // 委托给内部聚合器
-    }
-
-    @Override
-    public Object retract(Object accumulator, Object retractField) {
-        return accumulator;  // 忽略回撤，直接返回 accumulator
-    }
-}
-```
-
-**为什么需要装饰器模式?** 不是所有聚合函数都支持回撤(如 max/min 无法精确回撤)。通过装饰器，用户可以为任何聚合函数配置 `fields.${field_name}.ignore-retract=true` 来跳过回撤处理，而无需修改聚合函数本身。
-
-**好处**: 正交组合，任何聚合函数与是否忽略回撤，两个维度可以自由组合。
-
----
-
-## 7. FieldAggregator SPI 注册机制
-
-### 7.1 Factory 接口设计
-
-**源码路径**: `paimon-core/.../aggregate/factory/FieldAggregatorFactory.java`
-
-```java
-public interface FieldAggregatorFactory extends Factory {
-    FieldAggregator create(DataType fieldType, CoreOptions options, String field);
-    String identifier();  // 继承自 Factory 接口
-}
-```
-
-每个具体工厂通过 `identifier()` 方法返回唯一标识名(如 "sum", "max"), 通过 `create()` 方法创建对应的聚合器实例。工厂的 `create()` 方法接收三个参数:
-- `fieldType`: 字段数据类型，工厂内部进行类型校验
-- `options`: 全局配置，用于获取字段级配置(如 listagg 的分隔符)
-- `field`: 字段名，用于读取字段级配置
-
-### 7.2 SPI 服务文件注册
-
-**源码路径**: `paimon-core/src/main/resources/META-INF/services/org.apache.paimon.factories.Factory`
-
-所有 22 个工厂类通过 Java SPI 机制注册(与 CatalogFactory 等共享同一个 Factory 服务文件):
-
-```
-org.apache.paimon.mergetree.compact.aggregate.factory.FieldBoolAndAggFactory
-org.apache.paimon.mergetree.compact.aggregate.factory.FieldBoolOrAggFactory
-org.apache.paimon.mergetree.compact.aggregate.factory.FieldCollectAggFactory
-org.apache.paimon.mergetree.compact.aggregate.factory.FieldFirstNonNullValueAggFactory
-org.apache.paimon.mergetree.compact.aggregate.factory.FieldFirstNonNullValueAggLegacyFactory
-org.apache.paimon.mergetree.compact.aggregate.factory.FieldFirstValueAggFactory
-org.apache.paimon.mergetree.compact.aggregate.factory.FieldHllSketchAggFactory
-org.apache.paimon.mergetree.compact.aggregate.factory.FieldLastNonNullValueAggFactory
-org.apache.paimon.mergetree.compact.aggregate.factory.FieldLastValueAggFactory
-org.apache.paimon.mergetree.compact.aggregate.factory.FieldListaggAggFactory
-org.apache.paimon.mergetree.compact.aggregate.factory.FieldMaxAggFactory
-org.apache.paimon.mergetree.compact.aggregate.factory.FieldMergeMapAggFactory
-org.apache.paimon.mergetree.compact.aggregate.factory.FieldMergeMapWithKeyTimeAggFactory
-org.apache.paimon.mergetree.compact.aggregate.factory.FieldMinAggFactory
-org.apache.paimon.mergetree.compact.aggregate.factory.FieldNestedUpdateAggFactory
-org.apache.paimon.mergetree.compact.aggregate.factory.FieldNestedPartialUpdateAggFactory
-org.apache.paimon.mergetree.compact.aggregate.factory.FieldPrimaryKeyAggFactory
-org.apache.paimon.mergetree.compact.aggregate.factory.FieldProductAggFactory
-org.apache.paimon.mergetree.compact.aggregate.factory.FieldRoaringBitmap32AggFactory
-org.apache.paimon.mergetree.compact.aggregate.factory.FieldRoaringBitmap64AggFactory
-org.apache.paimon.mergetree.compact.aggregate.factory.FieldSumAggFactory
-org.apache.paimon.mergetree.compact.aggregate.factory.FieldThetaSketchAggFactory
-```
-
-### 7.3 工厂发现与创建流程
-
-**源码路径**: `FieldAggregatorFactory.create()` 静态方法 (第 39 行)
-
-```mermaid
-sequenceDiagram
-    participant Caller as AggregateMergeFunction / PartialUpdate
-    participant FacStatic as FieldAggregatorFactory (static)
-    participant FactoryUtil as FactoryUtil.discoverFactory
-    participant SPI as ServiceLoader
-    participant FacImpl as 具体 Factory 实现
-
-    Caller->>FacStatic: create(fieldType, fieldName, aggFuncName, options)
-    FacStatic->>FactoryUtil: discoverFactory(classLoader, FieldAggregatorFactory.class, aggFuncName)
-    FactoryUtil->>SPI: ServiceLoader.load(Factory.class)
-    SPI-->>FactoryUtil: 返回所有注册的 Factory
-    FactoryUtil->>FactoryUtil: 按 identifier() 匹配 aggFuncName
-    FactoryUtil-->>FacStatic: 返回匹配的 FieldAggregatorFactory
-    FacStatic->>FacImpl: factory.create(fieldType, options, fieldName)
-    FacImpl-->>FacStatic: 返回 FieldAggregator 实例
-
-    alt fieldIgnoreRetract == true
-        FacStatic->>FacStatic: new FieldIgnoreRetractAgg(aggregator)
-    end
-
-    FacStatic-->>Caller: 返回最终 FieldAggregator
-```
-
-完整的静态 `create()` 方法:
+**③ 发现 + 装饰流程**（静态 `FieldAggregatorFactory.create`）：
 
 ```java
 static FieldAggregator create(DataType fieldType, String fieldName, String aggFuncName, CoreOptions options) {
-    FieldAggregatorFactory factory = FactoryUtil.discoverFactory(
-            FieldAggregator.class.getClassLoader(), FieldAggregatorFactory.class, aggFuncName);
-    if (factory == null) {
-        throw new RuntimeException("Use unsupported aggregation: " + aggFuncName + " ...");
-    }
-
+    FieldAggregatorFactory factory = FactoryUtil.discoverFactory(..., FieldAggregatorFactory.class, aggFuncName);
+    if (factory == null) throw new RuntimeException("Use unsupported aggregation: " + aggFuncName);
     boolean removeRecordOnRetract = options.aggregationRemoveRecordOnDelete();
-    boolean fieldIgnoreRetract = options.fieldAggIgnoreRetract(fieldName);
-    // 两个选项不能同时启用
-    Preconditions.checkState(!(removeRecordOnRetract && fieldIgnoreRetract), ...);
-
+    boolean fieldIgnoreRetract    = options.fieldAggIgnoreRetract(fieldName);
+    Preconditions.checkState(!(removeRecordOnRetract && fieldIgnoreRetract), ...); // 二者互斥
     FieldAggregator aggregator = factory.create(fieldType, options, fieldName);
-    return fieldIgnoreRetract ? new FieldIgnoreRetractAgg(aggregator) : aggregator;
+    return fieldIgnoreRetract ? new FieldIgnoreRetractAgg(aggregator) : aggregator; // 按需套装饰器
 }
 ```
 
-**为什么使用 SPI 而不是 if-else 或 Map?** SPI 机制允许用户在不修改 Paimon 源码的情况下，通过引入自定义 JAR 包来扩展聚合函数。只需实现 `FieldAggregatorFactory` 接口并在 META-INF/services 中注册即可。
-
-**好处**: 开放-封闭原则(OCP)，对扩展开放，对修改封闭。
+要点：① 经 `ServiceLoader` 按 `identifier()` 匹配 `aggFuncName`；② 未知函数名直接抛异常；③ `ignore-retract` 在此处把聚合器包进 `FieldIgnoreRetractAgg`（§6.3）；④ 它与 `remove-record-on-delete` 互斥校验也在这里。
 
 ---
 
-## 8. PartialUpdate Sequence Group 详解
+## 7. PartialUpdate Sequence Group 详解
 
-### 解决什么问题
+> 本节是 partial-update 的核心，`14`（局部列更新）会引用。源码集中在 `PartialUpdateMergeFunction.java`。
 
-**核心业务问题**: 在多源宽表拼接场景中，不同数据源以不同的频率和时序更新同一行的不同列。如果使用全局序列号，会导致源间互相覆盖，造成数据不一致。
+### 7.1 问题：全局序列号下的多源乱序覆盖
 
-**没有这个设计的后果**:
-```sql
--- 场景: 用户画像表，源A更新基础信息，源B更新行为标签
--- 时刻1: 源A发送 {user_id=1, name="Alice", age=25, version=100}
--- 时刻2: 源B发送 {user_id=1, tags=["vip"], version=200}
--- 时刻3: 源A发送 {user_id=1, name="Bob", age=26, version=150}  -- 乱序!
+**① 要解决什么问题**：多源宽表里每个源更新频率/时序不同，且单源内还可能乱序。若全表共用一个序列号，会出现"快源的序列号压制慢源的列"。
 
--- 如果用全局序列号 version:
--- 时刻1后: name="Alice", age=25, tags=null
--- 时刻2后: name="Alice", age=25, tags=["vip"]  (version=200 > 100)
--- 时刻3后: name="Alice", age=25, tags=["vip"]  (version=150 < 200, 被忽略)
--- 结果: 源A的更新被源B的序列号"压制"，name 和 age 没有更新到最新值!
-
--- 使用 Sequence Group 后:
--- 时刻1后: name="Alice", age=25, version_a=100, tags=null, version_b=null
--- 时刻2后: name="Alice", age=25, version_a=100, tags=["vip"], version_b=200
--- 时刻3后: name="Bob", age=26, version_a=150, tags=["vip"], version_b=200
--- 结果: 每个源独立控制自己的列，互不干扰!
-```
-
-**实际场景**:
-1. **用户画像多源融合**: 基础信息源、行为标签源、风控评分源各自独立更新
-2. **IoT 设备监控**: 不同传感器以不同频率上报数据，需要独立控制
-3. **订单宽表**: 订单基础信息、物流信息、支付信息来自不同系统
-
-### 有什么坑
-
-**误区陷阱**:
-1. **序列字段全为 null 的处理**: 如果序列字段全为 null，说明该记录不属于这个 Sequence Group，应该跳过整个组的更新
-2. **聚合函数必须在 Sequence Group 中**: 除了 `last_non_null_value`，其他聚合函数必须在 Sequence Group 保护下使用
-3. **同一字段不能属于多个 Group**: 配置时会校验冲突，同一字段只能属于一个 Sequence Group
-4. **删除策略的选择**: `removeRecordOnDelete`、`ignoreDelete`、`sequenceGroupPartialDelete` 三种策略不能同时使用
-
-**错误配置示例**:
-```sql
--- 错误1: 聚合函数未在 Sequence Group 中
-CREATE TABLE metrics (
-    metric_id STRING PRIMARY KEY NOT ENFORCED,
-    version BIGINT,
-    total_amount DECIMAL(10,2)
-) WITH (
-    'merge-engine' = 'partial-update',
-    'sequence.field' = 'version',
-    'fields.total_amount.aggregate-function' = 'sum'  -- 错误! 必须在 Sequence Group 中
-);
--- 正确配置:
-'fields.version.sequence-group' = 'total_amount'
-
--- 错误2: 同一字段属于多个 Group
-CREATE TABLE user_profile (
-    user_id BIGINT PRIMARY KEY NOT ENFORCED,
-    version_a BIGINT,
-    version_b BIGINT,
-    name STRING
-) WITH (
-    'merge-engine' = 'partial-update',
-    'fields.version_a.sequence-group' = 'name',
-    'fields.version_b.sequence-group' = 'name'  -- 错误! name 不能同时属于两个 Group
-);
-
--- 错误3: 删除策略冲突
-CREATE TABLE orders (
-    order_id BIGINT PRIMARY KEY NOT ENFORCED,
-    version BIGINT,
-    status STRING
-) WITH (
-    'merge-engine' = 'partial-update',
-    'partial-update.ignore-delete' = 'true',
-    'partial-update.remove-record-on-delete' = 'true'  -- 错误! 两个策略冲突
-);
-
--- 错误4: sequenceGroupPartialDelete 指定非序列字段
-CREATE TABLE user_profile (
-    user_id BIGINT PRIMARY KEY NOT ENFORCED,
-    version_a BIGINT,
-    name STRING
-) WITH (
-    'merge-engine' = 'partial-update',
-    'fields.version_a.sequence-group' = 'name',
-    'partial-update.remove-record-on-sequence-group' = 'name'  -- 错误! 应该是 version_a
-);
-```
-
-**生产环境注意事项**:
-1. **序列字段的选择**: 序列字段应该是单调递增的，如时间戳、版本号、事务ID
-2. **null 值的语义**: 序列字段为 null 表示该源没有发送数据，会跳过整个组的更新
-3. **性能影响**: Sequence Group 需要额外的比较和判断，字段数量多时会影响性能
-4. **内存占用**: 每个 Sequence Group 需要创建 FieldsComparator 和 FieldAggregator，字段多时内存占用增加
-
-**性能陷阱**:
-```java
-// 陷阱1: 过多的 Sequence Group
-// 100个字段，每个字段一个 Sequence Group
-'fields.version_1.sequence-group' = 'field_1',
-'fields.version_2.sequence-group' = 'field_2',
-// ... 100个配置
-// 问题: 每个 Group 都要创建比较器和聚合器，内存和 CPU 开销大
-// 解决方案: 按业务逻辑合理分组，相关字段放在同一个 Group
-
-// 陷阱2: Sequence Group 中包含大字段
-'fields.version_a.sequence-group' = 'large_text_field'
-// large_text_field 是一个很大的文本字段
-// 问题: 每次比较序列号时都要读取大字段，影响性能
-// 解决方案: 将大字段单独放一个 Group，或考虑是否真的需要 Sequence Group
-
-// 陷阱3: 聚合函数 + Sequence Group 的组合
-'fields.version_a.sequence-group' = 'amount',
-'fields.amount.aggregate-function' = 'sum'
-// 问题: 聚合函数在序列号较小时也会调用 aggReversed，增加计算开销
-// 解决方案: 评估是否真的需要聚合，或使用 last_non_null_value
-```
-
-### 核心概念解释
-
-**Sequence Group (序列组)**:
-- 定义: 将列分组，每组有独立的序列字段，只有当组内序列字段更大时才更新该组的列
-- 配置格式: `fields.${sequence_fields}.sequence-group = ${field1},${field2},...`
-- 多序列字段: 一个 Group 可以有多个序列字段，按字典序比较
-
-**FieldsComparator (字段比较器)**:
-- 定义: 比较两条记录的序列字段大小，决定是否更新
-- 比较规则: 按序列字段顺序逐个比较，类似字典序
-- 代码生成: 使用 Janino 动态生成比较代码，避免反射开销
-
-**isEmptySequenceGroup (空序列组判断)**:
-- 定义: 检查序列字段是否全为 null
-- 语义: 全为 null 表示该记录不属于这个 Sequence Group，应该跳过
-- 缓存优化: 使用 boolean 数组避免重复检查
-
-**aggReversed (反向聚合)**:
-- 定义: 当新记录序列号小于旧记录时，以反向参数顺序调用聚合函数
-- 用途: 对于聚合字段，即使序列号更小，聚合值仍然应该被累加
-- 示例: `sum(100, 50)` 和 `sum(50, 100)` 结果相同，但 `collect([1,2], [3])` 和 `collect([3], [1,2])` 结果不同
-
-**sequenceGroupPartialDelete (基于序列组的部分删除)**:
-- 定义: 指定哪些 Sequence Group 的 DELETE 消息应触发整行删除
-- 配置: `partial-update.remove-record-on-sequence-group = ${seq_field1},${seq_field2},...`
-- 语义: 只有特定源系统的删除操作才能删除整行，其他源的删除被忽略
-
-**与其他系统对比**:
-| 特性 | Paimon Sequence Group | Hudi | Iceberg | Delta Lake |
-|------|----------------------|------|---------|------------|
-| **多序列号** | 支持 | 不支持 | 不支持 | 不支持 |
-| **字段级控制** | 支持 | 不支持 | 不支持 | 不支持 |
-| **聚合函数** | 支持 | 不支持 | 不支持 | 不支持 |
-| **部分删除** | 支持 | 不支持 | 不支持 | 不支持 |
-
-### 设计理念
-
-**为什么这样设计**:
-1. **独立序列号解决乱序问题**: 每个源系统用自己的序列号控制自己负责的列，避免了全局序列号导致的源间互相覆盖
-2. **字段级粒度控制**: 不是整行级别的序列号，而是字段级别的序列号，提供了更精细的控制
-3. **聚合函数的组合**: 支持在 Sequence Group 中使用聚合函数，实现"按序列号保护的聚合"语义
-4. **部分删除的灵活性**: 允许指定哪些源的删除操作才能删除整行，其他源的删除被忽略
-
-**权衡取舍**:
-- **灵活性 vs 复杂度**: Sequence Group 提供了极大的灵活性，但配置复杂度也显著增加。需要用户理解序列号、字段分组、聚合函数的组合语义
-- **准确性 vs 性能**: Sequence Group 保证了多源场景下的数据准确性，但每次合并都要比较序列号和调用聚合函数，性能略低于简单的 PartialUpdate
-- **功能完整性 vs 易用性**: 提供了丰富的配置项(sequence-group, aggregate-function, remove-on-sequence-group)，但也增加了学习成本
-
-**架构演进**:
-```
-v0.3: PartialUpdate 基础版 (全局序列号)
-  ↓
-v0.5: 增加 Sequence Group (单序列字段)
-  ↓
-v0.7: 支持多序列字段 (字典序比较)
-  ↓
-v1.0: 支持聚合函数 + Sequence Group 组合
-  ↓
-v1.2: 增加 sequenceGroupPartialDelete (部分删除)
-  ↓
-v1.5: 优化 isEmptySequenceGroup 缓存机制
-```
-
-**业界对比**:
-- **Hudi**: 只支持全局序列号，无法解决多源乱序问题。需要在上游做数据对齐
-- **Iceberg**: 不支持 PartialUpdate，更不支持 Sequence Group
-- **Delta Lake**: 通过 MERGE INTO 在计算层处理，无法在存储层解决
-- **Paimon**: 业界唯一在存储层原生支持 Sequence Group 的数据湖格式，是多源宽表拼接场景的最佳选择
-
-**典型配置模式**:
-```sql
--- 模式1: 基础多源融合 (每个源独立序列号)
-CREATE TABLE user_profile (
-    user_id BIGINT PRIMARY KEY NOT ENFORCED,
-    version_basic BIGINT,
-    name STRING,
-    age INT,
-    version_behavior BIGINT,
-    tags ARRAY<STRING>
-) WITH (
-    'merge-engine' = 'partial-update',
-    'fields.version_basic.sequence-group' = 'name,age',
-    'fields.version_behavior.sequence-group' = 'tags'
-);
-
--- 模式2: 聚合 + Sequence Group (预聚合 + 序列号保护)
-CREATE TABLE order_metrics (
-    order_id BIGINT PRIMARY KEY NOT ENFORCED,
-    version_payment BIGINT,
-    total_amount DECIMAL(10,2),
-    payment_count INT
-) WITH (
-    'merge-engine' = 'partial-update',
-    'fields.version_payment.sequence-group' = 'total_amount,payment_count',
-    'fields.total_amount.aggregate-function' = 'sum',
-    'fields.payment_count.aggregate-function' = 'sum'
-);
-
--- 模式3: 部分删除 (只有主源可以删除整行)
-CREATE TABLE product_info (
-    product_id BIGINT PRIMARY KEY NOT ENFORCED,
-    version_master BIGINT,
-    name STRING,
-    price DECIMAL(10,2),
-    version_inventory BIGINT,
-    stock INT
-) WITH (
-    'merge-engine' = 'partial-update',
-    'fields.version_master.sequence-group' = 'name,price',
-    'fields.version_inventory.sequence-group' = 'stock',
-    'partial-update.remove-record-on-sequence-group' = 'version_master'
-    -- 只有主源(version_master)的 DELETE 才能删除整行
-);
-```
-
----
-
-### 8.1 设计动机与问题背景
-
-在多源宽表拼接场景中，不同数据源可能以不同的频率和时序更新同一行的不同列。简单的"取最新非 null"策略可能导致数据不一致:
+用画像表举例（源 A 管 name/age，源 B 管 tags），用**单一全局** `version`：
 
 ```
-时刻1: 源A 发送 {pk=1, name="Alice", age=null,  version_a=3}
-时刻2: 源B 发送 {pk=1, name=null,    age=25,    version_b=5}
-时刻3: 源A 发送 {pk=1, name="Bob",   age=null,  version_a=2}  <-- 乱序! version_a < 之前的
+t1 源A {name=Alice, age=25, version=100}
+t2 源B {tags=[vip], version=200}
+t3 源A {name=Bob, age=26, version=150}   <- 源A的真实较新更新，但 version 150 < 200
 ```
 
-如果不区分序列号，时刻3 的 name="Bob" 会覆盖 name="Alice"，但实际上 version_a=2 < version_a=3，应该保留 "Alice"。
+结果 t3 被判定为"旧"（150 < 200）整体忽略，name 永远停在 Alice——**源 A 的更新被源 B 的序列号压死了**。根因：用一个序列号去比较本应彼此独立的两个源。
 
-**Sequence Group 的解决方案**: 将列分组，每组有独立的序列字段，只有当组内序列字段更大时才更新该组的列。
+**② 解法**：把列分组，每组配**独立**序列字段（`version_a` 管 name/age，`version_b` 管 tags），只有该组自己的序列号更大才更新该组列。这样源 A 的乱序只在 A 组内比较，与 B 组互不干涉。这是 Paimon 相对 Hudi（仅全局序列号）/ Iceberg / Delta 的独特能力。
 
-### 8.2 配置方式与解析流程
+### 7.2 配置与解析校验
 
-配置格式:
-```sql
--- fields.${sequence_fields}.sequence-group = ${field1},${field2},...
-'fields.version_a.sequence-group' = 'name,address'
-'fields.version_b.sequence-group' = 'age,salary'
-```
+配置格式：`fields.<序列字段>.sequence-group = <受保护列1>,<受保护列2>,...`。一个组可有多个序列字段（按字典序比较），由 `FieldsComparator`（Janino 代码生成，避免反射）实现比较。
 
-**解析流程** (源码路径: `PartialUpdateMergeFunction.Factory` 构造函数, 第 392-492 行):
+解析在 `PartialUpdateMergeFunction.Factory` 构造器（约 `:392` 起），核心校验（行号已重新核对）：
 
-```mermaid
-flowchart TD
-    A[遍历 options.toMap] --> B{key 以 fields. 开头且以 sequence-group 结尾?}
-    B -->|是| C[解析序列字段名 -> sequenceFields int数组]
-    C --> D[解析被保护字段名 -> field int 列表]
-    D --> E[为每个被保护字段创建 FieldsComparator]
-    E --> F[为序列字段自身也注册 FieldsComparator]
-    B -->|否| G[跳过]
-    F --> H[检查冲突: 同一字段不能属于多个 Group]
-    H --> I[为聚合字段创建 FieldAggregator]
-    I --> J[校验: 除 last_non_null_value 外,聚合函数必须在 sequence group 中]
-```
+| 校验 | 源码行 | 说明 |
+|---|---|---|
+| `remove-record-on-delete` 与 `ignore-delete` 互斥 | `:451` checkState | 删除语义冲突 |
+| `remove-record-on-sequence-group` 与 `ignore-delete` 互斥 | `:460` checkState | 同上 |
+| `remove-record-on-delete` 与 sequence-group 互斥 | `:469` checkState | 整行删与字段级序列冲突 |
+| `remove-record-on-sequence-group` 指定的字段必须是序列字段 | `:478` checkState | 配错指向受保护列会报错 |
+| 聚合函数（除 `last_non_null_value`）必须在某 sequence-group 内 | `getAggFuncName:680` checkArgument | 见 §7.5 |
+| 同一字段不能属于多个 group | 解析期校验 | name 同时归 a、b 组会报错 |
 
-**关键校验逻辑**:
-1. 同一字段不能同时属于多个 Sequence Group (第 428 行)
-2. `removeRecordOnDelete` 和 `ignoreDelete` 不能同时启用 (第 454 行)
-3. `removeRecordOnDelete` 和 `sequenceGroup` 不能同时启用 (第 473 行)
-4. `partial-update.remove-record-on-sequence-group` 中指定的字段必须是序列字段 (第 482 行)
-5. 使用聚合函数的字段必须在 Sequence Group 保护下(除了 `last_non_null_value`)
+> 旧稿标的 428/454/473/482 行号已过时；现为 451/460/469/478（已修正）。
 
-### 8.3 更新逻辑深度分析
+### 7.3 更新逻辑 updateWithSequenceGroup
 
-**源码路径**: `PartialUpdateMergeFunction.updateWithSequenceGroup()` (第 190 行)
-
-核心算法按字段索引从小到大遍历:
+**源码**：`PartialUpdateMergeFunction.updateWithSequenceGroup:190`（已核对）。按字段索引从小到大遍历，每字段取出其 `seqComparator` 与 `aggregator`：
 
 ```java
-for (int i = 0; i < getters.length; i++) {
-    // 1. 获取当前字段的 seqComparator 和 aggregator
-    FieldsComparator seqComparator = ...; // 按 fieldIndex 排序的迭代器取出
-    FieldAggregator aggregator = ...;
-
-    if (seqComparator == null) {
-        // 无序列组保护的字段: 非null覆盖 或 聚合
-        if (aggregator != null) {
-            row.setField(i, aggregator.agg(accumulator, field));
-        } else if (field != null) {
-            row.setField(i, field);
-        }
-    } else {
-        // 有序列组保护的字段
-        if (isEmptySequenceGroup(kv, seqComparator, isEmptySequenceGroup)) {
-            continue;  // 序列字段全为null,跳过整个组
-        }
-        if (seqComparator.compare(kv.value(), row) >= 0) {
-            // 新记录序列号 >= 当前值: 更新
-            if (是序列字段本身) {
-                // 序列字段全部更新
-                for (int fieldIndex : seqComparator.compareFields()) {
-                    row.setField(fieldIndex, getters[fieldIndex].getFieldOrNull(kv.value()));
-                }
-            } else {
-                // 普通受保护字段
-                row.setField(i, aggregator == null ? field : aggregator.agg(accumulator, field));
-            }
-        } else if (aggregator != null) {
-            // 新记录序列号 < 当前值但有聚合器: 反向聚合
-            row.setField(i, aggregator.aggReversed(accumulator, field));
-        }
+if (seqComparator == null) {                 // 无序列组保护
+    if (aggregator != null) row.setField(i, aggregator.agg(acc, field)); // 聚合
+    else if (field != null) row.setField(i, field);                      // 非 null 覆盖
+} else {                                      // 受序列组保护
+    if (isEmptySequenceGroup(kv, seqComparator, ...)) continue;          // 序列字段全 null → 跳过整组
+    if (seqComparator.compare(kv.value(), row) >= 0) {                   // 新记录序列号 >= 当前
+        if (是序列字段本身) { /* 更新该组所有序列字段 */ }
+        else row.setField(i, aggregator == null ? field : aggregator.agg(acc, field));
+    } else if (aggregator != null) {          // 序列号更小但有聚合器
+        row.setField(i, aggregator.aggReversed(acc, field));            // 反向聚合
     }
 }
 ```
 
-**为什么需要 `isEmptySequenceGroup` 检查?** 当序列字段全为 null 时，说明这条记录不属于该 Sequence Group 的源系统(该源系统没有发送数据)，应该跳过整个组的更新，避免用 null 覆盖有效数据。
+两个非显然的设计：
 
-**为什么序列号小时还要调用 `aggReversed`?** 对于聚合字段(如 SUM)，即使序列号更小，聚合值仍然应该被累加。`aggReversed` 以反向参数顺序调用聚合函数，确保对于非交换聚合函数(如 `collect`)也能正确处理顺序。
+- **`isEmptySequenceGroup`：序列字段全 null 就跳过整组**。原因：序列字段全 null 表示"该源这条没发数据"，若不跳过，会用 null 把这一组已有的有效值抹掉。它用 `boolean[]` 缓存（`:249`）避免对同组重复判定。
+- **序列号更小仍调 `aggReversed`**。原因：聚合字段（如 sum）即使乱序到达，累计值也该被算进去——只是参数要反过来（旧值当 acc）。对 `sum` 无差别，对 `collect` 这类非交换函数差别明显（§6.1）。这正是 §3.2 说的"普通字段乱序丢弃、聚合字段乱序仍累计"的分水岭。
 
-**`isEmptySequenceGroup` 的缓存优化**: 使用 `boolean[] isEmptySequenceGroup` 数组避免对同一个序列组重复检查:
-```java
-private boolean isEmptySequenceGroup(KeyValue kv, FieldsComparator comparator, boolean[] isEmptySequenceGroup) {
-    if (isEmptySequenceGroup[comparator.compareFields()[0]]) return true; // 已判定过
-    for (int fieldIndex : comparator.compareFields()) {
-        if (getters[fieldIndex].getFieldOrNull(kv.value()) != null) return false; // 有非null序列字段
-    }
-    for (int fieldIndex : comparator.compareFields()) {
-        isEmptySequenceGroup[fieldIndex] = true; // 标记所有序列字段
-    }
-    return true;
-}
-```
+### 7.4 回撤逻辑 retractWithSequenceGroup 与部分删除
 
-### 8.4 回撤逻辑 retractWithSequenceGroup
-
-**源码路径**: `PartialUpdateMergeFunction.retractWithSequenceGroup()` (第 271 行)
-
-回撤在 Sequence Group 下的行为:
+**源码**：`retractWithSequenceGroup:271`（已核对）。回撤（DELETE/UPDATE_BEFORE）时的字段级行为：
 
 ```java
 if (seqComparator.compare(kv.value(), row) >= 0) {
     if (是序列字段) {
-        if (kv.valueKind() == RowKind.DELETE && sequenceGroupPartialDelete.contains(field)) {
-            // 触发基于 Sequence Group 的整行删除
-            currentDeleteRow = true;
-            row = new GenericRow(getters.length);
-            initRow(row, kv.value());
-            return;
+        if (kv.valueKind() == DELETE && sequenceGroupPartialDelete.contains(field)) {
+            currentDeleteRow = true;                 // 该序列字段被指定为"可删整行"→ 整行删
+            row = new GenericRow(...); initRow(row, kv.value()); return;
         }
-        // 更新序列字段
+        // 否则只更新序列字段
     } else {
-        if (aggregator == null) {
-            row.setField(i, null);  // 普通字段置null
-        } else {
-            // 聚合字段回撤
-            row.setField(i, aggregator.retract(accumulator, inputField));
-        }
+        row.setField(i, aggregator == null ? null            // 普通字段：回撤即置 null
+                                           : aggregator.retract(acc, in)); // 聚合字段：回撤
     }
 } else if (aggregator != null) {
-    // 序列号较小但有聚合器时也回撤
-    row.setField(i, aggregator.retract(accumulator, inputField));
+    row.setField(i, aggregator.retract(acc, in));            // 序列号更小但聚合字段仍回撤
 }
 ```
 
-**`sequenceGroupPartialDelete` 的作用**: 当配置了 `partial-update.remove-record-on-sequence-group` 时，指定哪些 Sequence Group 的 DELETE 消息应触发整行删除。这允许精细控制: 只有特定源系统的删除操作才能删除整行。
+要点：
+- **普通受保护字段的回撤是"置 null"**——这是 partial-update 唯一能把字段真正设回 null 的途径（基本模式下 null 永远当"不更新"，§3.2）。
+- **聚合字段的回撤受函数可逆性约束**（§3.3/§6.2）：不可逆函数会抛异常，需 ignore-retract。
+- **`sequenceGroupPartialDelete`（按源删整行）**：`partial-update.remove-record-on-sequence-group=<seq>` 指定哪些组的 DELETE 触发整行删。语义：只有"权威源"的删除能清空整行，其他源的 DELETE 只回撤本组列。这正是 §3.2 三种删除策略里最精细的一种。
 
-### 8.5 Sequence Group 中的聚合函数
+### 7.5 Sequence Group 中的聚合函数
 
-**源码路径**: `PartialUpdateMergeFunction.getAggFuncName()` (第 660 行)
+**源码**：`PartialUpdateMergeFunction.getAggFuncName:657`（已核对，旧稿标 660）。字段→聚合函数的判定，与 aggregation 引擎类似但多一条强制校验：
 
 ```java
-public static String getAggFuncName(String fieldName, CoreOptions options,
-        List<String> primaryKeys, List<String> sequenceFields,
-        List<String> fieldsProtectedBySequenceGroup) {
-
-    if (sequenceFields.contains(fieldName)) return null;     // 序列字段: 无聚合
-    if (primaryKeys.contains(fieldName)) return "primary-key"; // 主键: 总取新值
-    String aggFuncName = options.fieldAggFunc(fieldName);       // 用户配置
-    if (aggFuncName == null) aggFuncName = options.fieldsDefaultFunc(); // 默认聚合
-
-    if (aggFuncName != null) {
-        // 聚合函数必须在 Sequence Group 保护下(除 last_non_null_value 外)
-        checkArgument(
-            aggFuncName.equals("last_non_null_value")
-                || fieldsProtectedBySequenceGroup.contains(fieldName),
-            "Must use sequence group for aggregation functions...");
-    }
-    return aggFuncName;
+if (sequenceFields.contains(fieldName)) return null;          // 序列字段：不聚合
+if (primaryKeys.contains(fieldName))   return "primary-key";  // 主键：恒取最新
+String aggFuncName = options.fieldAggFunc(fieldName);         // 用户配置
+if (aggFuncName == null) aggFuncName = options.fieldsDefaultFunc();
+if (aggFuncName != null) {
+    checkArgument(                                            // 关键校验（:680）
+        aggFuncName.equals("last_non_null_value")
+            || fieldsProtectedBySequenceGroup.contains(fieldName),
+        "Must use sequence group for aggregation functions...");
 }
 ```
 
-**为什么 `last_non_null_value` 例外?** `last_non_null_value` 本质上就是 PartialUpdate 的默认行为(取最新非 null 值)，不依赖序列号排序，因此不需要 Sequence Group 保护。
+**为什么聚合必须在 sequence group 内（`last_non_null_value` 除外）**：聚合在乱序下要靠序列号决定 `agg` 还是 `aggReversed`（§7.3），没有序列号保护就无法判断顺序，结果不确定。而 `last_non_null_value` 本就是 partial-update 的默认语义、不依赖序列排序，故豁免。
 
-**典型配置示例**:
+典型组合配置：
+
 ```sql
-CREATE TABLE wide_table (
-    pk INT PRIMARY KEY NOT ENFORCED,
-    -- 源A 的列
-    version_a INT,
-    name STRING,
-    address STRING,
-    -- 源B 的列
-    version_b INT,
-    age INT,
-    total_amount DECIMAL(10,2)
-) WITH (
-    'merge-engine' = 'partial-update',
-    'fields.version_a.sequence-group' = 'name,address',
-    'fields.version_b.sequence-group' = 'age,total_amount',
-    'fields.total_amount.aggregate-function' = 'sum'
-);
+WITH (
+  'merge-engine' = 'partial-update',
+  'fields.version_a.sequence-group' = 'name,address',
+  'fields.version_b.sequence-group' = 'age,total_amount',
+  'fields.total_amount.aggregate-function' = 'sum',                       -- 在 b 组保护下做 SUM
+  'partial-update.remove-record-on-sequence-group' = 'version_a'          -- 只有 a 源能删整行
+)
 ```
 
-在这个配置中:
-- `name`, `address` 受 `version_a` 保护，只有 version_a 更大时才更新
-- `age`, `total_amount` 受 `version_b` 保护
-- `total_amount` 在 version_b 保护下还使用 SUM 聚合
+**风险/陷阱**：① 组过多 → 每组都建 `FieldsComparator`+`FieldAggregator`，内存/CPU 上升，按业务合理分组；② 大字段放进受序列保护组，每次比较都读它影响性能；③ 聚合 + 乱序会触发 `aggReversed` 额外计算。**收益**：多源乱序下字段级准确性，是其它湖格式做不到的。
 
 ---
 
-## 9. Changelog 四种模式
+## 8. Changelog 四种 producer（merge engine 视角）
 
-### 解决什么问题
+> **Changelog 产生机制由 `24` 主讲**。本节只从 merge engine 视角讲清"四种 producer 的语义差异、与哪种引擎搭配、谁产 changelog"；触发时机/全量压缩细节请看 `24`、`01` §8.6。
 
-**核心业务问题**: 下游系统需要增量消费数据变化，而非全量扫描。如何在 LSM-Tree 的 Compaction 过程中准确、高效地生成变更日志？
+**核心问题**：下游要增量消费变更（INSERT/UPDATE_BEFORE/UPDATE_AFTER/DELETE 四种 RowKind），而不是每次全量扫描。Paimon 用 `changelog-producer` 控制如何产生这套 changelog。
 
-**没有这个设计的后果**:
-- 下游只能全量扫描表，无法增量消费，查询成本极高
-- 无法区分 INSERT/UPDATE/DELETE 操作，下游无法正确处理数据变化
-- 实时性差，下游只能定期轮询，延迟高
-- 无法支持 CDC 场景，无法将数据湖的变化同步到下游数据库
-
-**实际场景**:
-```sql
--- 场景1: 订单表变化同步到 Elasticsearch (需要准确的 changelog)
--- Paimon 表:
-CREATE TABLE orders (
-    order_id BIGINT PRIMARY KEY NOT ENFORCED,
-    status STRING,
-    amount DECIMAL(10,2)
-) WITH (
-    'merge-engine' = 'deduplicate',
-    'changelog-producer' = 'lookup'  -- 低延迟准确 changelog
-);
-
--- 下游消费 changelog:
-INSERT: order_id=1001, status='created', amount=100
-UPDATE_BEFORE: order_id=1001, status='created', amount=100
-UPDATE_AFTER: order_id=1001, status='paid', amount=100
-DELETE: order_id=1001, status='paid', amount=100
-
--- 场景2: 实时报表 (对延迟不敏感)
-CREATE TABLE daily_metrics (
-    date DATE PRIMARY KEY NOT ENFORCED,
-    pv BIGINT,
-    uv BIGINT
-) WITH (
-    'merge-engine' = 'aggregation',
-    'changelog-producer' = 'full-compaction'  -- 高延迟低成本
-);
-
--- 场景3: 纯批处理 (不需要 changelog)
-CREATE TABLE dim_product (
-    product_id BIGINT PRIMARY KEY NOT ENFORCED,
-    name STRING,
-    price DECIMAL(10,2)
-) WITH (
-    'merge-engine' = 'deduplicate',
-    'changelog-producer' = 'none'  -- 无 changelog，节省存储
-);
-```
-
-### 有什么坑
-
-**误区陷阱**:
-1. **INPUT 模式用于非 Deduplicate 引擎**: INPUT 记录的是原始输入，而非合并后的结果，对于 PartialUpdate/Aggregation 不准确
-2. **FULL_COMPACTION 模式的延迟**: changelog 只在 Full Compaction 时产生，延迟可能达到小时级
-3. **LOOKUP 模式的内存开销**: 需要维护 lookup 索引，大表场景下内存占用可能达到数 GB
-4. **row-deduplicate 的性能影响**: 每次都要比较值是否相等，对于大字段(如 JSON)性能影响显著
-
-**错误配置示例**:
-```sql
--- 错误1: INPUT 模式 + PartialUpdate
-CREATE TABLE user_profile (
-    user_id BIGINT PRIMARY KEY NOT ENFORCED,
-    name STRING,
-    age INT
-) WITH (
-    'merge-engine' = 'partial-update',
-    'changelog-producer' = 'input'  -- 错误! INPUT 不适合 PartialUpdate
-);
--- 问题: 原始输入是部分字段，changelog 不反映最终状态
--- 正确做法: 使用 'lookup' 或 'full-compaction'
-
--- 错误2: LOOKUP 模式未配置足够内存
-CREATE TABLE large_table (
-    id BIGINT PRIMARY KEY NOT ENFORCED,
-    data STRING
-) WITH (
-    'merge-engine' = 'deduplicate',
-    'changelog-producer' = 'lookup'
-);
--- 问题: 大表的 lookup 索引可能占用数 GB 内存，导致 OOM
--- 解决方案: 增加堆内存，或使用 'full-compaction' 模式
-
--- 错误3: row-deduplicate 忽略大字段
-CREATE TABLE events (
-    event_id BIGINT PRIMARY KEY NOT ENFORCED,
-    event_data STRING,  -- 大 JSON 字段
-    timestamp BIGINT
-) WITH (
-    'merge-engine' = 'deduplicate',
-    'changelog-producer' = 'lookup',
-    'changelog-producer.row-deduplicate' = 'true'
-);
--- 问题: 每次都要比较 event_data 字段，性能差
--- 解决方案: 配置 'changelog-producer.row-deduplicate-ignore-fields' = 'event_data'
-
--- 错误4: NONE 模式但下游需要增量消费
-CREATE TABLE orders (
-    order_id BIGINT PRIMARY KEY NOT ENFORCED,
-    status STRING
-) WITH (
-    'merge-engine' = 'deduplicate',
-    'changelog-producer' = 'none'  -- 错误! 下游无法增量消费
-);
--- 问题: 下游只能全量扫描，成本高
--- 正确做法: 使用 'lookup' 或 'full-compaction'
-```
-
-**生产环境注意事项**:
-1. **LOOKUP 模式的索引类型**: 默认使用 hash index，大表建议使用 RocksDB
-2. **FULL_COMPACTION 的触发频率**: 默认触发条件较严格，可能导致 changelog 延迟很高
-3. **INPUT 模式的双写开销**: 每次 flush 都要写两份数据(数据文件 + changelog 文件)，I/O 翻倍
-4. **row-deduplicate 的 CPU 开销**: 对于复杂类型(ROW/ARRAY/MAP)，比较开销很大
-
-**性能陷阱**:
-```java
-// 陷阱1: LOOKUP 模式 + 高更新频率
-// 每次 Compaction 都要 lookup，高更新频率导致 lookup 次数激增
-// 解决方案: 评估是否真的需要低延迟 changelog，或优化更新频率
-
-// 陷阱2: FULL_COMPACTION 模式 + 小文件
-// Full Compaction 触发条件: 所有文件都在最高层
-// 如果有大量小文件，Full Compaction 很难触发，changelog 延迟极高
-// 解决方案: 配置合理的 compaction 策略，或使用 LOOKUP 模式
-
-// 陷阱3: row-deduplicate + 嵌套类型
-'changelog-producer.row-deduplicate' = 'true'
-// 表中有 ARRAY<ROW<...>> 类型字段
-// 问题: 比较嵌套类型需要递归遍历，CPU 开销大
-// 解决方案: 忽略嵌套字段，或关闭 row-deduplicate
-
-// 陷阱4: INPUT 模式 + Aggregation
-'merge-engine' = 'aggregation',
-'changelog-producer' = 'input'
-// 问题: INPUT 记录的是原始输入(如 +100, +50)，而非聚合结果(150)
-// 下游消费 changelog 无法得到正确的聚合值
-// 解决方案: 必须使用 'lookup' 或 'full-compaction'
-```
-
-### 核心概念解释
-
-**Changelog (变更日志)**:
-- 定义: 记录数据变化的日志，包含 INSERT/UPDATE_BEFORE/UPDATE_AFTER/DELETE 四种 RowKind
-- 用途: 下游系统通过 changelog 增量消费数据变化
-- 存储: 独立的 changelog 文件，与数据文件分离
-
-**ChangelogProducer (变更日志生成器)**:
-- 定义: 决定如何产生 changelog 的策略
-- 四种模式: NONE(无), INPUT(双写), FULL_COMPACTION(全量合并), LOOKUP(查找)
-- 配置: `changelog-producer` 选项
-
-**ChangelogResult**:
-- 定义: 包含合并结果和 changelog 记录的复合对象
-- 结构: `result` (数据结果) + `changelogs` (changelog 列表)
-- 用途: MergeFunctionWrapper 返回 ChangelogResult，同时产生数据和 changelog
-
-**row-deduplicate (行去重)**:
-- 定义: 如果合并前后值相同，则不生成 UPDATE changelog
-- 配置: `changelog-producer.row-deduplicate = true`
-- 忽略字段: `changelog-producer.row-deduplicate-ignore-fields` 指定不参与比较的字段
-
-**RecordEqualiser (记录相等比较器)**:
-- 定义: 比较两条记录的值是否相等
-- 实现: 使用 Janino 代码生成，避免反射开销
-- 用途: row-deduplicate 功能的核心
-
-**与其他系统对比**:
-| 特性 | Paimon | Hudi | Iceberg | Delta Lake |
-|------|--------|------|---------|------------|
-| **Changelog 模式** | 4种 | 1种(CDC) | 1种(CDC) | 1种(CDC) |
-| **低延迟 changelog** | LOOKUP | 不支持 | 不支持 | 不支持 |
-| **准确性** | 所有模式准确 | 准确 | 准确 | 准确 |
-| **row-deduplicate** | 支持 | 不支持 | 不支持 | 不支持 |
-| **配置化** | 是 | 否 | 否 | 否 |
-
-### 设计理念
-
-**为什么这样设计**:
-1. **四种模式覆盖不同场景**: NONE(批处理)、INPUT(低延迟 CDC)、FULL_COMPACTION(准实时)、LOOKUP(实时)覆盖了从批到流的所有场景
-2. **准确性优先**: 除了 INPUT 模式，其他模式都保证 changelog 的准确性，即使在 PartialUpdate/Aggregation 场景下
-3. **延迟与成本的权衡**: 提供多种模式让用户在延迟和成本之间做取舍
-4. **装饰器模式**: 通过 MergeFunctionWrapper 将 changelog 生成与数据合并正交分离
-
-**权衡取舍**:
-- **准确性 vs 延迟**: FULL_COMPACTION 准确但延迟高，LOOKUP 准确且延迟低但成本高
-- **功能 vs 复杂度**: 提供 4 种模式和丰富的配置项，增加了学习成本
-- **性能 vs 存储**: INPUT 模式双写增加了 I/O 和存储开销，但延迟最低
-
-**架构演进**:
-```
-v0.1: 只支持 NONE 模式 (无 changelog)
-  ↓
-v0.3: 增加 INPUT 模式 (双写 changelog)
-  ↓
-v0.5: 增加 FULL_COMPACTION 模式 (准确 changelog)
-  ↓
-v0.7: 增加 LOOKUP 模式 (低延迟准确 changelog)
-  ↓
-v1.0: 增加 row-deduplicate 功能
-  ↓
-v1.2: 优化 LOOKUP 模式的索引机制
-  ↓
-v1.5: 支持 row-deduplicate-ignore-fields
-```
-
-**业界对比**:
-- **Hudi**: 只支持 CDC 模式(类似 INPUT)，不支持 LOOKUP 和 FULL_COMPACTION
-- **Iceberg**: 只支持 CDC 模式，changelog 延迟较高
-- **Delta Lake**: 通过 Change Data Feed 提供 changelog，但功能较简单
-- **Paimon**: 提供 4 种模式，是业界最灵活的 changelog 方案，特别是 LOOKUP 模式是独有的低延迟准确 changelog
-
-**典型配置模式**:
-```sql
--- 模式1: 实时 CDC 同步 (推荐)
-CREATE TABLE orders (
-    order_id BIGINT PRIMARY KEY NOT ENFORCED,
-    status STRING
-) WITH (
-    'merge-engine' = 'deduplicate',
-    'changelog-producer' = 'lookup',  -- 低延迟准确 changelog
-    'changelog-producer.row-deduplicate' = 'true'  -- 值未变不生成 UPDATE
-);
-
--- 模式2: 准实时报表 (成本优先)
-CREATE TABLE daily_metrics (
-    date DATE PRIMARY KEY NOT ENFORCED,
-    pv BIGINT
-) WITH (
-    'merge-engine' = 'aggregation',
-    'changelog-producer' = 'full-compaction'  -- 延迟高但成本低
-);
-
--- 模式3: 纯批处理 (无 changelog)
-CREATE TABLE dim_product (
-    product_id BIGINT PRIMARY KEY NOT ENFORCED,
-    name STRING
-) WITH (
-    'merge-engine' = 'deduplicate',
-    'changelog-producer' = 'none'  -- 节省存储
-);
-
--- 模式4: 极低延迟 CDC (仅 Deduplicate)
-CREATE TABLE user_events (
-    event_id BIGINT PRIMARY KEY NOT ENFORCED,
-    event_type STRING,
-    event_data STRING
-) WITH (
-    'merge-engine' = 'deduplicate',
-    'changelog-producer' = 'input',  -- 最低延迟
-    'changelog-producer.row-deduplicate' = 'true',
-    'changelog-producer.row-deduplicate-ignore-fields' = 'event_data'  -- 忽略大字段
-);
-```
-
----
-
-**源码路径**: `paimon-api/.../CoreOptions.java` (第 3948 行)
+`ChangelogProducer` 枚举（`CoreOptions.java:4051`，已修正——旧稿标 3948）：
 
 ```java
 public enum ChangelogProducer {
-    NONE("none", "No changelog file."),
-    INPUT("input", "Double write to a changelog file when flushing memory table."),
-    FULL_COMPACTION("full-compaction", "Generate changelog files with each full compaction."),
-    LOOKUP("lookup", "Generate changelog files through 'lookup' compaction.");
+    NONE("none", ...), INPUT("input", ...),
+    FULL_COMPACTION("full-compaction", ...), LOOKUP("lookup", ...);
 }
 ```
 
-### 9.1 NONE 模式
+**与 merge engine 的关系（本篇重点）**：changelog 的"准确性"取决于它记录的是**原始输入**还是**合并后状态**——这正是 merge engine 介入的地方：
 
-**行为**: 不产生任何 changelog 文件。流式读取只能消费最新快照的差异(delta 文件)。
+- **NONE / INPUT 不经过合并**：NONE 不产 changelog；INPUT 在 flush 时把"原始输入行"直接双写（`MergeTreeWriter` 处理，不走 compaction 的 MergeFunction）。所以 INPUT 只对 deduplicate 准确——partial-update/aggregation 的原始输入（部分列、增量值）≠ 最终状态，下游会拿到错的 changelog。
+- **FULL_COMPACTION / LOOKUP 经过合并**：在 compaction 里用 `MergeFunctionWrapper`（§9）把合并后的"前后状态"算成 changelog，因此对所有四种引擎都准确。
 
-**为什么是默认模式?** 产生 changelog 有额外的存储和计算开销。对于只需要批量查询或不需要精确 CDC 语义的场景，NONE 模式最经济。
+### 8.1 NONE / INPUT：不经合并的两端
 
-**适用场景**: 纯批处理查询、数据仓库分层。
+- **NONE（默认）**：不产 changelog 文件，流读只能消费快照间 delta。最省，适合批查询/数仓分层、下游不需要精确 CDC 的场景。
+- **INPUT**：flush 时双写原始输入到 changelog 文件，延迟最低（不等 compaction）。**只对 deduplicate 准确**——这是它最大的限制。适合 MySQL binlog 直接入湖这类"输入即最终态"的场景。
 
-### 9.2 INPUT 模式
+### 8.2 FULL_COMPACTION：合并到最高层时产 changelog
 
-**行为**: 在刷写内存表(MemTable flush)时，将输入的 changelog 记录直接双写到 changelog 文件。
+**源码**：`FullChangelogMergeTreeCompactRewriter.java`，仅当输出到最高层才产：
 
-**源码关系**: 由 `MergeTreeWriter` 在 flush 时直接写入，不涉及 Compaction 阶段的 MergeFunction。
-
-**为什么不推荐用于非 Deduplicate 引擎?** INPUT 模式记录的是原始输入，而非合并后的结果。对于 PartialUpdate/Aggregation，原始输入不等于最终状态变更，下游消费者看到的 changelog 可能不准确。
-
-**适用场景**: Deduplicate 引擎 + 精确 CDC 语义(如从 MySQL binlog 直接入湖)。
-
-### 9.3 FULL_COMPACTION 模式
-
-**行为**: 仅在 Full Compaction(合并到最高层)时产生 changelog。
-
-**源码路径**: `paimon-core/.../compact/FullChangelogMergeTreeCompactRewriter.java`
-
-判断条件:
 ```java
-@Override
 protected boolean rewriteChangelog(int outputLevel, boolean dropDelete, ...) {
-    boolean changelog = outputLevel == maxLevel;  // 仅当输出到最高层
-    if (changelog) {
-        Preconditions.checkArgument(dropDelete, ...);  // Full Compaction 必须 drop delete
-    }
+    boolean changelog = outputLevel == maxLevel;
+    if (changelog) Preconditions.checkArgument(dropDelete, ...); // 全量压缩必 drop delete
     return changelog;
 }
 ```
 
-使用 `FullChangelogMergeFunctionWrapper` 生成 changelog:
-```java
-@Override
-protected MergeFunctionWrapper<ChangelogResult> createMergeWrapper(int outputLevel) {
-    return new FullChangelogMergeFunctionWrapper(mfFactory.create(), maxLevel, valueEqualiser);
-}
-```
+用 `FullChangelogMergeFunctionWrapper`（§9.2）以"最高层旧记录 vs 合并新结果"算 changelog。对所有引擎准确，计算成本远低于 lookup；代价是 changelog 只在 full compaction 时产生，延迟受全量压缩频率支配（可能小时级，触发机制见 `24`、`01` §8.2 的 EarlyFullCompaction）。适合准实时报表。
 
-**为什么 Full Compaction 模式的 changelog 有延迟?** changelog 只在 Full Compaction 时产生，而 Full Compaction 的触发频率远低于增量 Compaction，因此 changelog 的产生有较大延迟。
+### 8.3 LOOKUP：涉及 L0 的 compaction 即产 changelog
 
-**好处**: 比 NONE 多了准确的 changelog，但计算开销远小于 LOOKUP。是准确性和性能的折中。
+**源码**：`LookupMergeTreeCompactRewriter.java`，条件是 `outputLevel>0 且 sections 含 L0`（`rewriteLookupChangelog`）。
 
-**适用场景**: 对延迟不敏感的流式消费场景，如准实时报表。
+由 `LookupChangelogMergeFunctionWrapper`（§9.3）算 changelog：拿高层记录或 lookup 结果当 BEFORE、合并结果当 AFTER，按 BEFORE/AFTER 的有无与是否相等产 INSERT / DELETE / UPDATE_BEFORE+AFTER。因为每次涉及 L0 的 compaction（频率远高于 full compaction）都会产，所以延迟低、对所有引擎准确——这是 Paimon 流式场景推荐模式，也是其相对其它湖格式的独特能力。代价是要维护 lookup 索引（内存/IO）。
 
-### 9.4 LOOKUP 模式
+**与 DeletionVector 协同**（详见 `04`）：同时开 DV + lookup changelog 时，lookup 到旧记录后除用于 changelog 对比，还会 `deletionVectorsMaintainer.notifyNewDeletion()` 把旧记录物理位置标记为删。
 
-**行为**: 在涉及 Level-0 文件的 Compaction 中，通过查找(lookup)历史值来生成精确的 changelog。
+### 8.4 四种 producer 对比与 row-deduplicate
 
-**源码路径**: `paimon-core/.../compact/LookupMergeTreeCompactRewriter.java`
+| 维度 | NONE | INPUT | FULL_COMPACTION | LOOKUP |
+|---|---|---|---|---|
+| changelog 来源 | 无 | 原始输入双写 | full compaction 时计算 | 涉及 L0 的 compaction lookup 计算 |
+| 是否经合并 | — | 否 | 是 | 是 |
+| 延迟 | — | 最低（flush）| 高（依赖全量压缩）| 低（增量压缩）|
+| 准确性 | — | **仅 deduplicate** | 所有引擎 | 所有引擎 |
+| 额外开销 | 无 | 双写存储 | 全量压缩计算 | lookup 索引内存/IO |
+| 适合引擎 | 所有 | deduplicate | 所有 | 所有（推荐）|
+| 配置值 | `none`（默认）| `input` | `full-compaction` | `lookup` |
 
-判断条件:
-```java
-@Override
-protected boolean rewriteChangelog(int outputLevel, boolean dropDelete, ...) {
-    return rewriteLookupChangelog(outputLevel, sections);
-    // 即: outputLevel > 0 且 sections 中包含 Level-0 文件
-}
-```
+**row-deduplicate**（`changelog-producer.row-deduplicate`，`CoreOptions.java:922`）：合并前后值相等时不产 UPDATE_BEFORE/AFTER，靠 `RecordEqualiser`（Janino 代码生成）比较。可配 `changelog-producer.row-deduplicate-ignore-fields`（`CoreOptions.java:929`）排除大字段（如 JSON）以省比较开销。仅 full-compaction / lookup 适用。
 
-changelog 生成逻辑由 `LookupChangelogMergeFunctionWrapper` 实现:
-
-```mermaid
-flowchart TD
-    A[获取合并候选记录] --> B{包含 Level-0 记录?}
-    B -->|否| C[无 changelog]
-    B -->|是| D{有高层记录?}
-    D -->|是| E[高层记录作为 BEFORE]
-    D -->|否| F[lookup 查询更高层]
-    F --> G{lookup 找到?}
-    G -->|是| H[lookup 结果作为 BEFORE]
-    G -->|否| I[无 BEFORE]
-    E --> J[合并计算 AFTER]
-    H --> J
-    I --> J
-    J --> K{BEFORE == null 且 AFTER.isAdd?}
-    K -->|是| L[生成 INSERT changelog]
-    K -->|否| M{BEFORE.isAdd 且 !AFTER.isAdd?}
-    M -->|是| N[生成 DELETE changelog]
-    M -->|否| O{值不等?}
-    O -->|是| P[生成 UPDATE_BEFORE + UPDATE_AFTER]
-    O -->|否| Q[无 changelog 值未变]
-```
-
-**为什么 Lookup 模式能产生即时 changelog?** 因为每次涉及 Level-0 的 Compaction 都会触发 changelog 生成，而 Level-0 文件是新写入的数据，Compaction 频率远高于 Full Compaction。
-
-**好处**: 低延迟、高准确性的 changelog，是 Paimon 在流式场景中推荐的模式。
-
-**代价**: 需要维护 lookup 索引(如 hash index 文件或 RocksDB)，有额外的内存和 I/O 开销。
-
-**与 DeletionVector 的协同**: 当同时启用 DV 和 lookup changelog 时，lookup 到旧记录后除了用于 changelog 对比，还会通过 `deletionVectorsMaintainer.notifyNewDeletion()` 标记旧记录的物理位置为已删除。
-
-### 9.5 四种模式对比
-
-| 特性 | NONE | INPUT | FULL_COMPACTION | LOOKUP |
-|------|------|-------|-----------------|--------|
-| **Changelog 来源** | 无 | 原始输入双写 | Full Compaction 时计算 | 每次 L0 Compaction lookup 计算 |
-| **延迟** | N/A | 最低(flush时) | 高(依赖全量合并) | 低(增量合并) |
-| **准确性** | N/A | 仅 Deduplicate 准确 | 所有引擎准确 | 所有引擎准确 |
-| **额外开销** | 无 | 双写存储 | Full Compaction 计算 | Lookup 索引内存/IO |
-| **适合引擎** | 所有 | Deduplicate | 所有 | 所有(推荐) |
-| **配置值** | `none` | `input` | `full-compaction` | `lookup` |
-| **row-deduplicate** | N/A | N/A | 支持 | 支持 |
-
-**changelog-producer.row-deduplicate**: 当设置为 true 时，如果合并前后值相同，则不生成 UPDATE_BEFORE/UPDATE_AFTER changelog。通过 `RecordEqualiser` 比较值的相等性。可配合 `changelog-producer.row-deduplicate-ignore-fields` 忽略某些字段的比较。
+**选型一句话**：批查询→none；deduplicate + binlog 直入且要极低延迟→input；准实时报表能容忍延迟→full-compaction；流式且要准确低延迟→lookup（默认推荐）。
 
 ---
 
-## 10. MergeFunctionWrapper 体系
+## 9. MergeFunctionWrapper 与 Changelog 生成
 
-### 10.1 ReducerMergeFunctionWrapper
+**Wrapper 是 §8 四种 producer 的实现机制**：它包在 MergeFunction 外、把返回类型从 `KeyValue` 换成 `ChangelogResult`（数据 + changelog 列表），从而在合并的同时算出 changelog。四个实现各对应一种场景——这就是策略 × 装饰正交解耦的落地（§2.1）。
 
-**源码路径**: `paimon-core/.../compact/ReducerMergeFunctionWrapper.java`
+### 9.1 ReducerMergeFunctionWrapper：单条记录直返优化
 
-**设计目的**: 优化只有一条记录时的合并性能。
+**源码**：`ReducerMergeFunctionWrapper.java`。它不产 changelog，是**读路径和普通 compaction**（none 模式）的默认 wrapper。
 
 ```java
-public class ReducerMergeFunctionWrapper implements MergeFunctionWrapper<KeyValue> {
-    private KeyValue initialKv;
-    private boolean isInitialized;
-
-    @Override
-    public void add(KeyValue kv) {
-        if (initialKv == null) {
-            initialKv = kv;  // 第一条: 暂存
-        } else {
-            if (!isInitialized) {
-                merge(initialKv);  // 第二条到来时才初始化合并
-                isInitialized = true;
-            }
-            merge(kv);
-        }
-    }
-
-    @Override
-    public KeyValue getResult() {
-        return isInitialized ? mergeFunction.getResult() : initialKv;
-        // 只有一条记录时直接返回，跳过 MergeFunction
-    }
+public void add(KeyValue kv) {
+    if (initialKv == null) initialKv = kv;          // 第一条只暂存，不进 MergeFunction
+    else { if (!isInitialized) { merge(initialKv); isInitialized = true; } merge(kv); }
+}
+public KeyValue getResult() {
+    return isInitialized ? mergeFunction.getResult() : initialKv;  // 只有一条时直返，跳过合并
 }
 ```
 
-**为什么这个优化重要?** 在 LSM-Tree 中，大部分 key 在单次 Compaction 中只出现一次(来自一个 SortedRun)。跳过 MergeFunction 的 reset/add/getResult 调用链可以显著减少方法调用和对象创建。
+**为什么这个优化值钱**：LSM 中大量 key 在单次合并里只来自一个 SortedRun（只出现一次），跳过 `reset/add/getResult` 整条调用链能显著省方法调用和对象创建。`MergeTreeCompactRewriter.rewriteCompaction` 默认用它。
 
-**使用场景**: 在 `MergeTreeCompactRewriter.rewriteCompaction()` 中被默认使用(第 87 行):
+### 9.2 FullChangelogMergeFunctionWrapper：full-compaction 产 changelog
+
+**源码**：`FullChangelogMergeFunctionWrapper.java`，配合 §8.2。以 `topLevelKv`（最高层记录 = 上次 full compaction 结果）当"旧值"，合并结果当"新值"算 changelog：
+
 ```java
-reader = readerForMergeTree(sections, new ReducerMergeFunctionWrapper(mfFactory.create()));
-```
-
-### 10.2 FullChangelogMergeFunctionWrapper
-
-**源码路径**: `paimon-core/.../compact/FullChangelogMergeFunctionWrapper.java`
-
-**设计目的**: 在 Full Compaction 时同时产生合并数据和 changelog。
-
-核心逻辑:
-```java
-@Override
-public ChangelogResult getResult() {
-    reusedResult.reset();
-    if (isInitialized) {  // 多条记录
-        KeyValue merged = mergeFunction.getResult();
-        if (topLevelKv == null) {
-            // 无最高层历史记录且合并结果是 ADD -> INSERT
-            if (merged.isAdd()) reusedResult.addChangelog(replace(reusedAfter, INSERT, merged));
-        } else {
-            if (!merged.isAdd()) {
-                // 有历史 + 合并结果是删除 -> DELETE
-                reusedResult.addChangelog(replace(reusedBefore, DELETE, topLevelKv));
-            } else if (valueEqualiser == null || !valueEqualiser.equals(topLevelKv.value(), merged.value())) {
-                // 有历史 + 值变化 -> UPDATE_BEFORE + UPDATE_AFTER
-                reusedResult.addChangelog(replace(reusedBefore, UPDATE_BEFORE, topLevelKv));
-                reusedResult.addChangelog(replace(reusedAfter, UPDATE_AFTER, merged));
-            }
-        }
-        return reusedResult.setResultIfNotRetract(merged);
-    } else {  // 单条记录
-        if (topLevelKv == null && initialKv.isAdd()) {
-            reusedResult.addChangelog(replace(reusedAfter, INSERT, initialKv));
-        }
-        return reusedResult.setResultIfNotRetract(initialKv);
-    }
+if (topLevelKv == null) {                        // 无历史
+    if (merged.isAdd()) addChangelog(INSERT, merged);
+} else if (!merged.isAdd()) {                     // 有历史 + 结果是删
+    addChangelog(DELETE, topLevelKv);
+} else if (!valueEqualiser.equals(topLevelKv.value(), merged.value())) { // 有历史 + 值变
+    addChangelog(UPDATE_BEFORE, topLevelKv);
+    addChangelog(UPDATE_AFTER, merged);
 }
+return reusedResult.setResultIfNotRetract(merged);
 ```
 
-**`topLevelKv` 的含义**: 来自 maxLevel(最高层)的记录，代表上一次 Full Compaction 的结果。只有该层级的记录被视为"旧值"。
+两个要点：① **只有 maxLevel 的记录算"旧值"**——其它层是中间态不算；② **`setResultIfNotRetract`**：full compaction 必 dropDelete，但 MergeFunction 可能返回 DELETE，此方法确保 DELETE 不作为数据输出（只当 changelog 参考）。
 
-**`setResultIfNotRetract` 的作用**: Full Compaction 时 dropDelete 总是 true，但 MergeFunction 可能返回 DELETE 类型的结果。此方法确保 DELETE 结果不被作为数据输出(只作为 changelog 的参考)。
+### 9.3 LookupChangelogMergeFunctionWrapper：lookup 产 changelog
 
-### 10.3 LookupChangelogMergeFunctionWrapper
+**源码**：`LookupChangelogMergeFunctionWrapper.java`，配合 §8.3。它包的是 `LookupMergeFunction`（§5）：
 
-**源码路径**: `paimon-core/.../compact/LookupChangelogMergeFunctionWrapper.java`
-
-**设计目的**: 通过 lookup 历史数据来实时生成 changelog。
-
-关键方法:
 ```java
-@Override
 public ChangelogResult getResult() {
-    // 1. 从 LookupMergeFunction 中获取高层记录
-    KeyValue highLevel = mergeFunction.pickHighLevel();
-    boolean containLevel0 = mergeFunction.containLevel0();
-
-    // 2. 如果没有高层记录，通过 lookup 函数查询
-    if (highLevel == null) {
+    KeyValue highLevel = mergeFunction.pickHighLevel();      // 先看候选里有无高层记录
+    if (highLevel == null) {                                 // 没有就 lookup
         T lookupResult = lookup.apply(mergeFunction.key());
         if (lookupResult != null) {
-            if (lookupStrategy.deletionVector) {
-                // DV 模式: 获取文件名和行位置，标记删除
+            if (lookupStrategy.deletionVector)               // DV 模式：标记旧记录位置为删
                 deletionVectorsMaintainer.notifyNewDeletion(fileName, rowPosition);
-            }
             highLevel = extractKeyValue(lookupResult);
-            mergeFunction.insertInto(highLevel, comparator);  // 插入到候选中参与合并
+            mergeFunction.insertInto(highLevel, comparator); // 插回候选参与合并
         }
     }
-
-    // 3. 计算合并结果
     KeyValue result = mergeFunction.getResult();
-
-    // 4. 只在有 Level-0 记录且配置产生 changelog 时生成
-    reusedResult.reset();
-    if (containLevel0 && lookupStrategy.produceChangelog) {
-        setChangelog(highLevel, result);
-    }
+    if (containLevel0 && lookupStrategy.produceChangelog)    // 仅含 L0 且要 changelog 才产
+        setChangelog(highLevel, result);                     // before=highLevel, after=result
     return reusedResult.setResult(result);
 }
 ```
 
-**`setChangelog` 逻辑**:
-```java
-private void setChangelog(@Nullable KeyValue before, KeyValue after) {
-    if (before == null || !before.isAdd()) {
-        if (after.isAdd()) {
-            reusedResult.addChangelog(replaceAfter(INSERT, after));     // 新增
-        }
-    } else {
-        if (!after.isAdd()) {
-            reusedResult.addChangelog(replaceBefore(DELETE, before));   // 删除
-        } else if (valueEqualiser == null || !valueEqualiser.equals(before.value(), after.value())) {
-            reusedResult.addChangelog(replaceBefore(UPDATE_BEFORE, before)); // 更新前
-            reusedResult.addChangelog(replaceAfter(UPDATE_AFTER, after));    // 更新后
-        }
-    }
-}
-```
+`setChangelog(before, after)` 按 before/after 的 isAdd 与值是否相等产 INSERT / DELETE / UPDATE_BEFORE+AFTER（逻辑与 §9.2 同构）。
 
-**序列号比较器的构造**: Lookup 模式中需要按正确的顺序将 lookup 到的记录插入候选列表:
-```java
-private Comparator<KeyValue> createSequenceComparator(@Nullable FieldsComparator userDefinedSeqComparator) {
-    if (userDefinedSeqComparator == null) {
-        return Comparator.comparingLong(KeyValue::sequenceNumber);
-    }
-    return (o1, o2) -> {
-        int result = userDefinedSeqComparator.compare(o1.value(), o2.value());
-        if (result != 0) return result;
-        return Long.compare(o1.sequenceNumber(), o2.sequenceNumber());
-    };
-}
-```
+两个要点：① **lookup 与 DV 复用同一次查询**——查到旧记录既用于 changelog 对比，又标记其物理位置删除（§8.3 协同）；② lookup 回来的记录要按序列号插回候选（`createSequenceComparator`：先比用户序列字段、再比系统 sequenceNumber），保证合并顺序正确。
 
-### 10.4 FirstRowMergeFunctionWrapper
+### 9.4 FirstRowMergeFunctionWrapper：first-row 专用，仅产 INSERT
 
-**源码路径**: `paimon-core/.../compact/FirstRowMergeFunctionWrapper.java`
-
-**设计目的**: 为 FirstRow 引擎生成 changelog (仅 INSERT)。
+**源码**：`FirstRowMergeFunctionWrapper.java`，配合 §3.4。
 
 ```java
-@Override
 public ChangelogResult getResult() {
-    reusedResult.reset();
     KeyValue result = mergeFunction.getResult();
-
-    if (mergeFunction.containsHighLevel) {
-        // 有高层记录说明 key 已存在 -> 不生成 changelog
+    if (mergeFunction.containsHighLevel)          // 候选含高层 → key 已存在 → 不产 changelog
         return reusedResult.setResult(result);
-    }
-
-    if (contains.test(result.key())) {
-        // lookup 发现更高层已有此 key -> 不生成 changelog，且不输出结果
-        return reusedResult;  // 空结果(null result)
-    }
-
-    // 全新的 key -> 生成 INSERT changelog
-    return reusedResult.setResult(result).addChangelog(result);
+    if (contains.test(result.key()))              // lookup 发现更高层已有 → 不产、且不输出
+        return reusedResult;                       // 空结果
+    return reusedResult.setResult(result).addChangelog(result); // 全新 key → 产 INSERT
 }
 ```
 
-**`contains` 函数**: 通过 `LookupLevels.lookup()` 检查更高层是否存在此 key。返回 `Boolean`(而非 `KeyValue`)，因为 FirstRow 只关心 key 是否存在，不关心具体值。这大大减少了 lookup 的数据传输量。
+**关键设计：`contains` 返回 `Boolean` 而非 `KeyValue`**。first-row 只关心"这个 key 在更高层是否已存在"，不关心值，所以 lookup 只传 boolean——数据传输量比 §9.3 的 KeyValue lookup 小得多。这呼应 §5 中"first-row 不套 LookupMergeFunction、走专用 wrapper"的设计。
 
 ---
 
-## 11. CompactRewriter 体系
+## 10. CompactRewriter 体系
 
-### 11.1 继承层次
+**定位**：CompactRewriter 是 compaction 时"读多个 SortedRun → 用 §9 的 Wrapper 合并 → 写数据文件 +（可选）changelog 文件"的执行器。它用**模板方法模式**把"骨架流程相同、判断条件不同"的 full/lookup changelog 统一起来——这就是 §8 的四种 producer 在 compaction 端的落地。
+
+### 10.1 继承层次
 
 ```mermaid
 classDiagram
@@ -2553,7 +854,7 @@ classDiagram
     ChangelogMergeTreeRewriter <|-- LookupMergeTreeCompactRewriter
 ```
 
-### 11.2 ChangelogMergeTreeRewriter
+### 10.2 ChangelogMergeTreeRewriter
 
 **源码路径**: `paimon-core/.../compact/ChangelogMergeTreeRewriter.java`
 
@@ -2608,7 +909,7 @@ protected enum UpgradeStrategy {
 }
 ```
 
-### 11.3 FullChangelogMergeTreeCompactRewriter
+### 10.3 FullChangelogMergeTreeCompactRewriter
 
 **源码路径**: `paimon-core/.../compact/FullChangelogMergeTreeCompactRewriter.java`
 
@@ -2623,7 +924,7 @@ protected MergeFunctionWrapper<ChangelogResult> createMergeWrapper(int outputLev
 }
 ```
 
-### 11.4 LookupMergeTreeCompactRewriter
+### 10.4 LookupMergeTreeCompactRewriter
 
 **源码路径**: `paimon-core/.../compact/LookupMergeTreeCompactRewriter.java`
 
@@ -2685,11 +986,13 @@ protected List<DataFileMeta> notifyRewriteCompactAfter(List<DataFileMeta> files)
    - 创建 `FirstRowMergeFunctionWrapper`
    - lookup 仅返回 `Boolean`(key 是否存在)
 
+**收益与代价**：模板方法让新增 changelog 模式只需实现 `rewriteChangelog`/`upgradeStrategy`/`createMergeWrapper` 三个钩子，避免复制"读-合并-写"骨架；upgrade 策略把"能只改 level 就不重写文件"的优化（如 deduplicate 无序列字段、输出到 maxLevel）做到了细粒度，省下大量 compaction IO。代价是 lookup 路径要额外维护 lookupLevels / dvMaintainer / remoteLookupFileManager，复杂度明显高于 full。
+
 ---
 
-## 12. 跨分区更新
+## 11. 跨分区更新
 
-### 12.1 判定条件
+### 11.1 判定条件
 
 **源码路径**: `paimon-api/.../schema/TableSchema.java` (第 200 行)
 
@@ -2714,7 +1017,9 @@ if (crossPartitionUpdate) {
 }
 ```
 
-### 12.2 GlobalIndexAssigner 机制
+### 11.2 GlobalIndexAssigner 机制
+
+> 跨分区更新与 BucketMode（KEY_DYNAMIC）的关系详见 `01` §10.3、CDC 集成详见 `14`；本节聚焦它对 merge 语义的影响。
 
 **源码路径**: `paimon-core/.../crosspartition/GlobalIndexAssigner.java`
 
@@ -2741,238 +1046,40 @@ if (crossPartitionUpdate) {
 **为什么使用 RocksDB 而非内存 Map?** 全局索引可能非常大(全表所有主键的映射)，内存放不下。RocksDB 提供了磁盘 + 缓存的混合存储，支持大规模索引。
 
 **配置参数**:
-- `cross-partition-upsert.index-ttl`: 索引条目的过期时间，防止索引无限增长 (源码路径: `CoreOptions.java` 第 1800 行)
-- `cross-partition-upsert.bootstrap-parallelism`: 启动时初始化索引的并行度 (源码路径: `CoreOptions.java` 第 1809 行)
+- `cross-partition-upsert.index-ttl`: 索引条目的过期时间，防止索引无限增长（`CoreOptions.java:1824`，已修正）
+- `cross-partition-upsert.bootstrap-parallelism`: 启动时初始化索引的并行度（`CoreOptions.java:1833`，已修正）
 
-**Schema 校验约束** (源码路径: `SchemaValidation.java` 第 563 行):
-```java
-if (schema.crossPartitionUpdate()) {
-    // 跨分区更新场景不能使用 sequence.field
-    // 因为全局索引无法保证不同分区间的序列号有序性
-}
-```
+**Schema 校验约束**（`SchemaValidation.java`）：跨分区更新场景不能使用 `sequence.field`——全局索引无法保证不同分区间的序列号有序性。这也呼应 §7：跨分区的乱序问题靠全局索引而非 sequence-group 解决。
 
-**好处**: 使 Paimon 能够支持分区变更(如用户从城市 A 搬到城市 B)等业务场景，这是许多其他数据湖格式不支持的能力。代价是需要维护额外的全局索引，启动时需要 bootstrap(从已有数据构建索引)。
+**好处**: 使 Paimon 能支持分区变更（如用户从城市 A 搬到城市 B）等业务场景，这是许多其他数据湖格式不支持的能力。代价是需要维护额外的全局索引，启动时需要 bootstrap（从已有数据构建索引），大表首次启动有明显延迟。
 
 ---
 
-## 13. SortMergeReader 体系
+## 12. SortMergeReader 多路归并
 
-### 解决什么问题
+> 多路归并是 merge engine 在**读路径和 compaction**的共同前置（§1.4）：它把 N 个有序 SortedRun 按 key 归并成单流，再逐 key 喂给 MergeFunction(Wrapper)。LSM/Compaction 基础详见 `01` §5；这里只讲归并算法本身。
 
-**核心业务问题**: LSM-Tree 的 Compaction 需要将多个有序文件(SortedRun)合并为一个有序文件。如何高效地进行多路归并排序？
+**① 要解决什么问题**：compaction/读取常涉及十几到几十个有序文件（L0 多个 + 高层各一），需按 key 有序地多路归并，且不能一次性把所有数据读进内存（会 OOM）。
 
-**没有这个设计的后果**:
-- 简单的顺序读取会导致大量随机 I/O，性能极差
-- 内存中一次性加载所有数据会导致 OOM
-- 不同路数的归并性能差异巨大，无法适应不同场景
+**② 两种实现，按 `sort-engine` 选**（`SortMergeReader.createSortMergeReader`）：
 
-**实际场景**:
-```
-场景1: Level-0 有 10 个文件，Level-1 有 5 个文件，需要合并
-- 15 路归并，每个文件 100MB
-- 如果顺序读取: 需要 15 次完整扫描，I/O 成本极高
-- 使用 SortMergeReader: 每个文件维护一个迭代器，通过堆/败者树选择最小元素
+| 维度 | MinHeap | LoserTree（默认）|
+|---|---|---|
+| 数据结构 | `PriorityQueue`（对象引用堆）| 败者树（连续数组）|
+| 单次 pop 比较 | O(log n) | O(log n)，但比较次数更少、更稳定 |
+| Cache 友好性 | 较差（指针跳转）| 较好（数组连续）|
+| batch | 多 batch，可渐进释放内存 | 单 batch，一次处理完 |
+| 比较器方向 | `compare(e1, e2)` | **`compare(e2, e1)`（反向）** |
 
-场景2: 大规模 Compaction，50 个文件参与合并
-- 50 路归并，如果用最小堆，每次 pop 需要 O(log 50) 次比较
-- 如果用败者树，同样是 O(log 50)，但败者树的数组结构对 CPU Cache 更友好
+默认 `LOSER_TREE`（`CoreOptions.SORT_ENGINE` 默认值，`CoreOptions.java:603`，已核对）。原因：败者树数组结构对现代 CPU cache 更友好，多路归并是 compaction 关键路径，比较更省。
 
-场景3: 内存受限场景，无法一次性加载所有数据
-- 使用批处理机制，每次只加载一个 batch 到内存
-- 处理完一个 batch 后释放内存，再加载下一个 batch
-```
+**③ 排序键三段式**（MinHeap 比较器 `SortMergeReaderWithMinHeap.java:56`）：先按**用户 key** → 再按**用户定义序列字段**（若有）→ 最后按**系统 sequenceNumber**。这保证同 key 的版本按时间有序进入 MergeFunction，合并语义才成立。
 
-### 有什么坑
+**④ 防 OOM：MergeSorter**（`mergetree/MergeSorter.java`）在 SortMergeReader 之上加 spill——参与合并的数据超内存阈值时先落磁盘临时排序文件再归并，避免大规模 compaction OOM。
 
-**误区陷阱**:
-1. **MinHeap 的批处理误解**: MinHeap 实现是分批处理的，不是一次性处理所有数据
-2. **LoserTree 的内存占用**: LoserTree 一次性加载所有数据，内存占用高于 MinHeap
-3. **比较器方向的混淆**: LoserTree 的比较器方向是反的(e2, e1)，容易搞错
-4. **路数过多的性能**: 路数超过 100 时，归并性能会显著下降
+**⑤ 风险/陷阱**：① 归并路数越多峰值内存/比较越多，靠 compaction 策略（`num-sorted-run.*`，详见 `01` §1.3 陷阱 7）控制；② LoserTree 比较器方向是反的（`compare(e2,e1)`），自定义时极易写反；③ key 是复合主键时每次比较多字段，用代码生成比较器避免反射。
 
-**错误使用示例**:
-```java
-// 错误1: 误以为 MinHeap 一次性加载所有数据
-// 实际上 MinHeap 是分批处理的，每个 reader 一次只读一个 batch
-
-// 错误2: 在内存受限场景使用 LoserTree
-// LoserTree 一次性加载所有数据，可能导致 OOM
-// 应该使用 MinHeap 的批处理机制
-
-// 错误3: 比较器方向搞反
-// MinHeap: (e1, e2) -> compare(e1.key, e2.key)
-// LoserTree: (e1, e2) -> compare(e2.key, e1.key)  // 注意是反的!
-
-// 错误4: 路数过多时未优化
-// 100 路归并时，每次 pop 需要 O(log 100) ≈ 7 次比较
-// 考虑先做部分合并，减少路数
-```
-
-**生产环境注意事项**:
-1. **路数的选择**: 路数越多，归并开销越大。建议通过 compaction 策略控制路数在 20 以内
-2. **内存配置**: LoserTree 模式需要更多内存，MinHeap 模式可以渐进释放
-3. **CPU Cache 优化**: LoserTree 对 CPU Cache 更友好，但需要 CPU 支持
-4. **批大小配置**: MinHeap 的 batch 大小影响内存占用和 I/O 效率
-
-**性能陷阱**:
-```java
-// 陷阱1: 路数过多
-// 50 路归并，每次 pop 需要 O(log 50) ≈ 6 次比较
-// 如果每秒处理 100 万条记录，需要 600 万次比较
-// 解决方案: 优化 compaction 策略，减少路数
-
-// 陷阱2: 比较器开销大
-// 如果 key 是复合主键(如 3 个字段)，每次比较需要比较 3 个字段
-// 解决方案: 使用代码生成的比较器，避免反射
-
-// 陷阱3: 对象创建开销
-// 每次 pop 都创建新的 Element 对象
-// 解决方案: 对象复用机制
-
-// 陷阱4: I/O 批大小不合理
-// batch 太小: I/O 次数多，开销大
-// batch 太大: 内存占用高，可能 OOM
-// 解决方案: 根据内存和 I/O 特性调整 batch 大小
-```
-
-### 核心概念解释
-
-**SortMergeReader (排序合并读取器)**:
-- 定义: 将多个有序的 RecordReader 合并为一个有序的输出流
-- 接口: `readBatch()` 读取一个批次, `RecordIterator` 迭代批次中的记录
-- 两种实现: MinHeap(最小堆) 和 LoserTree(败者树)
-
-**MinHeap (最小堆)**:
-- 定义: 使用 Java PriorityQueue 实现的最小堆
-- 特点: 分批处理，可以渐进释放内存
-- 时间复杂度: O(log n) per pop，n 是路数
-- 空间复杂度: O(n + batch_size)
-
-**LoserTree (败者树)**:
-- 定义: 使用数组实现的败者树
-- 特点: 一次性处理所有数据，对 CPU Cache 友好
-- 时间复杂度: O(log n) per pop，n 是路数
-- 空间复杂度: O(n + total_records)
-
-**批处理机制 (MinHeap)**:
-```
-readBatch() --> 返回一个 RecordIterator
-  ↓
-迭代器遍历当前 batch 的所有记录
-  ↓
-batch 耗尽后，调用 releaseBatch() 释放内存
-  ↓
-下次调用 readBatch() 加载新的 batch
-```
-
-**败者树原理**:
-```
-败者树是一种特殊的完全二叉树:
-- 叶子节点: 各路输入的当前元素
-- 内部节点: 存储"败者"(较大的元素)
-- 根节点: 存储最终的败者
-- 胜者: 不在树中，直接输出
-
-优势: 每次调整只需要 O(log n) 次比较，且访问模式对 Cache 友好
-```
-
-**MergeSorter (合并排序器)**:
-- 定义: 在 SortMergeReader 之上增加 spill 机制
-- 用途: 当数据量超过内存阈值时，先 spill 到磁盘，再从磁盘归并
-- 防止: 大规模 Compaction 时的 OOM
-
-**与其他系统对比**:
-| 特性 | Paimon | RocksDB | LevelDB | HBase |
-|------|--------|---------|---------|-------|
-| **归并算法** | MinHeap/LoserTree | MinHeap | MinHeap | MinHeap |
-| **批处理** | 支持 | 不支持 | 不支持 | 支持 |
-| **Spill 机制** | 支持 | 不需要 | 不需要 | 支持 |
-| **可配置** | 是 | 否 | 否 | 否 |
-
-### 设计理念
-
-**为什么这样设计**:
-1. **两种算法可选**: MinHeap 和 LoserTree 各有优势，提供选择让用户根据场景优化
-2. **批处理机制**: MinHeap 的批处理可以渐进释放内存，避免 OOM
-3. **对象复用**: 通过对象复用减少 GC 压力，提高吞吐量
-4. **Spill 机制**: MergeSorter 的 spill 机制防止大规模 Compaction 时的 OOM
-
-**权衡取舍**:
-- **MinHeap vs LoserTree**: MinHeap 内存占用低但 Cache 不友好，LoserTree Cache 友好但内存占用高
-- **批处理 vs 一次性**: 批处理可以渐进释放内存，但增加了 I/O 次数
-- **性能 vs 复杂度**: LoserTree 性能更好，但实现复杂度高于 MinHeap
-
-**架构演进**:
-```
-v0.1: 只支持 MinHeap
-  ↓
-v0.3: 增加批处理机制
-  ↓
-v0.5: 增加 LoserTree 实现
-  ↓
-v0.7: 增加 MergeSorter 的 spill 机制
-  ↓
-v1.0: 优化对象复用机制
-  ↓
-v1.2: 默认使用 LoserTree
-  ↓
-v1.5: 优化 LoserTree 的 Cache 友好性
-```
-
-**业界对比**:
-- **RocksDB**: 只使用 MinHeap，不支持 LoserTree
-- **LevelDB**: 只使用 MinHeap，实现较简单
-- **HBase**: 使用 MinHeap + 批处理，类似 Paimon 的 MinHeap 实现
-- **Paimon**: 提供 MinHeap 和 LoserTree 两种选择，是业界最灵活的设计
-
-**性能对比**:
-```
-测试场景: 20 路归并，每路 1000 万条记录
-
-MinHeap:
-- 吞吐量: 50 万条/秒
-- 内存占用: 500 MB (批处理)
-- CPU Cache Miss: 15%
-
-LoserTree:
-- 吞吐量: 65 万条/秒 (+30%)
-- 内存占用: 800 MB (一次性加载)
-- CPU Cache Miss: 8% (-47%)
-
-结论: LoserTree 性能更好，但内存占用更高
-```
-
-**典型配置**:
-```sql
--- 配置1: 默认 LoserTree (推荐)
-CREATE TABLE orders (
-    order_id BIGINT PRIMARY KEY NOT ENFORCED,
-    status STRING
-) WITH (
-    'sort-engine' = 'loser-tree'  -- 默认值
-);
-
--- 配置2: 内存受限场景使用 MinHeap
-CREATE TABLE large_table (
-    id BIGINT PRIMARY KEY NOT ENFORCED,
-    data STRING
-) WITH (
-    'sort-engine' = 'min-heap'  -- 内存占用低
-);
-
--- 配置3: 调整 MergeSorter 的 spill 阈值
-CREATE TABLE events (
-    event_id BIGINT PRIMARY KEY NOT ENFORCED,
-    event_data STRING
-) WITH (
-    'sort-spill-threshold' = '128mb'  -- spill 阈值
-);
-```
-
----
-
-### 13.1 MinHeap 实现
+### 12.1 MinHeap 实现
 
 **源码路径**: `paimon-core/.../compact/SortMergeReaderWithMinHeap.java`
 
@@ -3019,7 +1126,7 @@ while (!minHeap.isEmpty() && userKeyComparator.compare(key, minHeap.peek().kv.ke
 }
 ```
 
-### 13.2 LoserTree 实现
+### 12.2 LoserTree 实现
 
 **源码路径**: `paimon-core/.../compact/SortMergeReaderWithLoserTree.java`
 
@@ -3069,100 +1176,33 @@ public T next() throws IOException {
 }
 ```
 
-### 13.3 选择策略与性能对比
+### 12.3 工厂入口
 
-**源码路径**: `paimon-core/.../compact/SortMergeReader.java`
+`SortMergeReader.createSortMergeReader`（`SortMergeReader.java`）按 `sort-engine` 二选一：
 
 ```java
-static <T> SortMergeReader<T> createSortMergeReader(..., SortEngine sortEngine) {
-    switch (sortEngine) {
-        case MIN_HEAP:  return new SortMergeReaderWithMinHeap<>(...);
-        case LOSER_TREE: return new SortMergeReaderWithLoserTree<>(...);
-    }
+switch (sortEngine) {
+    case MIN_HEAP:   return new SortMergeReaderWithMinHeap<>(...);
+    case LOSER_TREE: return new SortMergeReaderWithLoserTree<>(...);
 }
 ```
 
-通过 `sort-engine` 配置:
-
-| 特性 | MinHeap | LoserTree |
-|------|---------|-----------|
-| **数据结构** | PriorityQueue(动态数组堆) | 败者树(固定数组) |
-| **比较次数** | O(log n) per pop | O(log n) per pop |
-| **Cache 友好性** | 较差(对象引用跳转) | 较好(数组连续内存) |
-| **批处理** | 多 batch(可渐进释放内存) | 单 batch(一次性处理) |
-| **内存占用** | 动态，可渐进释放 | 固定，一次性分配 |
-| **默认** | 否 | **是(默认)** |
-
-**为什么默认选择 LoserTree?** 败者树的数组结构对 CPU Cache 更友好，在多路归并场景下有更稳定的性能表现。Paimon 作为数据湖格式，Compaction 是性能关键路径，选择更高效的归并算法有显著收益。
-
-**MergeSorter 的角色** (源码路径: `paimon-core/.../mergetree/MergeSorter.java`):
-
-MergeSorter 在 SortMergeReader 之上增加了一层: 当参与合并的 SortedRun 数据量超过内存阈值时，先将数据 spill 到磁盘的临时排序文件，再从磁盘文件进行归并。这防止了大规模 Compaction 时的 OOM。
+两者算法复杂度同为 O(log n)/pop，选型差异（cache 友好性、batch 策略、默认值）见 §12 开头对比表。MergeSorter 的 spill 角色见 §12 第④点。
 
 ---
 
-## 14. 设计决策总结
+## 13. 设计决策总结
 
-### 14.1 策略模式 + 装饰器模式的双重运用
+| 决策点 | 选择 | 取舍 / 代价 | 收益 |
+|---|---|---|---|
+| 合并语义如何解耦 | MergeFunction 策略模式 + MergeFunctionWrapper 装饰器模式 | 概念多、学习曲线陡 | 4 引擎 × 4 changelog 组合只需 4+4 个类，而非 16 个 |
+| 高吞吐下的 GC | MergeFunction 内部复用 `KeyValue`/`GenericRow` | "引用安全"成隐性契约，第三个 add 覆盖第一个（§2.2）| 显著降 GC、提 compaction 吞吐 |
+| 聚合算子扩展 | `FieldAggregator` + Java SPI 注册 | 多一层工厂发现 | 用户加 JAR 即扩展自定义聚合，不改源码（OCP）|
+| 多源乱序 | partial-update 的字段级 sequence-group | 配置复杂、每组建比较器/聚合器 | 每源独立序列控制各自列，业界独有能力 |
+| retract 是否精确 | 分函数实现（sum/collect 可逆；max/min 不可逆抛异常）+ ignore-retract 装饰器 | 不可逆函数遇 DELETE 要么不精确要么整行删 | 可逆函数精确回撤；不可逆函数可显式降级 |
+| changelog 延迟 vs 成本 | none / input / full-compaction / lookup 四档 | 配错引擎×producer 会得到错的 changelog（input 仅 dedup 准）| 从批到流全覆盖，lookup 兼顾低延迟与准确 |
+| 多路归并算法 | 默认 LoserTree（可切 MinHeap）| LoserTree 单 batch 内存占用偏高 | 数组结构 cache 友好，compaction 关键路径更省 |
+| 跨分区 upsert | RocksDB 全局索引 + GlobalIndexAssigner | 维护额外索引、启动需 bootstrap | 支持分区变更（用户搬家改城市分区）等其它格式不支持的场景 |
+| compaction + changelog 复用 | `ChangelogMergeTreeRewriter` 模板方法 | lookup 路径要额外维护 lookupLevels/dvMaintainer | 新增 changelog 模式只实现三个钩子，骨架复用 |
 
-**决策**: MergeFunction 用策略模式，MergeFunctionWrapper 用装饰器模式。
-
-**为什么**: 合并语义(Deduplicate/PartialUpdate/Aggregation/FirstRow)和变更日志生成(None/Full/Lookup)是两个正交维度。策略模式让合并语义可替换，装饰器模式让 changelog 行为可叠加。
-
-**好处**: 4 种 MergeEngine x 4 种 Changelog 模式的组合，只需 4+4 个类实现而非 4x4=16 个类。代码量大幅减少，扩展性极强。
-
-### 14.2 对象复用与零拷贝
-
-**决策**: MergeFunction 内部大量复用对象(如 `KeyValue reused`, `GenericRow row`)。
-
-**为什么**: Compaction 是高吞吐量操作，处理数百万甚至数十亿条记录。每条记录创建新对象会导致严重的 GC 压力。
-
-**好处**: 显著降低 GC 开销，提高 Compaction 吞吐量。代价是代码复杂度增加(需要注意对象引用安全性，参见 MergeFunction 的 JavaDoc 注释)。
-
-### 14.3 SPI 机制的聚合函数扩展
-
-**决策**: 聚合函数通过 Java SPI (`FieldAggregatorFactory`) 注册，而非硬编码。
-
-**为什么**: Paimon 作为通用数据湖格式，不同用户有不同的聚合需求。内置函数无法覆盖所有场景(如特定业务的自定义统计量)。
-
-**好处**: 用户可以实现自定义聚合函数，打成 JAR 包放入 classpath 即可使用，无需修改 Paimon 源码。这遵循了开放-封闭原则(OCP)。
-
-### 14.4 Sequence Group 的精细化控制
-
-**决策**: PartialUpdate 引擎支持 Sequence Group，每组列有独立的序列号。
-
-**为什么**: 多源宽表拼接场景中，不同源的更新频率和时序不同，全局序列号无法解决乱序问题。例如源 A 每秒更新一次，源 B 每分钟更新一次，如果用全局序列号，源 A 的旧数据可能覆盖源 B 的新数据。
-
-**好处**: 每个源系统用自己的序列号控制自己负责的列，互不干扰。配合聚合函数(如 SUM)还能在 Partial Update 中实现部分字段的预聚合。
-
-### 14.5 Lookup vs Full Compaction 的权衡
-
-**决策**: 提供两种 changelog 生成策略: Full Compaction(高延迟低成本)和 Lookup(低延迟高成本)。
-
-**为什么**: 不同业务对延迟和成本的容忍度不同。金融场景需要秒级 changelog，而离线报表可以容忍分钟级延迟。
-
-**好处**: 用户可以根据业务需求在延迟和成本之间做取舍。生产环境中，大多数流式场景选择 Lookup 模式以获得低延迟 changelog。
-
-### 14.6 LoserTree 作为默认排序引擎
-
-**决策**: 默认使用 LoserTree 而非 MinHeap 进行多路归并。
-
-**为什么**: 败者树的数组结构对现代 CPU 的缓存层次更友好，在路数较多时性能优势明显。LSM-Tree 的 Compaction 通常涉及多个 SortedRun 的归并，路数可达数十甚至上百。
-
-**好处**: Compaction 性能提升(取决于路数和数据分布)。代价是实现复杂度略高于 MinHeap。
-
-### 14.7 跨分区更新的全局索引
-
-**决策**: 通过基于 RocksDB 的全局索引实现跨分区 Upsert。
-
-**为什么**: 当主键不包含分区键时，同一主键可能出现在不同分区。没有全局索引就无法知道记录之前在哪个分区，也就无法生成正确的 DELETE 记录来清理旧分区的数据。
-
-**好处**: 使 Paimon 能够支持分区变更(如用户从城市 A 搬到城市 B)等业务场景。代价是需要维护额外的全局索引，启动时需要从已有数据 bootstrap 构建索引，有一定的启动延迟。
-
-### 14.8 模板方法模式在 CompactRewriter 中的应用
-
-**决策**: `ChangelogMergeTreeRewriter` 使用模板方法模式定义 Compaction 骨架。
-
-**为什么**: Full Compaction changelog 和 Lookup changelog 的整体流程相同(读取 -> 合并 -> 写数据文件 + changelog 文件)，但判断条件和具体 Wrapper 不同。
-
-**好处**: 避免代码重复，子类只需关注差异化逻辑。新增 changelog 模式只需继承 `ChangelogMergeTreeRewriter` 并实现三个抽象方法。
+**贯穿全篇的一条主线**：merge engine 把"同 key 多版本如何折叠"做成可插拔策略，changelog 把"折叠的前后状态如何记录"做成正交装饰，聚合把"单字段如何累计"做成可扩展 SPI——三层正交解耦，是 Paimon 能用一套 LSM 同时承载去重/拼接/聚合/首行四种语义的根本原因。

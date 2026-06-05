@@ -1,0 +1,405 @@
+---
+title: "文件索引"
+sidebar_position: 8
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# 文件索引 {#file-index}
+
+定义 `file-index.${index_type}.columns` 后，Paimon 会为每个文件创建其对应的索引文件。如果索引文件
+太小，它会被直接存储在 manifest（清单）文件中，或存储在数据文件所在的目录中。每个数据文件
+对应一个索引文件，该索引文件具有独立的文件定义，并且可以包含跨多个列的不同类型的索引。
+
+## 索引文件 {#index-file}
+
+文件索引的文件格式。把所有列与偏移量放在文件头（header）中。
+
+<pre>
+ ______________________________________    _____________________
+|     magic    ｜version｜head length  |
+|--------------------------------------|
+|            column number             |
+|--------------------------------------|
+|   column 1        ｜ index number    |
+|--------------------------------------|
+|  index name 1 ｜start pos ｜length   |
+|--------------------------------------|
+|  index name 2 ｜start pos ｜length   |
+|--------------------------------------|
+|  index name 3 ｜start pos ｜length   |
+|--------------------------------------|            HEAD
+|   column 2        ｜ index number    |
+|--------------------------------------|
+|  index name 1 ｜start pos ｜length   |
+|--------------------------------------|
+|  index name 2 ｜start pos ｜length   |
+|--------------------------------------|
+|  index name 3 ｜start pos ｜length   |
+|--------------------------------------|
+|                 ...                  |
+|--------------------------------------|
+|                 ...                  |
+|--------------------------------------|
+|  redundant length ｜redundant bytes  |
+|--------------------------------------|    ---------------------
+|                BODY                  |
+|                BODY                  |
+|                BODY                  |             BODY
+|                BODY                  |
+|______________________________________|    _____________________
+*
+magic:                            8 bytes long, value is 1493475289347502L, BIG_ENDIAN
+version:                          4 bytes int, BIG_ENDIAN
+head length:                      4 bytes int, BIG_ENDIAN
+column number:                    4 bytes int, BIG_ENDIAN
+column x name:                    var bytes, Java modified-utf-8
+index number:                     4 bytes int (how many column items below), BIG_ENDIAN
+index name x:                     var bytes, Java modified-utf-8
+start pos:                        4 bytes int, BIG_ENDIAN
+length:                           4 bytes int, BIG_ENDIAN
+redundant length:                 4 bytes int (for compatibility with later versions, in this version, content is zero)
+redundant bytes:                  var bytes (for compatibility with later version, in this version, is empty)
+BODY:                             column index bytes + column index bytes + column index bytes + .......
+</pre>
+
+## 索引：布隆过滤器（BloomFilter） {#index-bloomfilter}
+
+可用的配置项有：
+* `file-index.bloom-filter.columns`：指定需要布隆过滤器（bloom filter）索引的列。
+* `file-index.bloom-filter.<column_name>.fpp`：配置误判概率（false positive probability）。
+* `file-index.bloom-filter.<column_name>.items`：配置单个数据文件中预期的不同项数量。
+
+布隆过滤器索引的内容很简单：
+- numHashFunctions 4 bytes int, BIG_ENDIAN
+- bloom filter bytes
+
+该类使用（64 位）long 哈希。仅存储哈希函数的数量（一个整数）和位集（bit set）字节。对于字节类型
+（如 varchar、binary 等）使用 xx hash，对于数值类型则使用[指定的数值哈希算法](http://web.archive.org/web/20071223173210/http://www.concentric.net/~Ttwang/tech/inthash.htm)。
+
+## 索引：位图（Bitmap） {#index-bitmap}
+
+* `file-index.bitmap.columns`：指定需要位图（bitmap）索引的列。
+* `file-index.bitmap.<column_name>.index-block-size`：配置二级索引块大小，默认值为 16kb。
+
+<Tabs groupId="bitmap">
+
+<TabItem value="v2" label="V2">
+
+位图文件索引格式（V2）：
+
+<pre>
+
+Bitmap file index format (V2)
++-------------------------------------------------+-----------------
+｜ version (1 byte) = 2                           ｜
++-------------------------------------------------+
+｜ row count (4 bytes int)                        ｜
++-------------------------------------------------+
+｜ non-null value bitmap number (4 bytes int)     ｜
++-------------------------------------------------+
+｜ has null value (1 byte)                        ｜
++-------------------------------------------------+
+｜ null value offset (4 bytes if has null value)  ｜       HEAD
++-------------------------------------------------+
+｜ null bitmap length (4 bytes if has null value) ｜
++-------------------------------------------------+
+｜ bitmap index block number (4 bytes int)        ｜
++-------------------------------------------------+
+｜ value 1 | offset 1                             ｜
++-------------------------------------------------+
+｜ value 2 | offset 2                             ｜
++-------------------------------------------------+
+｜ ...                                            ｜
++-------------------------------------------------+
+｜ bitmap body offset (4 bytes int)               ｜
++-------------------------------------------------+-----------------
+｜ bitmap index block 1                           ｜
++-------------------------------------------------+
+｜ bitmap index block 2                           ｜  INDEX BLOCKS
++-------------------------------------------------+
+｜ ...                                            ｜
++-------------------------------------------------+-----------------
+｜ serialized bitmap 1                            ｜
++-------------------------------------------------+
+｜ serialized bitmap 2                            ｜
++-------------------------------------------------+  BITMAP BLOCKS
+｜ serialized bitmap 3                            ｜
++-------------------------------------------------+
+｜ ...                                            ｜
++-------------------------------------------------+-----------------
+
+index block format:
++-------------------------------------------------+
+｜ entry number (4 bytes int)                     ｜
++-------------------------------------------------+
+｜ value 1 | offset 1 | length 1                  ｜
++-------------------------------------------------+
+｜ value 2 | offset 2 | length 2                  ｜
++-------------------------------------------------+
+｜ ...                                            ｜
++-------------------------------------------------+
+
+value x:                       var bytes for any data type (as bitmap identifier)
+offset:                        4 bytes int (when it is negative, it represents that there is only one value
+                                 and its position is the inverse of the negative value)
+length:                        4 bytes int
+  
+</pre>
+
+</TabItem>
+
+<TabItem value="v1-legacy" label="V1（旧版）">
+
+（旧版）位图文件索引格式（V1）：
+
+你可以配置 `file-index.bitmap.<column_name>.version` 来使用旧版的位图版本 1。
+
+<pre>
+
+Bitmap file index format (V1)
++-------------------------------------------------+-----------------
+| version (1 byte)                                |
++-------------------------------------------------+
+| row count (4 bytes int)                         |
++-------------------------------------------------+
+| non-null value bitmap number (4 bytes int)      |
++-------------------------------------------------+
+| has null value (1 byte)                         |
++-------------------------------------------------+
+| null value offset (4 bytes if has null value)   |       HEAD
++-------------------------------------------------+
+| value 1 | offset 1                              |
++-------------------------------------------------+
+| value 2 | offset 2                              |
++-------------------------------------------------+
+| value 3 | offset 3                              |
++-------------------------------------------------+
+| ...                                             |
++-------------------------------------------------+-----------------
+| serialized bitmap 1                             |
++-------------------------------------------------+
+| serialized bitmap 2                             |
++-------------------------------------------------+       BODY
+| serialized bitmap 3                             |
++-------------------------------------------------+
+| ...                                             |
++-------------------------------------------------+-----------------
+*
+value x:                       var bytes for any data type (as bitmap identifier)
+offset:                        4 bytes int (when it is negative, it represents that there is only one value
+                                 and its position is the inverse of the negative value)
+</pre>
+
+</TabItem>
+
+</Tabs>
+
+所有整数均为 BIG_ENDIAN。
+
+位图仅支持以下数据类型：TinyIntType、SmallIntType、IntType、BigIntType、DateType、TimeType、
+LocalZonedTimestampType、TimestampType、CharType、VarCharType、StringType、BooleanType。
+
+## 索引：范围位图（Range Bitmap） {#index-range-bitmap}
+
+优势：
+1. 比位图索引更小。
+2. 适用于高基数（high cardinality）场景下的点查询与范围查询。
+3. 可用于优化 AND/OR 谓词。（相应的列需要具有位图索引或范围位图索引。）
+4. 可用于优化 topk/bottomk 查询。（目前仅适用于 Append 表（追加表）。）
+
+不足：
+1. 点查询的求值速度可能比位图索引慢。
+
+可用的配置项：
+* `file-index.range-bitmap.columns`：指定需要范围位图（range-bitmap）索引的列。
+* `file-index.range-bitmap.<column_name>.chunk-size`：配置 chunk 大小，默认值为 16kb。
+
+表支持使用范围位图文件索引来优化 `EQUALS`、`RANGE`、`AND/OR` 和 `TOPN` 谓词。位图与范围位图文件索引的结果会被合并并下推到 DataFile，用于过滤 rowgroup 和 page。
+
+在以下查询示例中，`class_id` 和 `score` 已创建了范围位图文件索引。而分区键 `dt` 不是必需的。
+
+**优化 `EQUALS` 谓词：**
+```sql
+SELECT * FROM TABLE WHERE dt = '20250801' AND score = 100;
+
+SELECT * FROM TABLE WHERE dt = '20250801' AND score IN (60, 80);
+```
+
+**优化 `RANGE` 谓词：**
+```sql
+SELECT * FROM TABLE WHERE dt = '20250801' AND score > 60;
+
+SELECT * FROM TABLE WHERE dt = '20250801' AND score < 60;
+```
+
+**优化 `AND/OR` 谓词：**
+```sql
+SELECT * FROM TABLE WHERE dt = '20250801' AND class_id = 1 AND score < 60;
+
+SELECT * FROM TABLE WHERE dt = '20250801' AND class_id = 1 AND score < 60 OR score > 80;
+```
+
+**优化 `TOPN` 谓词：**
+
+目前，`TOPN` 谓词优化不能与其他谓词一起使用，并且仅在 Apache Spark 中支持。
+```sql
+SELECT * FROM TABLE WHERE dt = '20250801' ORDER BY score ASC LIMIT 10;
+
+SELECT * FROM TABLE WHERE dt = '20250801' ORDER BY score DESC LIMIT 10;
+
+-- if there are multiple sort keys, the first sort key must be created with range-bitmap.
+SELECT * FROM TABLE WHERE dt = '20250801' ORDER BY score ASC, col DESC LIMIT 10;
+SELECT * FROM TABLE WHERE dt = '20250801' ORDER BY score DESC, col ASC LIMIT 10;
+```
+
+<pre>
+Range Bitmap file index format (V1)
++-------------------------------------------------+-----------------
+| header length (4 bytes int)                     |
++-------------------------------------------------+
+| version (1 byte)                                |
++-------------------------------------------------+
+| row number (4 bytes int)                        |
++-------------------------------------------------+
+| cardinality (4 bytes int)                       |       HEAD
++-------------------------------------------------+
+| min value                                       |
++-------------------------------------------------+
+| max value                                       |
++-------------------------------------------------+
+| dictionary length (4 bytes int)                 |
++-------------------------------------------------+-----------------
+| dictionary serialize in bytes                   |
++-------------------------------------------------+       BODY
+| bit-slice index bitmap serialize in bytes       |
++-------------------------------------------------+-----------------
+</pre>
+
+<pre>
+Dictionary format (V1)
++-------------------------------------------------+-----------------
+| header length (4 bytes int)                     |
++-------------------------------------------------+
+| version (1 byte)                                |
++-------------------------------------------------+
+| the chunks size (4 bytes int)                   |       HEAD
++-------------------------------------------------+    
+| the offsets length (4 bytes int)                |       
++-------------------------------------------------+
+| the chunks length (4 bytes int)                 |
++-------------------------------------------------+-----------------
+| offsets serialize in bytes                      |
++-------------------------------------------------+
+| chunks serialize in bytes                       |       BODY
++-------------------------------------------------+
+| keys serialize in bytes                         |
++-------------------------------------------------+-----------------
+</pre>
+
+<pre>
+Bit-slice index bitmap format (V1)
++-------------------------------------------------+-----------------
+| header length (4 bytes int)                     |
++-------------------------------------------------+
+| version (1 byte)                                |
++-------------------------------------------------+
+| slices size (4 bytes int)                       |       HEAD
++-------------------------------------------------+    
+| existence bitmap length (4 bytes int)           |       
++-------------------------------------------------+
+| indexes length (4 bytes int)                    |
++-------------------------------------------------+
+| indexes serialize in bytes                      |
++-------------------------------------------------+-----------------
+| existence bitmap serialize in bytes             |
++-------------------------------------------------+
+| the bit 0 bitmap serialize in bytes             |
++-------------------------------------------------+
+| the bit 1 bitmap serialize in byte              |       BODY
++-------------------------------------------------+
+| the bit 2 bitmap serialize in byte              |
++-------------------------------------------------+
+| ...                                             |
++-------------------------------------------------+-----------------
+</pre>
+
+RangeBitmap 仅支持以下数据类型：TinyIntType、SmallIntType、IntType、BigIntType、DateType、TimeType、LocalZonedTimestampType、TimestampType、CharType、VarCharType、StringType、BooleanType、DoubleType、FloatType。
+
+## 索引：位切片索引位图（Bit-Slice Index Bitmap） {#index-bit-slice-index-bitmap}
+
+:::warning
+
+已弃用。请改用范围位图（range-bitmap）索引。
+
+:::
+
+BSI 文件索引是一种数值范围索引，用于加速范围查询，它可以与位图索引配合使用。
+
+定义 `'file-index.bsi.columns'`。
+
+BSI 文件索引格式（V1）：
+
+<pre>
+BSI file index format (V1)
++-------------------------------------------------+
+| version (1 byte)                                |
++-------------------------------------------------+
+| row count (4 bytes int)                         |
++-------------------------------------------------+
+| has positive value (1 byte)                     |
++-------------------------------------------------+
+| positive BSI serialized (if has positive value) |       
++-------------------------------------------------+
+| has negative value (1 byte)                     |
++-------------------------------------------------+
+| negative BSI serialized (if has negative value) |       
++-------------------------------------------------+
+</pre>
+
+BSI 序列化格式（V1）：
+<pre>
+BSI serialized format (V1)
++-------------------------------------------------+
+| version (1 byte)                                |
++-------------------------------------------------+
+| min value (8 bytes long)                        |
++-------------------------------------------------+
+| max value (8 bytes long)                        |
++-------------------------------------------------+
+| serialized existence bitmap                     |       
++-------------------------------------------------+
+| bit slice bitmap count (4 bytes int)            |
++-------------------------------------------------+
+| serialized bit 0 bitmap                         |
++-------------------------------------------------+
+| serialized bit 1 bitmap                         |
++-------------------------------------------------+
+| serialized bit 2 bitmap                         |
++-------------------------------------------------+
+| ...                                             |
++-------------------------------------------------+
+</pre>
+
+BSI 仅支持以下数据类型：TinyIntType、SmallIntType、IntType、BigIntType、DateType、LocalZonedTimestamp、
+TimestampType、DecimalType。

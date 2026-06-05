@@ -1,493 +1,214 @@
-# Apache Paimon Catalog 与元数据管理深度分析
+# Catalog 与元数据管理：源码专家手册
 
-> 基于 Paimon 1.5-SNAPSHOT 源码分析，commit: 55f4fd175
-> 分析日期: 2026-04-21
+> 版本：Apache Paimon 1.5-SNAPSHOT
+> 源码模块：`paimon-api`（Catalog 接口、Identifier、Snapshot、TableSchema、SchemaChange、REST auth）、`paimon-core`（AbstractCatalog / FileSystemCatalog / CachingCatalog / RESTCatalog、SchemaManager、SnapshotManager、TagManager、BranchManager、manifest、operation/commit）、`paimon-common`（RESTTokenFileIO、FileIO 原子写、HintFileUtils）
+> 更新日期：2026-06-03
+
+**一句话定位。** Catalog 子系统是 Paimon 元数据的"控制面"——它把"库 / 表 / 分区 / 快照 / 标签 / 分支"这些逻辑对象，落到文件系统目录、Hive Metastore、JDBC 库或远端 REST Server 上，并通过**乐观并发控制**（文件原子创建 + 重试退避，或服务端仲裁）保证多写并发安全。它的两个设计支柱是：（1）**文件即元数据**——Schema / Snapshot / Manifest 全是 JSON 或自描述二进制文件，无需"读-改-写"整块元数据；（2）**装饰器 + SPI**——`PrivilegedCatalog → CachingCatalog → {FileSystem|Hive|Jdbc|REST}Catalog` 链式叠加，由 `CatalogFactory` 通过 Java SPI 装配。读完这篇你应当能够：改 commit 的冲突检测逻辑、定位"提交反复重试 / 失败"的线上问题、读懂 REST Catalog 的 token 刷新与 PVFS data-token 走向、判断一次 `ALTER TABLE` 为何卡住、知道一次写入到底产生几个 snapshot。
 
 ---
 
 ## 目录
 
-- [一、概述](#一概述)
+- [一、全局架构与数据流](#一全局架构与数据流)
 - [二、Catalog 接口体系](#二catalog-接口体系)
-  - [2.1 类层次结构](#21-类层次结构)
-  - [2.2 Catalog 接口定义](#22-catalog-接口定义)
-  - [2.3 AbstractCatalog 抽象基类](#23-abstractcatalog-抽象基类)
-  - [2.4 FileSystemCatalog 实现](#24-filesystemcatalog-实现)
-  - [2.5 DelegateCatalog 委托模式](#25-delegatecatalog-委托模式)
-  - [2.6 CachingCatalog 缓存装饰器](#26-cachingcatalog-缓存装饰器)
-  - [2.7 CatalogFactory SPI 加载机制](#27-catalogfactory-spi-加载机制)
-  - [2.8 Identifier 表标识体系](#28-identifier-表标识体系)
-- [三、Schema 演进机制](#三schema-演进机制)
-  - [3.1 TableSchema 完整字段](#31-tableschema-完整字段)
-  - [3.2 SchemaManager 管理器](#32-schemamanager-管理器)
-  - [3.3 SchemaChange 所有变更类型](#33-schemachange-所有变更类型)
-  - [3.4 乐观锁机制与原子写入](#34-乐观锁机制与原子写入)
-  - [3.5 Schema 存储路径规则](#35-schema-存储路径规则)
-- [四、Snapshot 管理](#四snapshot-管理)
-  - [4.1 Snapshot 完整字段表格](#41-snapshot-完整字段表格)
-  - [4.2 base/delta/changelog 三分法](#42-basedeltachangelog-三分法)
-  - [4.3 CommitKind 提交类型](#43-commitkind-提交类型)
-  - [4.4 SnapshotManager 管理器](#44-snapshotmanager-管理器)
-- [五、Tag 和 Branch 机制](#五tag-和-branch-机制)
-  - [5.1 TagManager 标签管理](#51-tagmanager-标签管理)
-  - [5.2 Tag TTL 机制](#52-tag-ttl-机制)
-  - [5.3 BranchManager 分支管理](#53-branchmanager-分支管理)
-  - [5.4 分支路径规则与文件布局](#54-分支路径规则与文件布局)
-- [六、Manifest 三级结构](#六manifest-三级结构)
-  - [6.1 整体架构](#61-整体架构)
-  - [6.2 ManifestList 清单列表](#62-manifestlist-清单列表)
-  - [6.3 ManifestFileMeta 字段详解](#63-manifestfilemeta-字段详解)
-  - [6.4 ManifestFile 与 ManifestEntry](#64-manifestfile-与-manifestentry)
-  - [6.5 Manifest 写入与读取流程](#65-manifest-写入与读取流程)
-- [七、Commit 流程](#七commit-流程)
-  - [7.1 FileStoreCommitImpl.commit() 完整流程](#71-filestorecommitimplcommit-完整流程)
-  - [7.2 tryCommit 乐观锁重试机制](#72-trycommit-乐观锁重试机制)
-  - [7.3 tryCommitOnce 单次提交详解](#73-trycommitonce-单次提交详解)
-  - [7.4 冲突检测 ConflictDetection](#74-冲突检测-conflictdetection)
-  - [7.5 APPEND/COMPACT 分离提交](#75-appendcompact-分离提交)
-  - [7.6 Overwrite 分区覆写](#76-overwrite-分区覆写)
-- [八、CoreOptions 配置体系](#八coreoptions-配置体系)
-- [九、与 Iceberg 的设计对比](#九与-iceberg-的设计对比)
+  - [2.1 类层次与装配链](#21-类层次与装配链)
+  - [2.2 Catalog 接口契约与能力探测](#22-catalog-接口契约与能力探测)
+  - [2.3 AbstractCatalog 模板方法](#23-abstractcatalog-模板方法)
+  - [2.4 FileSystemCatalog 与原子锁](#24-filesystemcatalog-与原子锁)
+  - [2.5 DelegateCatalog / CachingCatalog](#25-delegatecatalog--cachingcatalog)
+  - [2.6 CatalogFactory SPI 与四种 metastore](#26-catalogfactory-spi-与四种-metastore)
+  - [2.7 Identifier 标识解析](#27-identifier-标识解析)
+- [三、REST Catalog（云原生重点）](#三rest-catalog云原生重点)
+  - [3.1 RESTCatalog 与 RESTApi 分层](#31-restcatalog-与-restapi-分层)
+  - [3.2 认证体系：AuthProvider / Bear / DLF](#32-认证体系authprovider--bear--dlf)
+  - [3.3 DLF 签名与 token 刷新](#33-dlf-签名与-token-刷新)
+  - [3.4 Data Token、RESTTokenFileIO 与 PVFS](#34-data-tokenresttokenfileio-与-pvfs)
+  - [3.5 REST 并发控制与排障](#35-rest-并发控制与排障)
+- [四、Schema 演进机制](#四schema-演进机制)
+  - [4.1 TableSchema 字段与派生量](#41-tableschema-字段与派生量)
+  - [4.2 SchemaManager 与乐观锁 commit](#42-schemamanager-与乐观锁-commit)
+  - [4.3 SchemaChange 类型与生成纯函数](#43-schemachange-类型与生成纯函数)
+  - [4.4 类型变更校验与列映射读取](#44-类型变更校验与列映射读取)
+  - [4.5 Schema 存储路径与回退分支](#45-schema-存储路径与回退分支)
+- [五、Snapshot 管理](#五snapshot-管理)
+  - [5.1 Snapshot 字段表（v3）](#51-snapshot-字段表v3)
+  - [5.2 base/delta/changelog 三分法](#52-basedeltachangelog-三分法)
+  - [5.3 SnapshotManager 与 LATEST hint](#53-snapshotmanager-与-latest-hint)
+  - [5.4 快照过期与去重查询](#54-快照过期与去重查询)
+- [六、Tag 与 Branch](#六tag-与-branch)
+  - [6.1 TagManager 与 Tag TTL](#61-tagmanager-与-tag-ttl)
+  - [6.2 BranchManager 写时复制](#62-branchmanager-写时复制)
+- [七、Manifest 三级结构](#七manifest-三级结构)
+  - [7.1 三级结构与 ObjectsFile](#71-三级结构与-objectsfile)
+  - [7.2 ManifestFileMeta 过滤剪枝](#72-manifestfilemeta-过滤剪枝)
+  - [7.3 ManifestEntry 与合并语义](#73-manifestentry-与合并语义)
+  - [7.4 Manifest 合并时机与策略](#74-manifest-合并时机与策略)
+- [八、Commit 乐观锁全流程](#八commit-乐观锁全流程)
+  - [8.1 commit() 与 APPEND/COMPACT 分离](#81-commit-与-appendcompact-分离)
+  - [8.2 tryCommit 重试退避](#82-trycommit-重试退避)
+  - [8.3 tryCommitOnce 去重与增量冲突检测](#83-trycommitonce-去重与增量冲突检测)
+  - [8.4 ConflictDetection 多层检查](#84-conflictdetection-多层检查)
+  - [8.5 Overwrite 分区覆写](#85-overwrite-分区覆写)
+  - [8.6 提交排障速查](#86-提交排障速查)
+- [九、系统表与 CoreOptions](#九系统表与-coreoptions)
+- [十、与 Iceberg 的设计对比](#十与-iceberg-的设计对比)
+- [十一、设计决策总结](#十一设计决策总结)
 
 ---
 
-## 一、概述
+## 一、全局架构与数据流
 
-Apache Paimon 的 Catalog 体系是整个数据湖管理的核心枢纽。它负责管理数据库、表、视图、分区、快照、标签、分支等所有元数据对象。其设计遵循以下核心原则:
+Paimon 把"元数据"拆成四类持久化对象，每类都是独立文件、独立生命周期：
 
-1. **文件系统即元数据存储**: 默认实现 `FileSystemCatalog` 将所有元数据（Schema、Snapshot、Manifest）直接以文件形式存储在文件系统/对象存储上，不依赖外部数据库，实现零外部依赖的部署模式。
-2. **乐观并发控制**: Schema 演进和 Snapshot 提交均基于文件系统的原子重命名/创建操作实现乐观锁，无需引入分布式锁服务。
-3. **装饰器模式扩展**: 通过 `DelegateCatalog` → `CachingCatalog` 等装饰器链，无侵入地叠加缓存、权限等能力。
-4. **SPI 可插拔**: 通过 `CatalogFactory` SPI 机制支持 FileSystem、REST、Hive 等多种 Catalog 后端。
+| 对象 | 物理形态 | 写入者 | 谁引用它 |
+|---|---|---|---|
+| TableSchema | `schema/schema-{id}`（JSON） | SchemaManager | Snapshot.schemaId、每个 DataFileMeta.schemaId、ManifestFileMeta.schemaId |
+| Snapshot | `snapshot/snapshot-{id}`（JSON） | FileStoreCommitImpl | LATEST hint、Tag、Branch、消费者位点 |
+| ManifestList / ManifestFile | `manifest/*`（自描述二进制 ObjectsFile） | manifestList / manifestFile.write | Snapshot 的三个 manifestList 字段、indexManifest |
+| Tag / Branch | `tag/tag-{name}`、`branch/branch-{name}/...` | TagManager / BranchManager | 用户引用、过期保护 |
+
+控制面（Catalog）只负责"库 / 表的目录结构 + schema 入口"；一旦拿到 `Table` 对象，数据面的读写（Snapshot / Manifest / Commit）就由 `FileStore` 体系接管。装配链如下：
 
 ```
-+------------------------------------------------------+
-|                   计算引擎层                           |
-|  (Flink / Spark / Hive / REST Client)                |
-+------------------------------------------------------+
-              |                          |
-              v                          v
-+------------------------+  +--------------------------+
-| PrivilegedCatalog      |  |                          |
-|   (权限装饰器, 可选)    |  |   RESTCatalog            |
-+------------------------+  |   (REST API 后端)        |
-              |              +--------------------------+
-              v
-+------------------------+
-| CachingCatalog         |
-|   (缓存装饰器)         |
-+------------------------+
-              |
-              v
-+------------------------+     +-----------------------+
-| FileSystemCatalog      |     | HiveCatalog           |
-|   (文件系统后端)       |     |   (Hive Metastore)    |
-+------------------------+     +-----------------------+
-         |           |
-         v           v
-+-------------+  +-----------+
-| SchemaManager|  |SnapshotMgr|
-+-------------+  +-----------+
-         |           |
-         v           v
-+------------------------------------------------------+
-|                    FileIO (文件系统抽象)               |
-|   (HDFS / S3 / OSS / Azure / GCS / Local)            |
-+------------------------------------------------------+
+计算引擎 (Flink / Spark / Hive / pypaimon)
+        │ CatalogFactory.createCatalog(context)
+        ▼
+  PrivilegedCatalog        (权限装饰器, 可选 — privilege/*)
+        │ wrapped
+        ▼
+  CachingCatalog           (Caffeine 缓存装饰器, 默认开启)
+        │ wrapped
+        ▼
+  ┌─────────────┬─────────────┬──────────────┬──────────────┐
+  │FileSystemCat│ HiveCatalog │ JdbcCatalog  │ RESTCatalog  │
+  │(目录即元数据)│(Hive MS)    │(关系库)       │(远端 Server) │
+  └──────┬──────┴──────┬──────┴──────┬───────┴──────┬───────┘
+         │             │             │              │ RESTApi(HTTP)
+         ▼             ▼             ▼              ▼
+   SchemaManager / SnapshotManager / Manifest* / FileStoreCommitImpl
+         │
+         ▼
+   FileIO 抽象 (HDFS / S3 / OSS / 本地 / RESTTokenFileIO 包裹的临时凭证 FileIO)
 ```
+
+注意四处易被误解的边界：
+
+1. **`RESTCatalog` 不继承 `AbstractCatalog`** —— 它直接 `implements Catalog`，因为它几乎所有方法都转发给 `RESTApi` 的 HTTP 调用，模板方法那套校验逻辑由它自己内联（仍调用 `CatalogUtils.checkNotSystemTable` 等静态方法）。`FileSystemCatalog` / `HiveCatalog` / `JdbcCatalog` 才继承 `AbstractCatalog`。
+2. **缓存层在装饰链中间**，所以 REST 也能被 `CachingCatalog` 包裹；但 REST 还有自己内部的 token / FileIO 缓存（见 3.4），两套缓存目标不同——一个缓存逻辑表对象，一个缓存按凭证构造的物理 FileIO。
+3. **数据文件的 FileIO 与元数据 FileIO 可能不同**：REST 模式下元数据走 catalog token，数据文件走每表独立的 data token（`RESTTokenFileIO`）。
+4. **一次写入提交可能产生 0、1 或 2 个 snapshot**：APPEND 与 COMPACT 各自一次提交（见第八章），这是理解 Paimon 提交语义的第一道坎。
+
+**为什么把元数据拆成独立文件而非单块 metadata？** Iceberg / Delta 把 schema、partition spec、快照引用都塞进一个 `metadata.json`（或 `_delta_log`），每次变更要"读整块 + 改 + 写整块"。Paimon 选择拆分：schema 改了只写一个新 `schema-{id}`，快照提交只写一个新 `snapshot-{id}` + 增量 manifest，互不干扰。代价是读取路径要多次 IO（先读 snapshot、再读 manifest list、再读 manifest、再按 schemaId 取 schema），但换来了"每类元数据各自乐观锁、各自演进"的解耦能力，这正是 Paimon 支持高频流式提交的基础。
+
+**读路径数据流（拿到 Table 之后）：**
+
+```
+Table.newReadBuilder()
+  → TableScan.plan()
+      → SnapshotManager.latestSnapshot()        # LATEST hint + 验证(见 5.3)
+      → ManifestList.readDataManifests(snapshot) # base + delta 的 ManifestFileMeta
+      → 用 ManifestFileMeta.partitionStats 按分区谓词剪枝(见 7.2)
+      → ManifestFile.read(meta) 读 ManifestEntry
+      → FileEntry.mergeEntries 合并 ADD/DELETE 得有效文件列表
+      → 按 DataFileMeta.schemaId 取对应 schema 做列映射(见 4.4)
+  → 产出 Split[]
+TableRead.createReader(split) → 读实际数据文件(ORC/Parquet/Avro)
+```
+
+**写路径数据流：**
+
+```
+Table.newBatchWriteBuilder()/newStreamWriteBuilder()
+  → TableWrite.write(row)                        # 缓冲 + 排序 + 落数据文件, 产 CommitMessage
+  → TableCommit.commit(ManifestCommittable)
+      → FileStoreCommitImpl.commit(...)          # 第八章主线
+          → collectChanges 分桶 → tryCommit(APPEND) [+ tryCommit(COMPACT)]
+              → tryCommitOnce: 去重 → 冲突检测 → 构建 Snapshot → 原子写
+```
+
+把这两条链记在脑里，后续每章都是在补这条主干上某个节点的细节。
+
+**贯穿全篇的两个不变式**（看任何细节时回到这两条）：
+
+1. **写永不改旧文件，只追加新文件 + 原子写一个新 snapshot**。schema、manifest、data 都只新增不改；唯一的"切换"动作是原子写 `snapshot-{id+1}`（或 REST 服务端提交）。这让任何写入要么完整生效（新 snapshot 可见）要么完全不可见（新 snapshot 没写成），天然原子。
+2. **读永远从一个确定的 snapshot 出发，向下展开**。snapshot → manifest list → manifest → data，每层靠文件名 / id 引用下一层，按 schemaId 关联 schema。读到哪个 snapshot 就看到哪个一致快照，互不干扰。
+
+乐观锁、精确一次、时间旅行、分支、Tag——全是这两个不变式的推论。后续每个机制若看不懂，回到"它如何维持这两条"通常就能想通。
+
+**index manifest 的位置**：除三个 data manifest list，Snapshot 还有一个 `indexManifest` 字段，指向索引文件清单（Deletion Vector 文件、file index 等的元数据）。它与 data manifest 平行——data manifest 管"哪些数据文件存在"，index manifest 管"这些数据文件附带哪些索引 / 删除向量"。提交时 `indexManifestFile.writeIndexFiles(oldIndexManifest, indexFiles)` 增量更新（复用旧的 + 加新的），与 data manifest 的合并逻辑独立。读取 merge-on-read 表时先读 index manifest 拿到每个数据文件的 DV，再据此跳过被删的行——这是 DV 表读路径多出来的一步，但避免了"删一行重写整文件"的代价。
+
+至此元数据全景：Snapshot 是中枢，向下挂 4 类清单（base / delta / changelog data manifest + index manifest），向上被 LATEST hint / Tag / Branch / 消费者位点引用，横向用 schemaId 关联 schema、用 commitUser/Identifier 支撑精确一次。后续各章逐一拆解这张图的每个节点。
 
 ---
 
 ## 二、Catalog 接口体系
 
-### 解决什么问题
+### ① 要解决什么问题
 
-**核心业务问题：**
-1. **统一的元数据管理入口**：数据湖需要管理数据库、表、分区、快照、标签等多种元数据对象，如果没有统一的抽象层，每个计算引擎（Flink/Spark/Hive）都需要实现自己的元数据管理逻辑，导致重复开发和不一致。
-2. **多种存储后端的适配**：不同的部署场景需要不同的元数据存储方案——小规模场景可以直接用文件系统，企业场景需要集成 Hive Metastore，云原生场景需要 REST API。
-3. **零外部依赖的部署**：传统数据湖（如 Hive）强依赖 MySQL/PostgreSQL 存储元数据，增加了部署复杂度和故障点。
+数据湖要被 Flink / Spark / Hive / Python 多引擎访问，每个引擎都需要"建库建表、改 schema、列分区、管快照 / 标签 / 分支"。若无统一抽象，每个引擎各写一套，必然出现行为不一致（例如 A 引擎允许删主键列、B 引擎不允许；A 把系统表当普通表删掉）。同时部署形态差异巨大：开发机要零依赖（filesystem）、传统数仓要接 Hive、云上要 REST、轻量场景要 JDBC。Catalog 抽象把"做什么"（接口）与"怎么存"（实现）解耦，并用装饰器叠加缓存 / 权限等横切关注点。
 
-**没有这个设计的后果：**
-- 每个计算引擎需要自己实现表的创建、删除、Schema 演进逻辑，代码重复且容易出现不一致
-- 无法在不同的元数据存储后端之间切换，被绑定到特定的基础设施
-- 无法通过装饰器模式灵活地添加缓存、权限控制等横切关注点
+### ② 设计原理与取舍（最重要）
 
-**实际场景：**
+- **模板方法 + 委托双模式并存**：`AbstractCatalog` 用模板方法固化校验与路由（系统库 / 系统表 / 分支拦截、建表类型分派），子类只填 `xxxImpl()`；`DelegateCatalog` 用委托模式做装饰器，二者职责正交。模板方法解决"通用逻辑下沉"，委托模式解决"横切能力叠加"——若只用继承做装饰器会导致组合爆炸（缓存×权限×后端三维组合）。
+- **能力探测而非异常驱动**：不同后端能力天差地别（filesystem 不支持分页 list、不支持 alterDatabase；REST 原生支持分页与版本管理）。用 `supportsListObjectsPaged()` / `supportsVersionManagement()` / `caseSensitive()` 让上层优雅降级，避免到处 try-catch `UnsupportedOperationException`——异常驱动的代价是"用失败来探测能力"，既慢又脏。
+- **接口分组而非扁平大接口**：Database / Table / Partition / 版本管理 / 能力探测五组方法逻辑清晰，但仍在一个接口里（而非拆成多个小接口），是为让装饰器只需实现一个 `wrapped`，避免多接口转发的样板。
+- **取舍**：filesystem 后端简单零依赖，代价是缺数据库属性、缺分页、对象存储下 rename 非原子需外部锁；REST 后端能力最全但引入网络往返与可用性依赖。Paimon 把"默认最简单"作为优先（filesystem 是 default），让上手成本最低。
+
+### ③ 关键源码
+
+能力探测与系统库常量（`paimon-core/.../catalog/Catalog.java:650-1231`）：
+
 ```java
-// 场景1: 开发环境使用本地文件系统
-Map<String, String> options = new HashMap<>();
-options.put("warehouse", "/tmp/paimon");
-options.put("metastore", "filesystem");
-Catalog catalog = CatalogFactory.createCatalog(CatalogContext.create(options));
-
-// 场景2: 生产环境集成 Hive Metastore
-options.put("metastore", "hive");
-options.put("uri", "thrift://hive-metastore:9083");
-Catalog catalog = CatalogFactory.createCatalog(CatalogContext.create(options));
-
-// 场景3: 云原生环境使用 REST Catalog
-options.put("metastore", "rest");
-options.put("uri", "https://catalog-server.example.com");
-Catalog catalog = CatalogFactory.createCatalog(CatalogContext.create(options));
+boolean supportsListObjectsPaged();
+default boolean supportsListByPattern() { ... }
+default boolean supportsListTableByType() { ... }
+boolean supportsVersionManagement();        // Tag/Branch/Snapshot 版本能力
+boolean supportsPartitionModification();
+boolean caseSensitive();
+String SYSTEM_DATABASE_NAME = "sys";        // 保留库名，禁止用户创建
 ```
 
-### 有什么坑
+### ④ 风险/陷阱/边界
 
-**误区陷阱：**
-1. **系统表不能直接 DDL**：尝试 `DROP TABLE my_table$snapshots` 会抛异常。系统表是虚拟的，只能通过原始表操作。
-2. **分支表不能直接 DDL**：尝试 `DROP TABLE my_table$branch_dev` 会失败。分支需要通过 `BranchManager.dropBranch()` 删除。
-3. **FileSystemCatalog 不支持 alterDatabase**：因为文件系统目录没有属性存储能力，尝试修改数据库属性会抛 `UnsupportedOperationException`。
+- 系统表（`my_table$snapshots`）、分支引用（`my_table$branch_dev`）**不能直接 DDL**：`AbstractCatalog` 在 `dropTable` / `createTable` / `renameTable` 入口用 `checkNotSystemTable` / `checkNotBranch` 拦截，抛异常而非静默忽略。删分支必须走 `BranchManager.dropBranch()`。
+- `FileSystemCatalog.alterDatabase()` 抛 `UnsupportedOperationException`——目录无属性存储位。需要库属性请用 hive / jdbc / rest。
+- 对象存储 warehouse 下 `renameTable` 危险：S3 / OSS 的 rename = copy+delete 非原子，大表迁移中途失败会留半态。
+- `caseSensitive()` 在 hive 后端常返回 false（Hive Metastore 库表名大小写不敏感），上层若用大小写区分的名字会撞表——跨后端迁移要先确认这一项。
 
-**错误配置：**
-```java
-// 错误：忘记配置 warehouse
-Map<String, String> options = new HashMap<>();
-options.put("metastore", "filesystem");
-// 缺少 warehouse 配置
-Catalog catalog = CatalogFactory.createCatalog(...); // 抛异常
+### ⑤ 收益与代价
 
-// 错误：在对象存储上使用 renameTable
-options.put("warehouse", "s3://bucket/warehouse");
-catalog.renameTable(from, to); // S3 的 rename 不是原子的，可能导致数据不一致
-```
+收益：单一接口适配四种后端、横切能力可插拔、上层引擎代码与存储解耦、能力降级优雅。代价：抽象层带来一层间接调用与"能力矩阵"心智负担；filesystem 的功能缺口需用文档与异常显式暴露。
 
-**生产环境注意事项：**
-1. **对象存储必须启用锁机制**：S3/OSS 等对象存储的原子操作能力有限，必须配置 `CatalogLockFactory`（如基于 MySQL 的锁）来保证并发安全。
-2. **缓存配置要合理**：`CachingCatalog` 默认启用，但如果多个进程共享同一个 warehouse，缓存过期时间不能太长，否则会读到过期的元数据。
-3. **避免频繁的 invalidateTable**：每次调用都会清空缓存，导致下次访问需要重新读取文件系统，影响性能。
+**Catalog 层排障速查**：
 
-**性能陷阱：**
-```java
-// 陷阱：在循环中反复 getTable
-for (String tableName : catalog.listTables(db)) {
-    Table table = catalog.getTable(Identifier.create(db, tableName));
-    // 如果缓存未启用，每次都会读取文件系统
-}
-
-// 优化：启用缓存并批量操作
-options.put("cache.enabled", "true");
-options.put("cache.expire-after-access", "10min");
-```
-
-### 核心概念解释
-
-**Catalog（目录）：**
-元数据管理的统一接口，类似于关系数据库中的 `INFORMATION_SCHEMA`。它管理数据库、表、分区、快照等所有元数据对象。
-
-**FileSystemCatalog vs HiveCatalog：**
-- **FileSystemCatalog**：将元数据直接存储为文件系统上的文件（JSON 格式），零外部依赖，适合小规模部署和开发环境。
-- **HiveCatalog**：将元数据存储在 Hive Metastore 中，适合已有 Hive 基础设施的企业环境，可以与 Hive 表共存。
-
-**装饰器模式（Decorator Pattern）：**
-通过 `DelegateCatalog` 实现的设计模式，允许在不修改原始 Catalog 的情况下动态添加功能：
-```
-PrivilegedCatalog (权限控制)
-  → CachingCatalog (缓存)
-    → FileSystemCatalog (实际存储)
-```
-
-**SPI（Service Provider Interface）：**
-Java 的插件机制，通过 `META-INF/services/org.apache.paimon.catalog.CatalogFactory` 文件声明实现类，运行时动态加载。这使得用户可以自定义 Catalog 实现而无需修改 Paimon 核心代码。
-
-**Identifier（标识符）：**
-Paimon 中表的完整标识，格式为 `{database}.{table}[$branch_{name}][$systemTable]`。例如：
-- `my_db.my_table` - 普通表
-- `my_db.my_table$snapshots` - 系统表
-- `my_db.my_table$branch_dev` - 分支表
-- `my_db.my_table$branch_dev$files` - 分支的系统表
-
-### 设计理念
-
-**为什么这样设计：**
-
-1. **接口与实现分离**：`Catalog` 接口定义了"做什么"，`FileSystemCatalog`/`HiveCatalog` 定义了"怎么做"。这使得上层代码（Flink/Spark）不需要关心底层存储细节。
-
-2. **模板方法模式**：`AbstractCatalog` 实现了通用逻辑（参数校验、系统表判断），子类只需实现 `xxxImpl()` 方法。这避免了每个实现都重复处理边界条件。
-
-3. **装饰器链的灵活组合**：通过装饰器模式，可以在运行时动态组合功能：
-   ```java
-   // 开发环境：只需基础功能
-   Catalog catalog = new FileSystemCatalog(...);
-   
-   // 生产环境：添加缓存和权限
-   catalog = new CachingCatalog(catalog);
-   catalog = new PrivilegedCatalog(catalog);
-   ```
-
-4. **能力探测而非异常处理**：通过 `supportsListObjectsPaged()`、`supportsVersionManagement()` 等方法，上层代码可以优雅降级，而不是捕获异常：
-   ```java
-   if (catalog.supportsListObjectsPaged()) {
-       // 使用分页 API
-   } else {
-       // 回退到全量列表
-   }
-   ```
-
-**权衡取舍：**
-
-1. **FileSystemCatalog 的简单性 vs 功能限制**：
-   - 优势：零外部依赖，部署简单，适合小规模场景
-   - 劣势：不支持数据库属性、分页列表等高级功能
-
-2. **乐观锁 vs 悲观锁**：
-   - Paimon 选择乐观锁（基于文件原子创建），避免了分布式锁的复杂性
-   - 代价是在高并发场景下可能需要多次重试
-
-3. **缓存一致性 vs 性能**：
-   - `CachingCatalog` 提升了读取性能，但在多进程场景下可能读到过期数据
-   - 通过 `cache.expire-after-access` 配置平衡一致性和性能
-
-**架构演进：**
-
-Paimon 的 Catalog 设计经历了以下演进：
-1. **v0.1-0.3**：只有 FileSystemCatalog，功能简单
-2. **v0.4-0.6**：引入 HiveCatalog，支持企业级部署
-3. **v0.7-0.9**：引入 CachingCatalog 装饰器，优化性能
-4. **v1.0+**：引入 RESTCatalog，支持云原生架构
-
-**业界对比：**
-
-| 特性 | Paimon | Iceberg | Delta Lake |
-|------|--------|---------|------------|
-| 默认 Catalog | FileSystemCatalog | HadoopCatalog | 无独立 Catalog（依赖 Spark） |
-| 零外部依赖 | ✅ | ✅ | ❌（需要 Spark Metastore） |
-| Hive 集成 | ✅ | ✅ | ✅ |
-| REST Catalog | ✅ | ✅ | ❌ |
-| 装饰器模式 | ✅ | ✅ | ❌ |
-
-### 2.1 类层次结构
-
-```
-Catalog (接口, AutoCloseable)
-|-- paimon-core: catalog/Catalog.java
-|
-+-- AbstractCatalog (抽象类)
-|   |-- paimon-core: catalog/AbstractCatalog.java
-|   |
-|   +-- FileSystemCatalog
-|       |-- paimon-core: catalog/FileSystemCatalog.java
-|       |-- 使用 FileIO 直接读写文件系统元数据
-|
-+-- DelegateCatalog (抽象委托类)
-|   |-- paimon-core: catalog/DelegateCatalog.java
-|   |
-|   +-- CachingCatalog
-|   |   |-- paimon-core: catalog/CachingCatalog.java
-|   |   |-- 基于 Caffeine Cache 缓存 Database/Table/Partition/Manifest
-|   |
-|   +-- PrivilegedCatalog
-|       |-- paimon-core: privilege/PrivilegedCatalog.java
-|       |-- 在操作前校验权限
-|
-+-- RESTCatalog
-    |-- paimon-core: rest/RESTCatalog (通过 REST API 与远端 Catalog Server 交互)
-```
-
-**为什么这么设计?**
-
-- `AbstractCatalog` 承载了核心的模板方法（Template Method）模式，将 database/table 的增删改查流程固定，子类只需实现 `xxxImpl()` 方法即可。这避免了每个 Catalog 实现重复处理参数校验、系统表判断等通用逻辑。
-- `DelegateCatalog` 使用了委托模式（Delegate Pattern），将所有方法透传给被包装的 Catalog，子类可以选择性地覆盖感兴趣的方法。这比继承更灵活，支持运行时动态组合。
-- 装饰器链 `PrivilegedCatalog → CachingCatalog → FileSystemCatalog` 的组合在 `CatalogFactory.createCatalog()` 中完成，各层职责单一，易于测试和维护。
-
-### 2.2 Catalog 接口定义
-
-> 源码: `paimon-core/src/main/java/org/apache/paimon/catalog/Catalog.java`
-
-Catalog 接口定义了完整的元数据管理合约，可分为以下几组方法:
-
-**Database 管理:**
-| 方法 | 说明 |
-|---|---|
-| `listDatabases()` | 列出所有数据库名称 |
-| `listDatabasesPaged(maxResults, pageToken, pattern)` | 分页列出数据库 |
-| `createDatabase(name, ignoreIfExists, properties)` | 创建数据库 |
-| `getDatabase(name)` | 获取数据库详情 |
-| `dropDatabase(name, ignoreIfNotExists, cascade)` | 删除数据库 |
-| `alterDatabase(name, changes, ignoreIfNotExists)` | 修改数据库属性 |
-
-**Table 管理:**
-| 方法 | 说明 |
-|---|---|
-| `getTable(identifier)` | 获取表对象（支持系统表 `$` 分隔） |
-| `getTableById(tableId)` | 通过 tableId 获取表 |
-| `listTables(databaseName)` | 列出库下所有表名 |
-| `createTable(identifier, schema, ignoreIfExists)` | 创建表 |
-| `dropTable(identifier, ignoreIfNotExists)` | 删除表 |
-| `renameTable(fromTable, toTable, ignoreIfNotExists)` | 重命名表 |
-| `alterTable(identifier, changes, ignoreIfNotExists)` | 变更表结构 |
-| `invalidateTable(identifier)` | 使缓存失效 |
-
-**Partition 管理:**
-| 方法 | 说明 |
-|---|---|
-| `listPartitions(identifier)` | 列出所有分区 |
-| `listPartitionsPaged(...)` | 分页列出分区 |
-| `markDonePartitions(identifier, partitions)` | 标记分区完成 |
-
-**版本管理（Tag/Branch/Snapshot）:**
-| 方法 | 说明 |
-|---|---|
-| `commitSnapshot(identifier, tableUuid, snapshot, statistics)` | 提交快照 |
-| `loadSnapshot(identifier)` | 加载最新快照 |
-| `createTag(identifier, tagName, snapshotId, timeRetained, ignoreIfExists)` | 创建标签 |
-| `deleteTag(identifier, tagName)` | 删除标签 |
-| `createBranch(identifier, branch, fromTag)` | 创建分支 |
-| `dropBranch(identifier, branch)` | 删除分支 |
-| `fastForward(identifier, branch)` | 快进分支 |
-| `rollbackTo(identifier, instant, fromSnapshot)` | 回滚到某个时间点 |
-
-**能力探测方法（Capabilities）:**
-| 方法 | 说明 |
-|---|---|
-| `supportsListObjectsPaged()` | 是否支持分页列表 |
-| `supportsListByPattern()` | 是否支持模式匹配 |
-| `supportsVersionManagement()` | 是否支持版本管理 |
-| `caseSensitive()` | 是否大小写敏感 |
-
-**为什么用能力探测模式?** 不同的 Catalog 后端能力差异巨大（FileSystem 不支持分页, REST 原生支持），通过能力探测方法让上层框架可以优雅降级，避免了大量的条件判断散布在各处。
-
-### 2.3 AbstractCatalog 抽象基类
-
-> 源码: `paimon-core/src/main/java/org/apache/paimon/catalog/AbstractCatalog.java`
-
-AbstractCatalog 是模板方法模式的核心载体。它实现了 Catalog 接口的所有公共方法，并将具体的存储操作委派给 `xxxImpl()` 抽象方法:
-
-```
-公开方法（含校验逻辑）          抽象方法（子类实现）
----------------------------    -------------------------
-createDatabase()          -->  createDatabaseImpl()
-getDatabase()             -->  getDatabaseImpl()
-dropDatabase()            -->  dropDatabaseImpl()
-alterDatabase()           -->  alterDatabaseImpl()
-listTables()              -->  listTablesImpl()
-createTable()             -->  createTableImpl()
-dropTable()               -->  dropTableImpl()
-renameTable()             -->  renameTableImpl()
-alterTable()              -->  alterTableImpl()
-```
-
-**核心字段:**
-
-| 字段 | 类型 | 说明 |
+| 现象 | 根因 | 处置 |
 |---|---|---|
-| `fileIO` | `FileIO` | 文件系统抽象，用于读写元数据文件 |
-| `tableDefaultOptions` | `Map<String, String>` | 全局表默认配置 |
-| `context` | `CatalogContext` | Catalog 上下文配置 |
+| `UnsupportedOperationException: alterDatabase` | filesystem 后端不支持库属性 | 换 hive / jdbc / rest |
+| `DROP TABLE t$snapshots` 报错 | 系统表不可 DDL | 操作原表，系统表只读 |
+| `DROP TABLE t$branch_dev` 报错 | 分支不可当表删 | 用 `dropBranch` |
+| 读到陈旧元数据 | 多进程共享 warehouse + 缓存未过期 | 调短 `cache.expire-after-write` 或 `invalidateTable` |
+| 对象存储建表 / 改 schema 偶发丢失 | 无原子 rename 未配锁 | hive / jdbc + `lock.enabled=true` |
+| getTable 慢（循环里） | 缓存被频繁 invalidate 或未启用 | 启用缓存、避免循环内 invalidate |
+| 跨后端迁移后表名撞车 | hive 大小写不敏感（`caseSensitive=false`） | 迁移前统一命名规范 |
+| REST getTable 报 403 | token 失效 / 时钟漂移 / 权限不足 | 查刷新日志、校 NTP、查服务端鉴权 |
+| REST 频繁初始化慢 | 每次 new Catalog 都拉 config | 复用 Catalog 实例 |
 
-**关键通用逻辑:**
-
-1. **系统数据库/表检查**: `createDatabase()` 中调用 `checkNotSystemDatabase(name)` 防止创建名为 `sys` 的数据库；`dropTable()` 中调用 `checkNotSystemTable(identifier)` 防止删除系统表。
-
-2. **分支检查**: `dropTable()`, `createTable()`, `renameTable()` 中调用 `checkNotBranch(identifier)` 防止对分支引用直接进行 DDL 操作。
-
-3. **表创建分类**: `createTable()` 根据 `CoreOptions.TYPE` 分派到不同的创建路径:
-   ```java
-   switch (Options.fromMap(schema.options()).get(TYPE)) {
-       case TABLE:
-       case MATERIALIZED_TABLE:
-           createTableImpl(identifier, schema);   // 正常表
-           break;
-       case FORMAT_TABLE:
-           createFormatTable(identifier, schema);  // 纯格式表
-           break;
-       case OBJECT_TABLE:
-           throw new UnsupportedOperationException(...); // 不支持
-   }
-   ```
-
-4. **getTable() 的统一加载**: 通过 `CatalogUtils.loadTable()` 统一处理普通表和系统表的加载，系统表通过 `$` 分隔符自动识别和创建。
-
-5. **锁工厂**: 通过 `lockFactory()` 获取分布式锁（如 Hive MetaStore 锁），在对象存储场景下自动启用锁机制 (`lockEnabled()` 判断 `fileIO.isObjectStore()`)。
-
-**为什么在 AbstractCatalog 层处理系统表判断?** 因为所有 Catalog 实现都需要统一处理系统表的路由逻辑（`$snapshots`, `$schemas` 等），将这一逻辑提升到抽象层避免了各实现的重复代码和潜在不一致。
-
-### 2.4 FileSystemCatalog 实现
-
-> 源码: `paimon-core/src/main/java/org/apache/paimon/catalog/FileSystemCatalog.java`
-
-FileSystemCatalog 是最核心的 Catalog 实现，将元数据完全存储在文件系统上。
-
-**文件系统目录布局:**
+### 2.1 类层次与装配链
 
 ```
-{warehouse}/
-  +-- {database}.db/
-       +-- {table}/
-            +-- schema/
-            |    +-- schema-0    (JSON 格式的 TableSchema)
-            |    +-- schema-1
-            |    +-- ...
-            +-- snapshot/
-            |    +-- snapshot-1  (JSON 格式的 Snapshot)
-            |    +-- snapshot-2
-            |    +-- ...
-            +-- tag/
-            |    +-- tag-{name}  (JSON 格式, 内容同 Snapshot + TTL 信息)
-            +-- branch/
-            |    +-- branch-{name}/
-            |         +-- schema/
-            |         +-- snapshot/
-            |         +-- tag/
-            +-- manifest/
-            |    +-- manifest-list-{uuid}  (ManifestFileMeta 列表)
-            |    +-- manifest-{uuid}       (ManifestEntry 列表)
-            +-- data files...
+Catalog (interface, AutoCloseable)              paimon-core: catalog/Catalog.java
+├─ AbstractCatalog (abstract, 模板方法)          catalog/AbstractCatalog.java
+│   ├─ FileSystemCatalog                         catalog/FileSystemCatalog.java
+│   ├─ HiveCatalog                               paimon-hive
+│   └─ JdbcCatalog                               catalog/JdbcCatalog
+├─ DelegateCatalog (abstract, 委托/装饰器)        catalog/DelegateCatalog.java
+│   ├─ CachingCatalog                            catalog/CachingCatalog.java
+│   └─ PrivilegedCatalog                         privilege/PrivilegedCatalog.java
+└─ RESTCatalog (直接 implements)                 rest/RESTCatalog.java
 ```
 
-**关键实现方法:**
-
-| 方法 | 实现逻辑 |
-|---|---|
-| `listDatabases()` | 列出 `{warehouse}/` 下的 `.db` 结尾的目录 |
-| `getDatabaseImpl()` | 检查 `{warehouse}/{name}.db/` 路径是否存在 |
-| `createDatabaseImpl()` | 创建 `{warehouse}/{name}.db/` 目录 |
-| `dropDatabaseImpl()` | 递归删除 `{warehouse}/{name}.db/` 目录 |
-| `listTablesImpl()` | 列出 `{database}.db/` 下含 `schema/` 子目录的目录 |
-| `loadTableSchema()` | 从 `{table}/schema/` 读取最新 schema 文件 |
-| `createTableImpl()` | 通过 `SchemaManager.createTable()` 写入初始 schema |
-| `dropTableImpl()` | 递归删除表目录及外部路径 |
-| `renameTableImpl()` | 重命名表目录 (`fileIO.rename()`) |
-| `alterTableImpl()` | 通过 `SchemaManager.commitChanges()` 提交 schema 变更 |
-
-**锁机制:**
-
-FileSystemCatalog 的 `createTableImpl()` 和 `alterTableImpl()` 都通过 `runWithLock()` 方法包装，确保在并发场景下的安全性:
-
-```java
-public <T> T runWithLock(Identifier identifier, Callable<T> callable) throws Exception {
-    Optional<CatalogLockFactory> lockFactory = lockFactory();
-    try (Lock lock = lockFactory
-            .map(factory -> factory.createLock(lockContext().orElse(null)))
-            .map(l -> Lock.fromCatalog(l, identifier))
-            .orElseGet(Lock::empty)) {
-        return lock.runWithLock(callable);
-    }
-}
-```
-
-**为什么 FileSystem Catalog 不支持 `alterDatabase()`?** 因为文件系统本身不提供目录级别的属性存储能力。数据库在文件系统上仅表现为一个目录，没有独立的元数据文件来持久化属性。需要属性支持的场景应使用 Hive Catalog 或 REST Catalog。
-
-**为什么 `renameTable` 注释中警告对象存储?** 因为 S3、OSS 等对象存储的 rename 操作并非原子的——它们实际上是 copy + delete，在大表场景下可能只完成了部分文件的迁移就失败了，留下不一致的状态。
-
-### 2.5 DelegateCatalog 委托模式
-
-> 源码: `paimon-core/src/main/java/org/apache/paimon/catalog/DelegateCatalog.java`
-
-DelegateCatalog 是一个抽象类，实现了 Catalog 接口的所有方法，每个方法都简单透传给 `wrapped` 成员:
-
-```java
-public abstract class DelegateCatalog implements Catalog {
-    protected final Catalog wrapped;
-
-    @Override
-    public Table getTable(Identifier identifier) throws TableNotExistException {
-        return wrapped.getTable(identifier);
-    }
-    // ... 其他所有方法同理
-}
-```
-
-它还提供了一个静态工具方法 `rootCatalog()` 来剥去所有装饰器层，获取最底层的 Catalog:
+`DelegateCatalog.rootCatalog()` 静态方法可剥去所有装饰层拿到最底层实现：
 
 ```java
 public static Catalog rootCatalog(Catalog catalog) {
@@ -498,70 +219,199 @@ public static Catalog rootCatalog(Catalog catalog) {
 }
 ```
 
-**为什么不直接用接口默认方法?** 因为 Java 8 的接口默认方法不能访问实例字段 (`wrapped`)。使用抽象类可以持有被委托对象的引用，且子类（如 CachingCatalog）可以选择性覆盖部分方法来插入缓存逻辑，而其余方法自动透传，大幅减少样板代码。
+常用于需要绕过缓存 / 权限直接操作底层的场景（如内部维护工具直接拿 `FileSystemCatalog` 的 `fileIO`）。
 
-### 2.6 CachingCatalog 缓存装饰器
+**为何 `AbstractCatalog` 与 `DelegateCatalog` 并列两条线，而非让装饰器也继承 `AbstractCatalog`？** 因为模板方法的 `xxxImpl()` 假设"我就是真正干活的人"，而装饰器的本质是"我把活转交给 wrapped"。两者的契约根本不同——硬塞进一条继承链会让装饰器被迫实现一堆它本不该实现的 `xxxImpl()`。
 
-> 源码: `paimon-core/src/main/java/org/apache/paimon/catalog/CachingCatalog.java`
+### 2.2 Catalog 接口契约与能力探测
 
-CachingCatalog 继承 DelegateCatalog，在元数据操作上添加基于 Caffeine Cache 的多级缓存:
+> 源码：`paimon-core/.../catalog/Catalog.java`（`interface Catalog extends AutoCloseable`，约 1230 行）
 
-**缓存类型:**
+按职责分组（仅列关键方法，签名以源码为准）：
 
-| 缓存 | 类型 | 说明 |
-|---|---|---|
-| `databaseCache` | `Cache<String, Database>` | 数据库元数据缓存 |
-| `tableCache` | `Cache<Identifier, Table>` | 表对象缓存 |
-| `partitionCache` | `Cache<Identifier, List<Partition>>` | 分区列表缓存（可选，默认不启用） |
-| `manifestCache` | `SegmentsCache<Path>` | Manifest 文件内容缓存 |
-| `dvMetaCache` | `DVMetaCache` | Deletion Vector 元数据缓存（可选） |
+**Database**：`listDatabases()` / `listDatabasesPaged(maxResults, pageToken, namePattern)` / `createDatabase` / `getDatabase` / `dropDatabase(name, ignoreIfNotExists, cascade)` / `alterDatabase`。
 
-**缓存配置项:**
+**Table**：`getTable(identifier)` / `getTableById` / `listTables` / `listTablesPaged` / `createTable` / `dropTable` / `renameTable` / `alterTable(identifier, List<SchemaChange>, ignoreIfNotExists)` / `invalidateTable`。
 
-| 配置键 | 默认值 | 说明 |
-|---|---|---|
-| `cache.enabled` | `true` | 是否启用缓存 |
-| `cache.expire-after-access` | - | 访问后过期时间（必须为正数） |
-| `cache.expire-after-write` | - | 写入后过期时间（必须为正数） |
-| `cache.snapshot-max-num-per-table` | - | 每表最大缓存快照数 |
-| `cache.partition-max-num` | `0` | 最大缓存分区数（0=不缓存） |
-| `cache.manifest-small-file-memory` | - | 小 manifest 文件缓存内存 |
-| `cache.manifest-small-file-threshold` | - | 小文件阈值 |
-| `cache.manifest-max-memory` | - | manifest 最大缓存内存 |
-| `cache.dv-max-num` | - | DV 元数据最大缓存数 |
+**Partition**：`listPartitions` / `listPartitionsPaged` / `markDonePartitions` / `alterPartitions`（受 `supportsPartitionModification()` 约束）。
 
-**缓存失效策略:**
+**版本管理（受 `supportsVersionManagement()` 约束）**：`commitSnapshot(identifier, tableUuid, snapshot, statistics)` / `loadSnapshot` / `createTag` / `deleteTag` / `createBranch` / `dropBranch` / `fastForward` / `rollbackTo`。
 
-CachingCatalog 在所有写操作后主动失效相关缓存:
+**能力探测**：`supportsListObjectsPaged` / `supportsListByPattern` / `supportsListTableByType` / `supportsVersionManagement` / `supportsPartitionModification` / `caseSensitive`。
+
+把 `commitSnapshot` 设计成接口方法是关键——它让"快照提交"可以由服务端做并发仲裁（REST 后端，见 3.5），而 filesystem 后端则靠本地原子文件创建。同理 `createTag` / `createBranch` / `rollbackTo` 进接口，意味着 REST 后端可以把这些版本操作的事务性收敛到服务端，而不必由客户端做多步文件操作（多步操作在网络不可靠时难保原子）。
+
+### 2.3 AbstractCatalog 模板方法
+
+> 源码：`paimon-core/.../catalog/AbstractCatalog.java`
+
+公开方法（含校验）→ 抽象方法（子类实现）的映射：
+
+```
+createDatabase()  → createDatabaseImpl()      dropTable()    → dropTableImpl()
+getDatabase()     → getDatabaseImpl()         renameTable()  → renameTableImpl()
+dropDatabase()    → dropDatabaseImpl()        alterTable()   → alterTableImpl()
+listTables()      → listTablesImpl()          createTable()  → createTableImpl()
+```
+
+核心字段：`fileIO`（读写元数据文件）、`tableDefaultOptions`（全局表默认配置，会在建表时 merge 进表 options）、`context`（CatalogContext）。
+
+核心通用逻辑：
+
+1. **系统库 / 表拦截**：`createDatabase` 调 `checkNotSystemDatabase`（禁止建 `sys`）；`dropTable` 调 `checkNotSystemTable`。
+2. **分支拦截**：DDL 入口调 `checkNotBranch`，防止把 `$branch_x` 当普通表操作。
+3. **建表分派**：按 `CoreOptions.TYPE` 路由——`TABLE` / `MATERIALIZED_TABLE` 走 `createTableImpl`，`FORMAT_TABLE` 走 `createFormatTable`，`OBJECT_TABLE` 在 filesystem 下抛 `UnsupportedOperationException`：
 
 ```java
-// dropTable 后失效该表及其所有分支的缓存
+switch (Options.fromMap(schema.options()).get(TYPE)) {
+    case TABLE:
+    case MATERIALIZED_TABLE:
+        createTableImpl(identifier, schema);    // 正常表/物化表
+        break;
+    case FORMAT_TABLE:
+        createFormatTable(identifier, schema);  // 纯格式表(CSV/Parquet 目录)
+        break;
+    case OBJECT_TABLE:
+        throw new UnsupportedOperationException(...);
+}
+```
+
+4. **getTable 统一加载**：`CatalogUtils.loadTable()` 同时处理普通表与系统表，`$` 分隔的系统表名自动经 `SystemTableLoader` 包装。
+5. **锁开关**：`lockEnabled()` 依据 `fileIO.isObjectStore()` 判断——对象存储默认需要外部锁。
+
+`AbstractCatalog` 还内置了 `CachingFileIO` / `LocalCacheManager` 的支持（其 import 可见），用于对元数据文件 IO 做本地缓存——这与 `CachingCatalog` 缓存逻辑表对象正交，是更底层的"文件字节缓存"。`FactoryUtil` 用于 SPI 发现各类 Factory（CatalogLockFactory、FileIO 等），是模板方法里"按配置装配可插拔组件"的统一入口。
+
+**为何系统表路由要在抽象层？** 所有后端都需统一处理 `$snapshots` / `$schemas` 等路由，提升到抽象层避免各实现各判一遍导致行为漂移（比如某实现漏判 `$audit_log` 就会把它当普通表去文件系统找，得到莫名其妙的"表不存在"）。系统表本身无独立存储——它是对原表 Snapshot / Schema / Manifest 文件的运行时投影（`SystemTableLoader.load` 包装原表的 FileStore），所以"建 / 删系统表"无意义、被拦截。
+
+**建表端到端 trace（filesystem 后端）**，理解每一步在哪个类：
+
+```
+Catalog.createTable(id, schema, ignoreIfExists)
+  → AbstractCatalog.createTable:
+       checkNotSystemTable / checkNotBranch(id)        # 拦截非法目标
+       tableDefaultOptions 合并进 schema.options()     # 注入全局默认
+       按 TYPE 分派 → createTableImpl(id, schema)
+  → FileSystemCatalog.createTableImpl:
+       runWithLock(id, () -> {
+         SchemaManager(fileIO, tablePath).createTable(schema, false)  # 写 schema-0
+       })
+  → SchemaManager.createTable:
+       latest() 若存在 → 抛"已存在"(除非 external)
+       TableSchema.create(0, schema)
+       FileStoreTableFactory.create(...).store()        # 用新 schema 试建表, 校验配置
+       commit(newSchema) → fileIO.tryToWriteAtomic(schema-0)   # 原子落盘
+  → CachingCatalog 包裹层: 建成后下次 getTable 缓存该表对象
+```
+
+注意 `FileStoreTableFactory.create(...).store()` 这步——它在写 schema-0 之前用候选 schema 实际构造一次 `FileStoreTable`，目的是把"bucket / 主键 / 序列字段 / merge-engine 配置互相矛盾"这类错误在建表时就暴露，而非等到第一次写入才崩。
+
+### 2.4 FileSystemCatalog 与原子锁
+
+> 源码：`paimon-core/.../catalog/FileSystemCatalog.java`
+
+目录布局（main 分支）：
+
+```
+{warehouse}/{database}.db/{table}/
+  schema/schema-{id}            # TableSchema JSON
+  snapshot/snapshot-{id}        # Snapshot JSON  + LATEST/EARLIEST hint
+  tag/tag-{name}                # Snapshot JSON (+TTL)
+  branch/branch-{name}/{schema,snapshot,tag}/...
+  manifest/{manifest-list-*, manifest-*, index-manifest-*}
+  bucket-{n}/{data-files}       # 实际数据文件
+```
+
+关键方法实现：`listDatabases` 列 warehouse 下 `.db` 目录；`listTablesImpl` 列 `.db` 下含 `schema/` 子目录的目录；`createTableImpl` 经 `SchemaManager.createTable` 写 schema-0；`alterTableImpl` 经 `SchemaManager.commitChanges` 提交变更；`renameTableImpl` 用 `fileIO.rename`。
+
+**为何"含 schema/ 子目录才算表"**：filesystem 后端没有"表注册表"，只能靠目录约定识别——`{db}.db/` 下的目录若有 `schema/` 子目录就是 Paimon 表，否则是普通目录（如临时目录、其它格式数据）。这也意味着手动 `mkdir foo/schema && cp schema-0 foo/schema/` 就能"恢复"一张被误删元数据但数据文件还在的表——filesystem 后端的元数据可手工修复，这是它运维上的一个隐性优势（REST 则不行，元数据在服务端）。
+
+**manifest 目录文件命名**：`manifest-list-{uuid}-{n}`（ManifestFileMeta 列表）、`manifest-{uuid}-{n}`（ManifestEntry）、`index-manifest-{uuid}-{n}`（DV 等索引）。uuid 保证并发写不撞名，无需协调；这也是为什么 manifest 不复用、靠合并 + 过期清理回收（追加式 uuid 命名天然支持乐观并发）。
+
+`createTableImpl` / `alterTableImpl` 用 `runWithLock()` 包裹——拿到 `CatalogLockFactory`（filesystem 默认无；hive / jdbc 提供）就 `Lock.fromCatalog(...)`，否则 `Lock.empty()`（HDFS 靠原子 rename 即可）：
+
+```java
+public <T> T runWithLock(Identifier identifier, Callable<T> callable) throws Exception {
+    return lockFactory()
+        .map(factory -> factory.createLock(lockContext().orElse(null)))
+        .map(l -> Lock.fromCatalog(l, identifier))
+        .orElseGet(Lock::empty)
+        .runWithLock(callable);
+}
+```
+
+`Lock`（`paimon-core/.../operation/Lock.java`）的 `EmptyLock` 直接 `callable.call()`，`CatalogLockImpl` 则把 `(database, objectName, callable)` 转给 `CatalogLock.runWithLock`——后者实现可能是 Hive MetaStore 锁或 JDBC 行锁。
+
+`Lock` 接口标 `@Public @since 0.4.0`（稳定 API），`fromCatalog(catalogLock, identifier)` 在 catalogLock 为 null 时退回 `EmptyLock`——优雅处理"未配锁"的情形。这层抽象让"加不加锁、用什么锁"对 SchemaManager / FileStoreCommit 透明：它们只管 `runWithLock(callable)`，锁的有无与实现由 Catalog 装配决定。对象存储场景下，正是这把锁把"先 exists 再写"的 TOCTOU 窗口串行化（同一表的并发 DDL / commit 被锁排队），补上原子 rename 缺失的安全性。
+
+**为何 alterDatabase 不支持**：库在 FS 上只是目录，无属性文件可持久化。**为何 rename 警示对象存储**：S3 / OSS 的 rename 非原子（copy+delete），大表迁移中途失败留半态。**为何 filesystem 默认无锁仍安全**：HDFS / 本地 FS 的 rename 是原子的，乐观锁基于"写 `schema-{id}` 已存在则失败"即可，无需外部锁；只有对象存储缺原子语义时才需补锁。
+
+**`tryToWriteAtomic` 的两种实现路径**（这是整个乐观锁的物理基础，值得追到底）：
+
+- **HDFS / 本地**：先写 `{path}.tmp.{uuid}` 临时文件，再 `rename(tmp, path)`；FS 保证 rename 原子且目标已存在则失败，返回 false。
+- **对象存储**：若底层支持条件写（如 S3 的 If-None-Match / OSS 的 x-oss-forbid-overwrite）则用 `putIfAbsent` 语义；否则只能"先 exists 再写"，存在 TOCTOU 窗口，必须配 `CatalogLock` 串行化。这就是 concurrency-control 文档反复强调"对象存储要配 hive/jdbc + lock.enabled"的根因。
+
+判断当前 FileIO 走哪条路径：`fileIO.isObjectStore()`——它同时决定 `AbstractCatalog.lockEnabled()` 是否默认开锁。
+
+### 2.5 DelegateCatalog / CachingCatalog
+
+> 源码：`catalog/DelegateCatalog.java`、`catalog/CachingCatalog.java`
+
+`DelegateCatalog` 持有 `protected final Catalog wrapped`，所有方法默认透传，子类按需覆写：
+
+```java
+public abstract class DelegateCatalog implements Catalog {
+    protected final Catalog wrapped;
+    @Override public Table getTable(Identifier id) throws TableNotExistException {
+        return wrapped.getTable(id);   // 其余方法同理透传
+    }
+}
+```
+
+不用接口默认方法的原因：Java 8 default 方法访问不了实例字段 `wrapped`。
+
+`CachingCatalog` 的多级缓存（基于 shaded Caffeine）：
+
+| 缓存 | 键/值 | 说明 |
+|---|---|---|
+| `databaseCache` | `String → Database` | 库元数据 |
+| `tableCache` | `Identifier → Table` | 表对象（系统表不直接缓存，缓存原表后动态包装） |
+| `partitionCache` | `Identifier → List<Partition>` | 默认关（`cache.partition-max-num=0`） |
+| `manifestCache` | `SegmentsCache<Path>` | 按**内存字节**而非条目数限制，小文件入缓存、大文件直读 |
+| `dvMetaCache` | DV 元数据 | Deletion Vector 元数据（可选） |
+
+系统表缓存的关键技巧——只缓存原表，系统表运行时包装，多个系统表共享一份原表缓存：
+
+```java
+if (identifier.isSystemTable()) {
+    Identifier origin = new Identifier(
+        identifier.getDatabaseName(), identifier.getTableName(),
+        identifier.getBranchName(), null);
+    Table originTable = getTable(origin);                 // 命中原表缓存
+    table = SystemTableLoader.load(
+        identifier.getSystemTableName(), (FileStoreTable) originTable);
+}
+```
+
+写操作后主动失效——`dropTable` 会清掉该表及其所有分支表的缓存条目：
+
+```java
 public void dropTable(Identifier identifier, boolean ignoreIfNotExists) {
     super.dropTable(identifier, ignoreIfNotExists);
     invalidateTable(identifier);
-    // 同时清除所有分支表的缓存
     for (Identifier i : tableCache.asMap().keySet()) {
         if (identifier.getTableName().equals(i.getTableName())
                 && identifier.getDatabaseName().equals(i.getDatabaseName())) {
-            tableCache.invalidate(i);
+            tableCache.invalidate(i);   // 连带分支表缓存一并失效
         }
     }
 }
 ```
 
-**系统表的特殊缓存逻辑:** 系统表（如 `my_table$snapshots`）不会被直接缓存。CachingCatalog 会缓存原始表 `my_table`，然后在 `getTable()` 时动态包装为系统表。这样原始表的缓存可以被多个系统表共用:
+**为何 Manifest 单独用 `SegmentsCache`？** Manifest 是大小悬殊的二进制大文件（几 KB 到几十 MB），普通 KV 缓存按"条目数"限制无法防止内存爆掉；`SegmentsCache` 按字节数限制，并用 `cache.manifest-small-file-threshold`（默认 1MB）决定小文件入缓存、大文件直读。**多进程共享 warehouse 的一致性陷阱**：`CachingCatalog` 是进程内缓存，进程 A 改了 schema，进程 B 的缓存不会自动失效，靠 `cache.expire-after-write`（默认 30min）兜底——共享场景务必把过期时间调短或显式 `invalidateTable`。
 
-```java
-if (identifier.isSystemTable()) {
-    Identifier originIdentifier = new Identifier(
-            identifier.getDatabaseName(), identifier.getTableName(),
-            identifier.getBranchName(), null);
-    Table originTable = getTable(originIdentifier); // 使用缓存
-    table = SystemTableLoader.load(identifier.getSystemTableName(), (FileStoreTable) originTable);
-}
-```
+`SegmentsCache` 缓存的是 manifest 文件**已读入内存的 MemorySegment 序列**（而非反序列化后的对象），命中时直接从内存段反序列化 entry，省去文件 IO。它是 catalog 级而非表级——多张表的 manifest 共用一个按 `cache.manifest-max-memory` 限额的池子，避免某张大表把内存吃光。`dvMetaCache`（Deletion Vector 元数据，限额 `cache.deletion-vectors.max-num` 默认 10 万）同理用于 merge-on-read 表加速 DV 查找。这三个数据级缓存（manifest / DV）与表对象缓存分离，是因为它们的访问模式（大对象、按字节、catalog 级共享）与"逻辑表对象"（小对象、按条目、表级）截然不同。
 
-**创建时机:** `CachingCatalog` 在 `CatalogFactory.createCatalog()` 中通过 `CachingCatalog.tryToCreate()` 按需创建:
+`CachingCatalog` 在 `CatalogFactory.createCatalog` 中按需创建（`cache.enabled` 默认 true）：
 
 ```java
 static Catalog createCatalog(CatalogContext context, ClassLoader classLoader) {
@@ -571,1415 +421,891 @@ static Catalog createCatalog(CatalogContext context, ClassLoader classLoader) {
 }
 ```
 
-**为什么 Manifest 缓存单独用 SegmentsCache?** Manifest 文件是二进制格式的大文件，不适合放入通用的 key-value 缓存。`SegmentsCache` 是一个基于内存大小（而非条目数）进行限制的缓存，支持按文件大小阈值决定是否缓存（小文件缓存、大文件不缓存），更适合处理大小差异悬殊的文件。
+**缓存的过期与失效策略对比**（理解何时该用哪个）：
 
-### 2.7 CatalogFactory SPI 加载机制
+| 机制 | 触发 | 适用 |
+|---|---|---|
+| `expire-after-access`（10min） | 末次访问后计时 | 热表常驻、冷表自然淘汰 |
+| `expire-after-write`（30min） | 写入后计时（硬上限） | 防止多进程下缓存无限陈旧 |
+| 主动 `invalidateTable` | DDL 写操作后 | 本进程改了元数据，立即失效 |
+| `partitionCache` 默认关 | `partition-max-num=0` | 分区数巨大时避免内存爆 |
 
-> 源码: `paimon-core/src/main/java/org/apache/paimon/catalog/CatalogFactory.java`
+**多进程一致性的真实风险与对策**：`expire-after-write` 是"多进程共享 warehouse"下唯一的兜底——进程 A 改 schema、进程 B 缓存的旧表对象最多陈旧 30min。若业务无法容忍这个窗口（如 A 加列后 B 立即要读到），要么调短 write 过期，要么 B 在关键读前显式 `invalidateTable`，要么直接用 REST Catalog（服务端是唯一真相源，缓存可由服务端 ETag / 版本号驱动失效）。
 
-CatalogFactory 是 Paimon 的 SPI 扩展点，继承自 `Factory` 接口，通过 Java SPI（ServiceLoader）机制加载:
+**陷阱：频繁 `invalidateTable` 反成性能杀手**——每次失效都让下次访问回落到文件系统全量加载（读 schema 目录 + 最新 snapshot）。在循环里对每张表 invalidate 再 getTable，相当于关掉了缓存。
+
+**`tableCache` 缓存的是 `Table` 对象（含其内部的 schema / path / FileIO 等），不是数据**——所以缓存命中省的是"加载表定义"的开销（读 schema、建 FileStoreTable），不是省数据读。一张表的 `Table` 对象可被多次 newRead / newWrite 复用；invalidate 后这些引用仍可用（已持有的对象不受影响），只是下次 getTable 会重建。这意味着缓存失效不会打断正在进行的读写——它只影响"下一次从 catalog 取表"。理解这点能避免"以为 invalidate 会中断在跑的查询"的误解。
+
+### 2.6 CatalogFactory SPI 与四种 metastore
+
+> 源码：`catalog/CatalogFactory.java`
 
 ```java
 public interface CatalogFactory extends Factory {
-    // 方式一: 需要 FileIO 和 warehouse 的创建方法
-    default Catalog create(FileIO fileIO, Path warehouse, CatalogContext context);
-
-    // 方式二: 只需 context 的创建方法（如 RESTCatalog）
-    default Catalog create(CatalogContext context);
+    default Catalog create(FileIO fileIO, Path warehouse, CatalogContext ctx);  // 需要 warehouse
+    default Catalog create(CatalogContext ctx);                                  // 自包含(REST)
 }
 ```
 
-**加载流程:**
+装配流程（`createUnwrappedCatalog`）：
 
 ```
-CatalogFactory.createCatalog(context, classLoader)
-    |
-    +-- createUnwrappedCatalog(context, classLoader)
-    |     |
-    |     +-- 从 context 中读取 "metastore" 配置（默认 "filesystem"）
-    |     +-- FactoryUtil.discoverFactory(classLoader, CatalogFactory.class, metastore)
-    |     |     // 使用 Java SPI 发现匹配 identifier 的 CatalogFactory
-    |     +-- 先尝试 catalogFactory.create(context)
-    |     +-- 若 UnsupportedOperationException:
-    |           +-- 读取 warehouse 路径（必须配置）
-    |           +-- 创建 FileIO 并检查/创建 warehouse 目录
-    |           +-- catalogFactory.create(fileIO, warehousePath, context)
-    |
-    +-- CachingCatalog.tryToCreate(catalog, options)  // 包装缓存层（如果启用）
-    +-- PrivilegedCatalog.tryToCreate(catalog, options) // 包装权限层（如果启用）
+读 "metastore" 配置（默认 "filesystem"）
+  → FactoryUtil.discoverFactory(classLoader, CatalogFactory.class, metastore)   // Java SPI
+  → 先试 catalogFactory.create(context)
+  → 抛 UnsupportedOperationException 则：
+       读 warehouse 路径（必须配置，否则报错）
+       创建 FileIO + 检查/创建 warehouse 目录
+       catalogFactory.create(fileIO, warehousePath, context)
 ```
 
-**已知的 CatalogFactory 实现:**
+**官方支持四种 metastore**（旧文仅提三种，已补 `jdbc`）：
 
-| Factory 类 | identifier | 说明 |
-|---|---|---|
-| `FileSystemCatalogFactory` | `"filesystem"` | 默认文件系统 Catalog |
-| `HiveCatalogFactory` | `"hive"` | Hive MetaStore Catalog |
-| `RESTCatalogFactory` | `"rest"` | REST API Catalog |
+| identifier | Factory | 元数据存储 | warehouse 含义 |
+|---|---|---|---|
+| `filesystem`（默认） | FileSystemCatalogFactory | 文件系统目录 | 仓库路径 |
+| `hive` | HiveCatalogFactory | Hive Metastore（+ schema 同步） | 默认用 `hive.metastore.warehouse.dir` |
+| `jdbc` | JdbcCatalogFactory | 关系库（MySQL / Postgres / SQLite） | 仓库路径（数据仍在 FS） |
+| `rest` | RESTCatalogFactory | 远端 REST Server | DLF 下为**实例名**，非路径 |
 
-**为什么有两个 create 方法?** 这是一个向后兼容的设计。早期的 Catalog 实现（如 FileSystemCatalog）需要外部传入 `FileIO` 和 `warehouse`，而新的实现（如 RESTCatalog）完全自包含，只需 `CatalogContext` 即可。两个方法互为 fallback，通过 UnsupportedOperationException 进行分派。
+JDBC catalog 把库表元数据存关系库（`uri`=`jdbc:mysql://...`、`jdbc.user/password`、`catalog-key`），但数据文件仍在 warehouse 指向的 FS 上——它解决的是"要一个轻量的、带行锁的元数据库，但不想上 Hive Metastore"的场景。两个 `create` 方法互为 fallback，是为兼容"需外部 FileIO 的老实现"与"完全自包含的 REST 新实现"——通过 `UnsupportedOperationException` 做分派，避免引入显式的"能力标志"参数。
 
-### 2.8 Identifier 表标识体系
+**程序化创建与使用 Catalog**（来自 `program-api/catalog-api`，三种后端）：
 
-> 源码: `paimon-api/src/main/java/org/apache/paimon/catalog/Identifier.java`
+```java
+// filesystem
+Map<String,String> opts = new HashMap<>();
+opts.put("warehouse", "hdfs:///path/to/warehouse");
+Catalog fs = CatalogFactory.createCatalog(CatalogContext.create(Options.fromMap(opts)));
 
-Identifier 是 Paimon 中标识表/系统表/分支的统一标识符:
+// hive
+opts.put("metastore", "hive"); opts.put("uri", "thrift://hms:9083");
+Catalog hive = CatalogFactory.createCatalog(CatalogContext.create(Options.fromMap(opts)));
+
+// rest (DLF)
+opts.put("metastore", "rest"); opts.put("uri", "https://...dlf.aliyuncs.com");
+opts.put("warehouse", "my_instance_name");      // 注意: 实例名, 非路径
+opts.put("token.provider", "dlf");
+opts.put("dlf.access-key-id", "..."); opts.put("dlf.access-key-secret", "...");
+Catalog rest = CatalogFactory.createCatalog(CatalogContext.create(Options.fromMap(opts)));
+
+// 用法: 增删改查均抛 checked 异常, 必须处理
+catalog.createDatabase("my_db", false);                       // ignoreIfExists=false
+catalog.dropDatabase("my_db", false, true);                   // ignoreIfNotExists, cascade
+boolean exists = catalog.databaseExists("my_db");
+Table table = catalog.getTable(Identifier.create("my_db", "t")); // 普通表
+Table sys   = catalog.getTable(Identifier.create("my_db", "t$snapshots")); // 系统表
+catalog.renameTable(Identifier.create("my_db","t"), Identifier.create("my_db","t2"), false);
+```
+
+`CatalogContext` 承载 options + Hadoop conf + FileIO 偏好；`CatalogFactory.createCatalog` 内部就是 2.6 的装配流程。建议把 Catalog 实例缓存复用（尤其 REST，避免每次 config 往返）。
+
+### 2.7 Identifier 标识解析
+
+> 源码：`paimon-api/.../catalog/Identifier.java`
+
+格式 `{database}.{table}[$branch_{branch}][$systemTable]`。示例：
 
 ```
-格式: {database}.{table}[$branch_{branchName}][$systemTable]
-
-示例:
-  my_db.my_table                         -- 普通表
-  my_db.my_table$snapshots               -- 系统表
-  my_db.my_table$branch_dev              -- 分支表
-  my_db.my_table$branch_dev$snapshots    -- 分支的系统表
+my_db.my_table                        普通表
+my_db.my_table$snapshots              系统表
+my_db.my_table$branch_dev             分支表
+my_db.my_table$branch_dev$snapshots   分支的系统表
 ```
 
-**字段:**
+字段：`database`（库名）、`object`（完整对象名）、`table` / `branch` / `systemTable`（均 `transient` 派生）。`object` 懒解析（`splitObjectName()`，分隔符 `$`）：1 段=普通表；2 段=`table$branch_x` 或 `table$系统表`；3 段=`table$branch_x$系统表`。
 
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `database` | `String` | 数据库名称 |
-| `object` | `String` | 完整的对象名（包含表名、分支、系统表信息） |
-| `table` (transient) | `String` | 解析后的表名 |
-| `branch` (transient) | `String` | 解析后的分支名（null 表示 main） |
-| `systemTable` (transient) | `String` | 解析后的系统表名（null 表示非系统表） |
+**为何用 `$` 而非 `.`**：`.` 已用于 `db.table`；`$` 在 SQL 标识符里合法且少用，`SELECT * FROM t$snapshots` 可直接写。**为何 `table` / `branch` / `systemTable` 设 `transient`**：序列化只传 `database`+`object`（最小信息），跨网络 / 跨进程时由接收端 `splitObjectName` 重新解析——避免序列化冗余且保证解析逻辑单一来源。
 
-`object` 字段的解析通过 `splitObjectName()` 懒加载完成，使用 `$` 作为分隔符:
+**`fullName()` 与系统表判定**：`Identifier.getFullName()` 返回 `database.object`（含 `$` 后缀），用于日志 / 缓存键；`isSystemTable()` 判断 `systemTable != null`，`getSystemTableName()` 取系统表名。分支判定 `getBranchName()` 解析 `$branch_` 前缀。**边界**：分支名嵌在 object 里用 `branch_` 前缀（而非裸分支名），所以 `t$branch_dev` 的分支名是 `dev`，`BRANCH_PREFIX="branch_"` 这个前缀是解析约定——若分支名本身含 `$` 会破坏解析，故 6.2 的 `validateBranch` 禁用特殊字符。
 
-- 1 段: `table` (普通表)
-- 2 段: `table$branch_xxx` 或 `table$systemTable`
-- 3 段: `table$branch_xxx$systemTable`
-
-**为什么用 `$` 作分隔符而不是 `.`?** 因为 `.` 已经被用于 `database.table` 的分隔。`$` 在 SQL 标识符中是合法但不常用的字符，既避免了与表名冲突，又能在 SQL 中直接使用（如 `SELECT * FROM my_table$snapshots`）。
+**为何用 transient + 懒解析 + 缓存于派生字段**：`Identifier` 在 Flink / Spark 里频繁创建、传递、当 Map key。若构造时就解析 object（split 字符串），每个 Identifier 都要做一次字符串操作；而很多 Identifier 创建后只比较 equals（按 database+object）不取 table/branch——懒解析让"只比较不取分量"的场景零解析开销。一旦首次取 `getTableName()` 才解析并缓存到 transient 字段，后续复用。这是"按需计算 + 缓存"在高频小对象上的典型优化。
 
 ---
 
-## 三、Schema 演进机制
+## 三、REST Catalog（云原生重点）
 
-### 解决什么问题
+### ① 要解决什么问题
 
-**核心业务问题：**
-1. **表结构变更的向后兼容性**：业务需求变化时需要添加列、修改列类型、删除列，但已有的数据文件不能重写（成本太高），必须支持新旧 Schema 共存。
-2. **并发 Schema 变更的安全性**：多个用户可能同时修改表结构（如添加不同的列），需要保证变更不会相互覆盖或产生冲突。
-3. **Schema 历史的可追溯性**：需要知道每个数据文件是用哪个版本的 Schema 写入的，以便在读取时正确解析。
+filesystem / hive / jdbc 都把"并发仲裁"压在客户端（原子 rename + 外部锁），在大规模多租户云环境下，这意味着每个客户端都要直连存储并持有长期强凭证——既不安全（凭证泄露面大）也难治理（权限分散在各引擎配置里）。REST Catalog 把元数据控制面收敛到服务端：客户端只发 HTTP，服务端统一做鉴权、并发提交仲裁、对象路径生成（UUID）、按表下发临时数据凭证。好处是客户端轻量、跨语言（pypaimon 也能接）、权限集中、凭证最小化。
 
-**没有这个设计的后果：**
-- 每次 Schema 变更都需要重写所有历史数据，成本极高且不可行
-- 并发变更会导致后提交的覆盖先提交的，丢失变更
-- 无法读取旧版本的数据文件，或者读取时数据错乱
+### ② 设计原理与取舍（最重要）
 
-**实际场景：**
-```java
-// 场景1: 业务需要添加新字段
-// 表中已有 1TB 数据，不可能重写
-ALTER TABLE user_events ADD COLUMN user_age INT;
+- **两段式初始化**：`RESTApi` 构造时先用本地 options 发一次 `GET config?warehouse=...`，把服务端下发的配置 merge 进来（含 token 相关参数与缓存参数），再构建真正的 `restAuthFunction`。这让"服务端控制客户端行为"成为可能——比如服务端可以强制开启 `data-token.enabled`。
+- **认证与签名分离**：`AuthProvider` 只负责"往请求头塞鉴权信息"，具体是静态 Bearer 还是 DLF v4 签名由实现决定；token 的生命周期管理（刷新）也封在 provider 内。新增认证方式只需加一个 `AuthProvider` + SPI Factory，不动 `RESTApi`。
+- **元数据凭证 vs 数据凭证分离**：访问 catalog 用 catalog token（长期一点）；读写表数据文件用服务端按表 / 按操作下发的 **data token**（短期、最小权限），通过 `RESTTokenFileIO` 包裹真实 FileIO。这是"权限最小化"的核心——即使 data token 泄露，也只影响一张表一小段时间。
+- **路径虚拟化**：服务端生成 UUID 物理路径，对用户暴露 `pvfs://catalog/db/table/...` 虚拟路径（PVFS），所有访问过 REST 权限系统，无需另维护一套 FS 权限。
+- **取舍**：引入网络依赖与服务端可用性约束、初始化往返开销、调试链路变长；换来集中鉴权审计、跨语言、UUID 路径隔离、最小权限数据访问。在大型组织里这笔账通常划算。
 
-// 场景2: 两个团队同时修改 Schema
-// 团队A: ALTER TABLE orders ADD COLUMN discount DECIMAL(10,2);
-// 团队B: ALTER TABLE orders ADD COLUMN tax DECIMAL(10,2);
-// 如果没有乐观锁，后提交的会覆盖先提交的
+**REST Catalog 的四个官方设计目标**（overview 文档）落到源码：(1) 技术特定逻辑全在服务端——客户端只发标准 REST，业务定制（如自定义权限、自定义存储后端）封在 server；(2) 解耦架构——客户端与服务端通过良定义的 REST API 交互，可独立演进 / 扩容；(3) 语言无关——任何语言实现的 server 只要遵守 API 即可（pypaimon 客户端就是例证）；(4) 支持任意 catalog 后端——server 背后可以是 DLF、自建元数据库、甚至代理到 Hive，客户端无感。这就是为什么 `RESTApi` 只认 REST 协议、不关心服务端实现——它把"控制面实现自由"作为头等目标，代价是把可用性 / 一致性责任也压到了服务端。
 
-// 场景3: 读取历史数据
-// 数据文件 file-1.parquet 用 schema-0 写入（3列）
-// 数据文件 file-2.parquet 用 schema-1 写入（4列）
-// 查询时需要自动对齐列，缺失的列填充 null
-```
+### ③ 关键源码
 
-### 有什么坑
-
-**误区陷阱：**
-1. **新增列必须可空**：尝试 `ADD COLUMN age INT NOT NULL` 会失败。因为旧数据文件没有这一列，读取时只能填充 null。
-   ```java
-   // 错误
-   SchemaChange.addColumn("age", DataTypes.INT(), null, false); // nullable=false 会抛异常
-   
-   // 正确
-   SchemaChange.addColumn("age", DataTypes.INT(), null, true); // nullable=true
-   ```
-
-2. **不能删除主键或分区键**：尝试 `DROP COLUMN partition_date` 会失败，因为这会破坏表的分区结构。
-   ```java
-   // 错误：删除分区键
-   SchemaChange.dropColumn("partition_date"); // 抛异常
-   ```
-
-3. **类型变更有严格限制**：只能进行"安全"的类型转换（如 INT → BIGINT），不能进行可能丢失精度的转换（如 BIGINT → INT）。
-   ```java
-   // 安全的类型变更
-   SchemaChange.updateColumnType("age", DataTypes.BIGINT()); // INT → BIGINT ✅
-   
-   // 不安全的类型变更
-   SchemaChange.updateColumnType("amount", DataTypes.INT()); // BIGINT → INT ❌
-   ```
-
-**错误配置：**
-```java
-// 错误：在高并发场景下未配置足够的重试次数
-options.put("commit.max-retries", "1"); // 太少，容易失败
-// 正确
-options.put("commit.max-retries", "10");
-```
-
-**生产环境注意事项：**
-1. **Schema 变更需要停写吗？** 不需要。Paimon 的乐观锁机制允许在写入过程中变更 Schema，但可能导致写入重试。
-2. **Schema ID 会回收吗？** 不会。即使删除列，`highestFieldId` 也会持续增长，确保字段 ID 永不重复。
-3. **Schema 文件会被清理吗？** 不会。所有历史 Schema 文件都会保留，因为旧的数据文件可能仍然引用它们。
-
-**性能陷阱：**
-```java
-// 陷阱：频繁的 Schema 变更导致 schema 文件过多
-for (int i = 0; i < 1000; i++) {
-    schemaManager.commitChanges(SchemaChange.setOption("key" + i, "value"));
-    // 每次都会生成新的 schema-{id} 文件
-}
-
-// 优化：批量提交变更
-List<SchemaChange> changes = new ArrayList<>();
-for (int i = 0; i < 1000; i++) {
-    changes.add(SchemaChange.setOption("key" + i, "value"));
-}
-schemaManager.commitChanges(changes); // 只生成一个新 schema 文件
-```
-
-### 核心概念解释
-
-**Schema vs TableSchema：**
-- **Schema**：用户提供的表结构定义（字段、主键、分区键、配置），不包含内部信息。
-- **TableSchema**：持久化的完整表结构，包含 Schema ID、字段 ID、创建时间等内部信息。
-
-**字段 ID（Field ID）：**
-每个字段都有一个全局唯一的 ID，用于在 Schema 演进时追踪字段的身份。即使字段被重命名，ID 也不变。
-```java
-// schema-0: id=0, name="user_id", type=BIGINT
-// schema-1: 重命名字段
-// id=0, name="uid", type=BIGINT  // ID 不变，name 变了
-```
-
-**highestFieldId：**
-已分配的最大字段 ID。删除字段后，ID 不会回收，新字段从 `highestFieldId + 1` 开始分配。这确保了字段 ID 的唯一性。
-
-**SchemaChange：**
-表示一次 Schema 变更操作的抽象，支持多态序列化（用于 REST API）。常见类型：
-- `AddColumn` - 添加列
-- `DropColumn` - 删除列
-- `RenameColumn` - 重命名列
-- `UpdateColumnType` - 修改列类型
-- `SetOption` - 设置表配置
-- `RemoveOption` - 删除表配置
-
-**乐观锁（Optimistic Locking）：**
-不使用分布式锁，而是通过"读取-计算-写入-检查"的方式实现并发控制：
-1. 读取当前最新 Schema（如 schema-5）
-2. 基于 schema-5 计算新 Schema（schema-6）
-3. 尝试原子写入 schema-6
-4. 如果写入失败（别人已经写了 schema-6），回到步骤 1 重试
-
-### 设计理念
-
-**为什么这样设计：**
-
-1. **独立的 Schema 文件而非嵌入 Snapshot**：
-   - 优势：Schema 变更不需要重写 Snapshot，操作更轻量
-   - 优势：多个 Snapshot 可以共享同一个 Schema，节省存储
-   - 劣势：读取时需要额外的 IO 获取 Schema 文件
-
-2. **字段 ID 永不回收**：
-   - 确保了字段身份的唯一性，即使字段被删除后重新添加同名字段，也会分配新的 ID
-   - 避免了"删除列A → 添加列A"导致的数据混淆
-
-3. **乐观锁而非悲观锁**：
-   - 避免了分布式锁的复杂性和性能开销
-   - 在低冲突场景下性能更好
-   - 代价是高冲突场景下需要多次重试
-
-4. **新增列必须可空**：
-   - 这是向后兼容性的必然要求
-   - 旧数据文件没有新列的数据，读取时只能填充 null
-   - 如果允许 NOT NULL，会导致旧数据无法读取
-
-**权衡取舍：**
-
-1. **Schema 文件数量 vs 查询性能**：
-   - 每次变更都生成新文件，导致 schema 目录下文件数量增长
-   - 但查询时只需读取最新的 schema 文件，不影响性能
-   - 历史 schema 文件用于读取旧数据文件
-
-2. **类型变更的安全性 vs 灵活性**：
-   - Paimon 只允许"安全"的类型转换（如 INT → BIGINT）
-   - 这保证了数据不会丢失精度，但限制了灵活性
-   - 如果需要不安全的转换，必须通过 `INSERT OVERWRITE` 重写数据
-
-3. **并发性能 vs 一致性**：
-   - 乐观锁在低冲突场景下性能好，但高冲突场景下会频繁重试
-   - 可以通过配置 `commit.max-retries` 和 `commit.max-retry-wait` 调整
-
-**架构演进：**
-
-Paimon 的 Schema 演进机制经历了以下版本：
-- **v1 (Paimon 0.4-0.6)**：基础的 Schema 演进，支持添加/删除列
-- **v2 (Paimon 0.7-0.8)**：增加了字段 ID 追踪，支持列重命名
-- **v3 (Paimon 0.9+)**：增加了嵌套字段的支持，支持复杂类型的 Schema 演进
-
-**业界对比：**
-
-| 特性 | Paimon | Iceberg | Delta Lake |
-|------|--------|---------|------------|
-| Schema 存储 | 独立文件 (schema-{id}) | 嵌入 metadata.json | 嵌入 _delta_log |
-| 字段 ID | ✅ 永不回收 | ✅ 永不回收 | ❌ 无字段 ID |
-| 并发控制 | 乐观锁（文件原子创建） | 乐观锁（CAS on metadata） | 乐观锁（日志追加） |
-| 类型变更 | 严格限制（安全转换） | 严格限制 | 较宽松 |
-| 嵌套字段 | ✅ 支持 | ✅ 支持 | ✅ 支持 |
-
-### 3.1 TableSchema 完整字段
-
-> 源码: `paimon-api/src/main/java/org/apache/paimon/schema/TableSchema.java`
-
-TableSchema 是表的完整元数据定义，比用户提供的 Schema 多了 ID、版本等内部信息:
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `version` | `int` | Schema 格式版本（当前 v3，Paimon 0.4-0.6=v1, 0.7-0.8=v2, 0.9+=v3） |
-| `id` | `long` | Schema ID，单调递增 |
-| `fields` | `List<DataField>` | 字段列表（不可变） |
-| `highestFieldId` | `int` | 已分配的最大字段 ID（因为删除列后 ID 不会回收） |
-| `partitionKeys` | `List<String>` | 分区键字段名 |
-| `primaryKeys` | `List<String>` | 主键字段名 |
-| `bucketKeys` | `List<String>` | 桶键字段名（派生字段） |
-| `numBucket` | `int` | 桶数量（派生字段，来自 options） |
-| `options` | `Map<String, String>` | 表级配置（CoreOptions） |
-| `comment` | `String` (nullable) | 表注释 |
-| `timeMillis` | `long` | Schema 创建时间戳 |
-
-**关于 `highestFieldId` 的设计:** 当删除列后再添加新列时，新列的字段 ID 从 `highestFieldId + 1` 开始分配，确保 ID 永远不会重复。这对 Schema Evolution（如读取旧数据文件时的列映射）至关重要。
-
-**关于 `bucketKeys` 的派生:** 如果用户未显式指定 `bucket-key` 配置，则默认使用 `primaryKeys`（去掉分区键部分）作为桶键:
+`RESTCatalog implements Catalog`（非 AbstractCatalog），核心字段与构造（`rest/RESTCatalog.java:99-120`）：
 
 ```java
-List<String> tmpBucketKeys = originalBucketKeys(); // 从 options 中读取
-if (tmpBucketKeys.isEmpty()) {
-    tmpBucketKeys = trimmedPrimaryKeys(); // fallback to primary keys
-}
-bucketKeys = tmpBucketKeys;
-```
+public class RESTCatalog implements Catalog {
+    private final RESTApi api;                 // 所有 HTTP 调用的入口
+    private final CatalogContext context;
+    private final boolean dataTokenEnabled;    // 是否启用按表 data token
+    protected final Map<String, String> tableDefaultOptions;
+    @Nullable private final LocalCacheManager cacheManager;  // 本地数据缓存(可选)
 
-**序列化格式:** TableSchema 序列化为 JSON 字符串后写入文件系统。
-
-### 3.2 SchemaManager 管理器
-
-> 源码: `paimon-core/src/main/java/org/apache/paimon/schema/SchemaManager.java`
-
-SchemaManager 是 Schema 的 CRUD 管理器，标注为 `@ThreadSafe`，其核心方法:
-
-| 方法 | 说明 |
-|---|---|
-| `latest()` | 获取最新版本的 TableSchema（扫描 schema 目录，取最大 ID） |
-| `schema(id)` | 读取指定 ID 的 TableSchema |
-| `listAll()` | 列出所有版本的 TableSchema |
-| `listAllIds()` | 列出所有 Schema ID |
-| `createTable(schema)` | 创建新表（写入 schema-0） |
-| `commitChanges(changes)` | 提交 SchemaChange 列表 |
-| `mergeSchema(rowType, allowExplicitCast, ...)` | 合并新 RowType 到当前 Schema |
-| `commit(newSchema)` | 原子写入新 Schema 文件 |
-
-**Schema 文件命名:** `schema-{id}`，例如 `schema-0`, `schema-1`, `schema-2`。
-
-**createTable 的乐观锁流程:**
-
-```java
-public TableSchema createTable(Schema schema, boolean externalTable) throws Exception {
-    while (true) {
-        Optional<TableSchema> latest = latest();
-        if (latest.isPresent()) {
-            // 表已存在
-            if (externalTable) {
-                checkSchemaForExternalTable(latestSchema.toSchema(), schema);
-                return latestSchema;
-            } else {
-                throw new IllegalStateException("Schema in filesystem exists");
-            }
-        }
-        TableSchema newSchema = TableSchema.create(0, schema); // id = 0
-        // 验证: 用新 schema 实际创建 FileStoreTable 来确保配置合法
-        FileStoreTableFactory.create(fileIO, tableRoot, newSchema).store();
-        boolean success = commit(newSchema); // 原子写入
-        if (success) return newSchema;
-        // 如果失败（并发创建），循环重试
+    public RESTCatalog(CatalogContext context) { this(context, true); }
+    public RESTCatalog(CatalogContext context, boolean configRequired) {
+        this.api = new RESTApi(context.options(), configRequired);
+        this.context = CatalogContext.create(api.options(),       // 用 merge 后的 options
+                context.hadoopConf(), context.preferIO(), context.fallbackIO());
+        this.dataTokenEnabled = api.options().get(RESTTokenFileIO.DATA_TOKEN_ENABLED);
+        this.tableDefaultOptions = CatalogUtils.tableDefaultOptions(this.context.options().toMap());
     }
 }
 ```
 
-### 3.3 SchemaChange 所有变更类型
+### ④ 风险/陷阱/边界
 
-> 源码: `paimon-api/src/main/java/org/apache/paimon/schema/SchemaChange.java`
+- `configRequired=true` 时每次 `new RESTCatalog` 都有一次同步 HTTP 往返（拉 config）。频繁创建 Catalog 实例会放大延迟，应复用（尤其 Flink 每个 subtask 别各建一个）。
+- DLF 模式下 `warehouse` 是**实例名**不是路径（doc 明确强调），写成路径会鉴权失败。
+- token 刷新基于本地时钟，客户端时钟漂移过大会导致提前 / 滞后刷新甚至签名失败——容器环境注意 NTP。
+- `RESTTokenFileIO` 序列化后 `apiInstance` 变 null（`transient`），反序列化端首次用时会按 `catalogContext` 重建 `RESTApi`——若 context 里缺凭证会在运行时才报错。
 
-SchemaChange 是一个接口，使用 Jackson 的 `@JsonSubTypes` 支持 JSON 多态序列化（用于 REST Catalog 的 API 传输）:
+### ⑤ 收益与代价
 
-| 变更类型 | 类名 | 说明 |
-|---|---|---|
-| 设置表选项 | `SetOption` | 设置 key-value 配置项 |
-| 删除表选项 | `RemoveOption` | 删除配置项 |
-| 更新表注释 | `UpdateComment` | 更新或清除表注释 |
-| 添加列 | `AddColumn` | 支持嵌套路径、位置指定(FIRST/AFTER/BEFORE) |
-| 重命名列 | `RenameColumn` | 支持嵌套路径 |
-| 删除列 | `DropColumn` | 支持嵌套路径 |
-| 修改列类型 | `UpdateColumnType` | 支持保留空值属性的类型变更 |
-| 修改列可空性 | `UpdateColumnNullability` | 更改列的 NULL/NOT NULL |
-| 修改列注释 | `UpdateColumnComment` | 更新列注释 |
-| 修改列默认值 | `UpdateColumnDefaultValue` | 更新列默认值 |
-| 修改列位置 | `UpdateColumnPosition` | 通过 Move 改变列顺序 |
-| 删除主键 | `DropPrimaryKey` | 删除主键定义 |
+收益：集中鉴权与审计、跨语言、UUID 路径天然隔离、data token 最小权限、客户端轻量。代价：强依赖服务端可用性与网络、初始化往返开销、调试需看服务端日志、时钟敏感。
 
-**Move 类型:**
+### 3.1 RESTCatalog 与 RESTApi 分层
+
+> 源码：`paimon-core/.../rest/RESTCatalog.java`（1274 行）、`paimon-api/.../rest/RESTApi.java`（1639 行）
+
+`RESTCatalog` 是"协议适配层"——把 Catalog 接口语义翻译成 REST 资源操作（database / table / partition / tag / branch / snapshot / view / function 各有资源路径）；`RESTApi` 是"HTTP 客户端层"——封装 `HttpClient`、`RESTAuthFunction`、`ResourcePaths`、Jackson 序列化（`OBJECT_MAPPER`）。两段式初始化（`RESTApi.java:190-213`）：
 
 ```java
-enum MoveType {
-    FIRST,   // 移到最前
-    AFTER,   // 移到指定列之后
-    BEFORE   // 移到指定列之前（SchemaManager 中使用）
+public RESTApi(Options options, boolean configRequired) {
+    this.client = new HttpClient(options.get(RESTCatalogOptions.URI));
+    AuthProvider authProvider = createAuthProvider(options);
+    Map<String,String> baseHeaders = extractPrefixMap(options, HEADER_PREFIX);
+    if (configRequired) {                                  // 第一次握手：拉服务端配置
+        String warehouse = options.get(WAREHOUSE);
+        Map<String,String> q = StringUtils.isNotEmpty(warehouse)
+                ? ImmutableMap.of(WAREHOUSE.key(), RESTUtil.encodeString(warehouse))
+                : ImmutableMap.of();
+        options = new Options(client.get(ResourcePaths.config(), q, ConfigResponse.class,
+                new RESTAuthFunction(baseHeaders, authProvider)).merge(options.toMap()));
+        baseHeaders.putAll(extractPrefixMap(options, HEADER_PREFIX));
+    }
+    this.restAuthFunction = new RESTAuthFunction(baseHeaders, authProvider);  // 后续请求复用
+    this.options = options;
+    this.resourcePaths = ResourcePaths.forCatalogProperties(options);
 }
 ```
 
-**AddColumn 的约束:** 新增列必须是可空的 (`isNullable() == true`)，这是为了保证向后兼容性——旧的数据文件不包含新列的数据，在读取时自动填充 null。
+`RESTAuthFunction` 是一个 `Function<RESTAuthParameter, Map<String,String>>`——每次请求把基础头 + AuthProvider 生成的鉴权头合并后下发给 `HttpClient`。把"配置 merge"前置，意味着服务端可以下发 `data-token.enabled`、缓存参数等控制客户端行为；`options()` 返回的就是 merge 后的最终配置，`RESTCatalog` 据此构建自己的 `context`。
 
-**commitChanges 的处理流程:**
+**资源路径与 HTTP 方法映射**（`ResourcePaths` + `RESTApi` 的各方法）：Catalog 接口操作翻译成 REST 资源——`GET /v1/{prefix}/databases`（列库）、`POST .../databases`（建库）、`GET .../databases/{db}/tables/{t}`（取表）、`POST .../tables`（建表）、`POST .../tables/{t}/commit`（提交快照）、`GET .../tables/{t}/snapshot`（loadSnapshot）、tag / branch / partition / view / function 各有路径。`ResourcePaths.forCatalogProperties(options)` 用服务端下发的 prefix 拼前缀（多租户隔离）。**分页**靠 `pageToken` 透传：`listTablesPaged(maxResults, pageToken, ...)` → REST query 带 token → 返回 `PagedList`（数据 + nextPageToken），客户端循环直到 token 为空——这正是 `supportsListObjectsPaged()` 在 REST 返回 true、filesystem 返回 false 的能力差异落点。
 
-```
-commitChanges(List<SchemaChange> changes)
-    |
-    +-- while(true) // 乐观锁循环
-    |     |
-    |     +-- latest() 获取当前最新 Schema
-    |     +-- generateTableSchema(oldSchema, changes, ...) // 纯函数，生成新 Schema
-    |     |     |
-    |     |     +-- 遍历每个 SchemaChange:
-    |     |     |     SetOption        -> 更新 options map
-    |     |     |     RemoveOption     -> 从 options 中移除
-    |     |     |     UpdateComment    -> 更新 comment
-    |     |     |     AddColumn        -> 分配新 fieldId, 添加到字段列表
-    |     |     |     RenameColumn     -> 更新字段名及相关 options 中的引用
-    |     |     |     DropColumn       -> 从字段列表中移除（校验非主键/分区键）
-    |     |     |     UpdateColumnType -> 检查类型兼容性, 更新类型
-    |     |     |     ...
-    |     |     +-- 构造 newTableSchema (id = oldId + 1)
-    |     |
-    |     +-- commit(newSchema) // 原子写入 schema-{newId}
-    |     +-- if (success) return newSchema
-    |     +-- // 否则继续循环（别人先写了同一个 ID）
+**HttpClient 与重试**：`HttpClient` 封装底层 HTTP（连接池、超时），对 5xx / 网络抖动可能做有限重试；对 4xx（鉴权 / 参数错）直接抛对应 `RESTException` 子类不重试。这与 `FileStoreCommitImpl` 的乐观锁重试是两层——HTTP 层重传瞬时网络错，commit 层重试快照冲突，职责不同别混淆。
+
+**三层重试别混淆**（排障时定位是哪层在重试）：(1) HTTP 层（HttpClient）重传瞬时网络 / 5xx；(2) commit 层（tryCommit）重试快照冲突（snapshot conflict）；(3) 作业层（Flink failover）应对 files conflict 重启。三层超时 / 次数独立配置，现象不同：HTTP 重试表现为单次请求变慢、commit 重试表现为 `attempts` 指标升高、作业重试表现为整个 task restart。看到"慢"先分清是哪层——HTTP 慢查网络 / 服务端，commit 慢查并发冲突，作业反复 restart 查 files conflict。混淆这三层会把"网络抖动"误判成"并发冲突"开错药方。
+
+### 3.2 认证体系：AuthProvider / Bear / DLF
+
+> 源码：`paimon-api/.../rest/auth/`
+
+`AuthProvider` 接口极简（`auth/AuthProvider.java`）：
+
+```java
+public interface AuthProvider {
+    Map<String,String> mergeAuthHeader(Map<String,String> baseHeader, RESTAuthParameter param);
+}
 ```
 
-### 3.4 乐观锁机制与原子写入
+`token.provider` 决定实现（经 `AuthProviderFactory` SPI、`AuthProviderEnum` 枚举）：
 
-> 源码: `SchemaManager.java` L1083-1088
+| provider | 实现类 | 鉴权方式 |
+|---|---|---|
+| `bear` | `BearTokenAuthProvider` | 静态 / 文件 token → `Authorization: Bearer <token>` |
+| `dlf` | `DLFAuthProvider` | 阿里云 DLF v4 签名（access-key / STS / ECS role） |
 
-Schema 的并发控制核心在 `commit()` 方法:
+Bear 最简单：把 token 塞进 `Authorization` 头，服务端校验合法性即认证通过；token 可来自配置 `token` 或周期刷新的文件。DLF 复杂在于它要**对每个请求做签名**（含 body 的 SHA256、时间戳、host），且 token 本身可能是动态的（STS / ECS role）——这就需要"签名器 + token 加载器 + 刷新逻辑"三件套。
+
+`RESTAuthParameter` 携带本次请求的方法、路径、query、body data 等签名所需信息——这是为什么签名不能在 `RESTApi` 构造时一次性算好，而必须每请求一算。
+
+`RESTAuthFunction`（持 baseHeaders + AuthProvider）是把"每请求签名"封装成函数对象：`HttpClient` 发请求时调它拿到完整鉴权头。这样 `HttpClient` 不关心鉴权细节、`AuthProvider` 不关心 HTTP 细节，二者经 `RESTAuthFunction` 解耦。换 token / 换签名算法只动 AuthProvider，HttpClient 与 RESTApi 的请求逻辑零改动——这是认证可插拔的工程落点。
+
+**Bear vs DLF 的安全模型差异**：Bear token 是"持有即认证"（bearer 语义）——一旦泄露，在过期前任何人都能冒用，且请求不绑定具体内容（无 body 签名）。DLF v4 签名则把请求方法 / 路径 / body 摘要 / 时间戳一起签名，重放窗口受 `x-dlf-date` 时间戳约束、内容被篡改即签名失效——安全性高得多。所以生产云环境推荐 DLF（尤其配合 STS / ECS role 的短期凭证），Bear 更适合内网可信环境或自建 server 的简单鉴权。`AuthProviderEnum` 枚举可扩展更多 provider，新增只需实现 `AuthProvider` + `AuthProviderFactory` 注册 SPI，不动 `RESTApi`。
+
+### 3.3 DLF 签名与 token 刷新
+
+> 源码：`auth/DLFAuthProvider.java`、`auth/DLFDefaultSigner.java`、`auth/DLFOpenApiSigner.java`、`auth/DLFTokenLoader.java` 及其实现
+
+`mergeAuthHeader` 每次请求都重新签名（`DLFAuthProvider.java:92-111`）：
+
+```java
+public Map<String,String> mergeAuthHeader(Map<String,String> baseHeader, RESTAuthParameter p) {
+    DLFToken token = getFreshToken();                       // 可能触发刷新
+    Instant now = Instant.now();
+    String host = extractHost(uri);
+    Map<String,String> signHeaders = signer.signHeaders(p.data(), now, token.getSecurityToken(), host);
+    String authorization = signer.authorization(p, token, host, signHeaders);
+    Map<String,String> out = new HashMap<>(baseHeader);
+    out.putAll(signHeaders);
+    out.put(DLF_AUTHORIZATION_HEADER_KEY, authorization);   // 含 x-dlf-date / x-dlf-security-token / x-dlf-content-sha256 ...
+    return out;
+}
+```
+
+签名头集合（`DLFAuthProvider` 常量）：`Authorization`、`Content-MD5`、`Content-Type`、`x-dlf-date`（格式 `yyyyMMdd'T'HHmmss'Z'`）、`x-dlf-security-token`、`x-dlf-version`、`x-dlf-content-sha256`（值 `UNSIGNED-PAYLOAD`）。
+
+**双签名算法自动选择**（`createSigner`）：按 endpoint 类型选 `DLFDefaultSigner`（VPC endpoint，如 `cn-hangzhou-vpc.dlf.aliyuncs.com`）或 `DLFOpenApiSigner`（公网 OpenAPI endpoint，如 `dlfnext.cn-hangzhou.aliyuncs.com`）。OpenAPI 端目前对库 / 表名字符集有限制（仅字母数字与特定符号），VPC 端无此限制且延迟更低。
+
+**token 刷新：双重检查锁 + 1 小时安全提前量**（`DLFAuthProvider.java:155-190`）：
+
+```java
+DLFToken getFreshToken() {
+    if (shouldRefresh()) {
+        synchronized (this) {
+            if (shouldRefresh()) { refreshToken(); }   // this.token = tokenLoader.loadToken();
+        }
+    }
+    return token;
+}
+private boolean shouldRefresh() {
+    if (token == null) return true;
+    Long expireTime = token.getExpirationAtMills();
+    if (expireTime == null) return false;              // 永不过期(静态 AK)
+    return expireTime - System.currentTimeMillis() < TOKEN_EXPIRATION_SAFE_TIME_MILLIS;
+}
+```
+
+`TOKEN_EXPIRATION_SAFE_TIME_MILLIS = 3_600_000L`（1 小时，`RESTApi.java:160`）——在过期前 1 小时就刷新，给签名、网络往返、时钟漂移留足缓冲。`token` 字段 `volatile`，配合双重检查锁保证可见性与"只有一个线程真正刷新"。
+
+token 来源（`DLFTokenLoader` 三种实现，经 `DLFTokenLoaderFactory` SPI 装配）：
+
+| Loader | 触发配置 | 行为 |
+|---|---|---|
+| 直接 access-key | `dlf.access-key-id/secret`(+`dlf.security-token`) | 静态 token，`getExpirationAtMills()` 为 null，永不刷新 |
+| `DLFLocalFileTokenLoader` | `dlf.token-path` | 周期读本地文件（外部进程刷写），适合 STS 由 sidecar 维护 |
+| `DLFECSTokenLoader` | `dlf.token-loader=ecs`(+`dlf.token-ecs-role-name`) | 从 ECS 元数据服务取实例 RAM role 的 STS token，无需配 AK |
+
+三种方式的安全梯度：**直接 AK**（RAM 用户长期 access key）最方便但凭证长期有效、泄露风险最高，仅建议受控环境；**STS 临时凭证**（带 `dlf.security-token` 或 `token-path` 文件）有有效期，泄露影响有限，是推荐做法；**ECS role**（`token-loader=ecs`）最安全——AK 完全不落地，由 ECS 实例的 RAM role 在元数据服务里动态发 STS token，机器即身份。生产云上首选 ECS role，其次 STS 文件，尽量避免长期 AK。三者对 Paimon 是透明的——`DLFAuthProvider` 只调 `tokenLoader.loadToken()`，不关心 token 怎么来的，这正是"加载器抽象"的价值。
+
+**边界 / 排障**：`refreshToken` 持表级 `synchronized`，高并发请求只一个线程真刷新、其余阻塞等待；若 `tokenLoader.loadToken()` 慢（ECS metadata 网络抖动），会短暂阻塞所有发请求线程——表现为"周期性请求毛刺"。日志 `begin/end refresh meta token for loader [...] expiresAtMillis [...]` 是定位刷新行为的钩子。
+
+**region 与 endpoint 推断**：`DLFAuthProvider` 持有 `region` 与 `signingAlgorithm`，`extractHost(uri)` 从 uri 剥协议与路径取 host（`https://host:port/prefix` → `host:port`）参与签名。VPC endpoint 与 OpenAPI endpoint 的 region 推断、签名算法选择都在构造期确定——配错 endpoint（如 VPC 环境填了公网 OpenAPI）会导致延迟高或签名不匹配。**时钟敏感的具体表现**：DLF v4 签名含 `x-dlf-date` 时间戳，服务端校验请求时间在允许窗口内（防重放）；若客户端时钟比服务端快/慢超过窗口（通常几分钟），所有请求被拒——容器无 NTP 是常见坑，表现为"突然全部 403 / 签名错误"。
+
+### 3.4 Data Token、RESTTokenFileIO 与 PVFS
+
+> 源码：`paimon-common/.../rest/RESTTokenFileIO.java`
+
+REST Catalog 生成 UUID 路径并下发**按表的短期数据凭证**，让客户端直连对象存储读写数据文件，而无需持有长期强凭证。`RESTTokenFileIO` 是 `FileIO` 装饰器，每个方法先 `tryToRefreshToken()` 再委托给真实 FileIO：
+
+```java
+public static final ConfigOption<Boolean> DATA_TOKEN_ENABLED =
+    ConfigOptions.key("data-token.enabled").booleanType().defaultValue(false);
+
+public FileIO fileIO() throws IOException {
+    tryToRefreshToken();
+    FileIO fileIO = FILE_IO_CACHE.getIfPresent(token);     // 以 RESTToken 为 key 缓存 FileIO
+    if (fileIO != null) return fileIO;
+    synchronized (FILE_IO_CACHE) {
+        fileIO = FILE_IO_CACHE.getIfPresent(token);
+        if (fileIO != null) return fileIO;
+        Options options = new Options(RESTUtil.merge(
+            catalogContext.options().toMap(), token.token()));   // token 携带 AK/SK/STS 注入 options
+        options.set(FILE_IO_ALLOW_CACHE, false);                 // 禁用内层 FileIO 自身缓存
+        fileIO = FileIO.get(path, CatalogContext.create(options, ...));
+        FILE_IO_CACHE.put(token, fileIO);
+        return fileIO;
+    }
+}
+```
+
+`FILE_IO_CACHE` 是全局静态 Caffeine（`maximumSize(1000)`、`expireAfterAccess(10, HOURS)`、移除时 `IOUtils.closeQuietly`、专用守护线程调度器）。关键设计点：
+
+- **以 `RESTToken` 为缓存 key**：token 刷新后是新对象，自然命中不到旧 FileIO，从而用新凭证重建——天然实现"凭证轮换"，旧 FileIO 在空闲过期时被关闭。这比"显式重配 FileIO"优雅得多。
+- **刷新阈值同样是 1h 安全提前量**（`tryToRefreshToken` 复用 `TOKEN_EXPIRATION_SAFE_TIME_MILLIS`），双重检查锁。
+- **`token` 字段 `volatile` 且可序列化**：Flink 算子序列化时把当前 token 带过去，反序列化端先用它、过期再刷新，避免一启动就齐刷刷打 REST Server（惊群）。`apiInstance` 是 `transient`，反序列化后按 `catalogContext` 懒重建。
+- **`configure()` 直接抛 `UnsupportedOperationException`**：它是被动包装器，配置只能来自构造时传入的 context，不允许二次 configure。
+
+**PVFS（Paimon Virtual Storage）**：因 UUID 路径难以人工访问，PVFS 暴露 `pvfs://catalog/db/table/...` 虚拟路径。`listStatus(pvfs://my_catalog/)` 返回所有库的虚拟路径，`listStatus(pvfs://my_catalog/my_db)` 返回所有表；`newInputStream(pvfs://.../my_table/a.csv)` 时先向 REST Server 解析真实路径，再用真实 FileSystem 读写。所有访问都过 REST Catalog 的权限系统，无需另维护一套 FS 权限。实现为 Hadoop `FileSystem`（`org.apache.paimon.vfs.hadoop.PaimonVirtualFileSystem` / `Pvfs`，配 `fs.pvfs.uri` / `fs.pvfs.token.provider` / `fs.pvfs.token`）+ Python fsspec 风格 SDK（`pypaimon.PaimonVirtualFileSystem`），因此 Spark / Hadoop shell / PyArrow / Ray 都能透明接入。
+
+PVFS 覆盖三类内置存储：Paimon Table、Format Table、Object Table（亦称 Fileset / Volume）——后两者尤其需要直接 FS 访问。**本质上 PVFS 与 `RESTTokenFileIO` 是同一思路在"用户可见路径"层的延伸**：路径虚拟化 + 凭证由服务端按权限下发，把"存储寻址"与"存储鉴权"都收敛到 REST Server。
+
+**本地数据缓存 `LocalCacheManager` / `CachingFileIO`**：REST 模式下数据文件常在远端对象存储，重复读（如多次扫描同一 manifest / 小文件）代价高。`RESTCatalog` 可选持有 `LocalCacheManager`，配合 `CachingFileIO`（`paimon-common/fs/cache`）把热数据缓存到本地磁盘 / 内存，`IO_CACHE_ENABLED` 配置控制开关。这与 `RESTTokenFileIO` 正交：前者管"读得快"，后者管"读得到（凭证）"。三者叠加时实际 FileIO 形如 `CachingFileIO( RESTTokenFileIO( ResolvingFileIO( 真实对象存储 FileIO ) ) )`——`ResolvingFileIO` 负责按 scheme 路由到具体实现。
+
+### 3.5 REST 表加载与并发控制
+
+filesystem 模式靠"本地原子写 `snapshot-{id+1}`"做乐观锁；REST 模式把这步交给服务端：`Catalog.commitSnapshot(identifier, tableUuid, snapshot, statistics)` 是接口方法，REST 实现把它翻译成一次 HTTP 提交，由服务端判定快照 ID 是否被抢占（snapshot conflict）、要删的文件是否已被删（files conflict）。`tableUuid` 用于服务端识别表身份——避免 drop+create 同名表后把老提交误认到新表。
+
+`FileStoreCommitImpl` 通过 `SnapshotCommit` 抽象屏蔽两种提交方式：filesystem 实现走 `fileIO.tryToWriteAtomic`（本地原子），REST 实现走 `catalog.commitSnapshot`（HTTP 让服务端仲裁）。`tryCommitOnce` 步骤 7 调的 `commitSnapshotImpl` 不关心底层是哪种——它只看返回 true（成功）/ false（冲突重试）。这层抽象让乐观锁的"读 latest → 算 → 提交 → 成败"主循环对 filesystem / REST 完全统一，差异只在最后一步"提交动作"的实现。这正是把 `commitSnapshot` 提到 `Catalog` 接口的回报：上层 commit 逻辑写一套，跑在四种后端上。
+
+**`SnapshotCommit` 与去重的协作**：filesystem 的 `tryToWriteAtomic(snapshot-{id+1})` 若返回 false（被抢），上层重试时先做去重检查（8.3 步骤 1）——若发现被抢那个快照其实是自己上次成功写的（三元组匹配），就认成功不再写。REST 的 `commitSnapshot` 则可能由服务端直接做去重（服务端知道 tableUuid + commitUser + identifier），返回"已提交"。两种路径殊途同归：精确一次的去重既可在客户端（扫快照链）也可在服务端（REST），由 `SnapshotCommit` 实现选择，对上层透明。
+
+**REST 表加载（getTable）流程**：`RESTCatalog.getTable` → `RESTApi` 发 `GET /databases/{db}/tables/{table}` → 返回 `GetTableResponse`（含 schema、path、options、uuid）→ 构造 `TableSchema` → 经 `CatalogUtils` / `FileStoreTableFactory` 组装 `FileStoreTable`。关键区别于 filesystem：表的物理 `path` 由服务端返回（UUID 路径），客户端不自己拼；表的 `FileIO` 若 `dataTokenEnabled` 则包成 `RESTTokenFileIO`（每次 IO 带最新 data token）。`loadSnapshot` 同理走 HTTP，由服务端返回 `TableSnapshot`，这也是 `SnapshotManager.snapshotLoader` 非空时优先走 loader 的原因（见 5.3）。
+
+**为何 REST 表的 path 由服务端给**：filesystem 表 path 可由 warehouse + db + table 推出（`{warehouse}/{db}.db/{table}`），但 REST 用 UUID 路径（隔离 + 防猜测 + 支持表改名不动数据），客户端无法推算，只能由服务端在 `GetTableResponse` 里返回。这也意味着 REST 表的"重命名"是元数据操作（改服务端的 name→uuid 映射），数据文件原地不动——比 filesystem 的目录 rename 更轻、更安全（无对象存储 rename 非原子问题）。这是 REST 架构相对 filesystem 的一个隐性优势。
+
+官方 concurrency-control 文档定义的两类失败在 REST 下语义不变，只是仲裁点从文件系统挪到服务端：
+
+1. **Snapshot conflict**：快照 ID 被别的作业抢了 → 客户端重新取 latest 再提（`tryCommit` 循环消化）。
+2. **Files conflict**：要逻辑删除的文件已被删 → 该提交节点无法继续，流式作业会故意 failover 重启，从最新状态重试。
+
+**排障要点**：REST 提交失败的根因常在服务端，客户端只看到 `RESTException` 子类（`BadRequestException` / `ForbiddenException` / `ServiceFailureException` / `AlreadyExistsException` / `NoSuchResourceException` / `NotImplementedException`，见 `rest/exceptions/`）。`ForbiddenException` 多为 token / 权限问题（查 3.3 刷新日志与服务端鉴权日志）；反复 `AlreadyExistsException`(snapshot) 说明高并发写撞车，参考"关写侧 compaction + 独立 compaction 作业"。`NotImplementedException` 说明该服务端未实现某可选 API（如分页 / 版本管理），此时 `supportsXxx()` 应返回 false 让上层降级——若仍调用即是客户端 bug。
+
+---
+
+## 四、Schema 演进机制
+
+### ① 要解决什么问题
+
+业务演进要加列 / 改类型 / 删列，但已写入的 TB 级数据文件不可能重写。必须做到：新旧 schema 共存、读旧文件时按列 ID 映射对齐、并发改 schema 不互相覆盖、每个数据文件能找回它写入时的 schema。
+
+### ② 设计原理与取舍（最重要）
+
+- **独立 schema 文件而非内嵌**：每次变更只写一个新 `schema-{id}`，O(1) 轻量，多个 snapshot 共享同一 schema；代价是读取时多一次 IO 取 schema。对比 Iceberg 把 schema 嵌进 metadata.json 每次重写整块——Paimon 的方式让"高频流式写 + 偶发 schema 改"互不拖累。
+- **字段 ID 永不回收**：`highestFieldId` 单调增，删列后新列从 `highestFieldId+1` 起，杜绝"删 A 再加同名 A"导致的旧数据错读。列映射靠 field id 而非列名 / 位置——这是演进正确性的锚点。
+- **乐观锁**：读最新 → 纯函数算新 schema → 原子写 `schema-{oldId+1}`，撞车则重试。无分布式锁依赖。把"算新 schema"做成无副作用纯函数，重试只需重算，简单且无脏状态。
+- **新增列强制 nullable**：旧文件没这列，读时只能补 null，故 `addColumn(nullable=false)` 直接拒绝——这是向后兼容的硬约束。
+- **类型变更只允许安全扩宽**：INT→BIGINT 可，BIGINT→INT 默认不可（除非 `allowExplicitCast`），保证不丢精度；不安全转换必须 overwrite 重写数据。
+
+### ③ 关键源码
+
+乐观锁原子写（`SchemaManager.java`，`commit`）：
 
 ```java
 public boolean commit(TableSchema newSchema) throws Exception {
     SchemaValidation.validateTableSchema(newSchema);
     SchemaValidation.validateFallbackBranch(this, newSchema);
     Path schemaPath = toSchemaPath(newSchema.id());
-    return fileIO.tryToWriteAtomic(schemaPath, newSchema.toString());
+    return fileIO.tryToWriteAtomic(schemaPath, newSchema.toString());  // 目标已存在则返回 false
 }
 ```
 
-**`tryToWriteAtomic()`** 是 FileIO 接口提供的原子写入方法:
-- **本地文件系统/HDFS**: 使用原子重命名（先写临时文件，再 rename 到目标路径）。如果目标路径已存在则返回 false。
-- **对象存储（S3/OSS）**: 使用 `putIfAbsent` 语义（如果支持），否则回退到先检查存在性再写入（需要配合分布式锁）。
+`tryToWriteAtomic` 在 HDFS / 本地 FS 上用"写临时文件 + 原子 rename"；目标已存在 rename 失败返回 false，触发上层重试。对象存储无原子 rename 时退化为 `putIfAbsent` 语义或配合外部锁。
 
-**乐观锁逻辑:**
-1. 读取当前最新 Schema ID（如 `5`）
-2. 生成新 Schema 的 ID = `6`
-3. 尝试原子写入 `schema-6`
-4. 如果写入成功，操作完成
-5. 如果写入失败（有人已经写了 `schema-6`），回到步骤 1 重试
+### ④ 风险/陷阱/边界
 
-**为什么不使用分布式锁?** 对于 HDFS 等提供原子重命名的文件系统，乐观锁已经足够安全且性能更好（无需额外的锁服务依赖）。只有在对象存储场景下，才需要通过 `CatalogLock` 引入外部锁（如 MySQL/ZooKeeper 锁）。
+- 不能删主键 / 分区键列（会破坏分区与桶结构），`generateTableSchema` 内校验后抛异常。
+- schema 文件永不清理——旧数据文件可能仍引用旧 schema id。
+- 高频单条变更会刷出大量 schema 文件；应**批量** `commitChanges(List<SchemaChange>)` 一次只产一个新文件。
+- Schema 变更不需要停写：乐观锁允许写入过程中改 schema，但写入可能因此重试。
+- 重命名列会同步改 options 里对该列的引用（如 `bucket-key`、`sequence.field`）——若手动改 options 与列名不一致会校验失败。
 
-### 3.5 Schema 存储路径规则
+### ⑤ 收益与代价
 
-```
-主分支: {table_path}/schema/schema-{id}
-其他分支: {table_path}/branch/branch-{branchName}/schema/schema-{id}
-```
+收益：演进零重写、并发安全、历史可追溯、读旧文件可精确列映射。代价：读路径多一次 schema IO、schema 文件单调累积、类型变更受限（不安全转换需 overwrite 重写）。
 
-路径由 SchemaManager 中的 `branchPath()` + `schemaDirectory()` + `toSchemaPath()` 组合构建:
+**Schema 与 Snapshot 的解耦在版本管理上的回报**：因为 schema 独立于 snapshot，时间旅行到 snapshot-N 时自动用 N.schemaId 对应的 schema 读取——历史数据按历史 schema 解析，不会被当前 schema "污染"。分支 / Tag 也各自记 schemaId，互不干扰。若 schema 内嵌 snapshot，每次改 schema 都要重写所有引用它的快照，时间旅行与分支的实现会复杂得多。这就是 4.0 节"独立 schema 文件"取舍在版本管理维度的具体收益——一个设计决策的价值往往在多个机制里复利显现。
+
+**程序化 API 的完整约束清单**（来自 `program-api/catalog-api`，对应 `SchemaValidation` / `generateTableSchema` 校验）：
+
+- 新增列不能 `NOT NULL`（向后兼容）；
+- 不能改分区列类型（破坏分区布局）；
+- 不能改主键列的 nullability（主键恒非空）；
+- 嵌套 ROW 类型的列**不支持改类型**，也不支持把普通列改成嵌套 ROW；
+- 删列 / 改列经 `fieldNames` 数组支持嵌套路径（如 `["col5","f1"]` 改 ROW 内子字段注释 / nullability）。
+
+异常类型对应：`alterTable` 抛 `ColumnAlreadyExistException` / `ColumnNotExistException` / `TableNotExistException`；建表抛 `TableAlreadyExistException` / `DatabaseNotExistException`；`alterDatabase` 仅 hive / jdbc 支持（filesystem 抛 `UnsupportedOperationException`），改库属性用 `DatabaseChange.setProperty / removeProperty`。这些 checked 异常都定义在 `Catalog` 接口内部——程序化调用必须处理。
+
+### 4.1 TableSchema 字段与派生量
+
+> 源码：`paimon-api/.../schema/TableSchema.java`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `version` | int | schema 格式版本（当前 v3） |
+| `id` | long | schema ID，单调递增（schema-0 起） |
+| `fields` | List\<DataField\> | 字段（不可变，每个含全局 field id） |
+| `highestFieldId` | int | 已分配最大 field id（删列不回收） |
+| `partitionKeys` / `primaryKeys` | List\<String\> | 分区键 / 主键 |
+| `bucketKeys` / `numBucket` | 派生 | 桶键 / 桶数（来自 options） |
+| `options` | Map | 表级 CoreOptions |
+| `comment` | String? | 表注释 |
+| `timeMillis` | long | 创建时间戳 |
+
+`bucketKeys` 派生规则——未显式配 `bucket-key` 时回退到主键（去掉分区键部分）：
 
 ```java
-private String branchPath() {
-    return BranchManager.branchPath(tableRoot, branch);
-    // main 分支: {tableRoot}
-    // 其他分支: {tableRoot}/branch/branch-{branch}
-}
+List<String> tmp = originalBucketKeys();        // 从 options 读 bucket-key
+if (tmp.isEmpty()) tmp = trimmedPrimaryKeys();  // fallback: 主键去分区键
+bucketKeys = tmp;
+```
 
-public Path schemaDirectory() {
-    return new Path(branchPath() + "/schema");
-}
+`highestFieldId` 的存在使"删除列 A → 新增列 A"得到不同 field id，读旧文件时旧 A 仍按旧 id 解析、新 A 按新 id，不会张冠李戴。序列化为 JSON 写盘。
 
-public Path toSchemaPath(long schemaId) {
-    return new Path(branchPath() + "/schema/" + SCHEMA_PREFIX + schemaId);
+具体例子说明 field id 为何是稳定锚点：
+
+```
+schema-0: [id=0 user_id BIGINT, id=1 name STRING, id=2 age INT]   highestFieldId=2
+ALTER RENAME name → username:
+schema-1: [id=0 user_id, id=1 username STRING, id=2 age]          # id 不变, 只改 name
+ALTER DROP age; ALTER ADD age STRING:
+schema-2: [id=0 user_id, id=1 username, id=3 age STRING]          # 新 age 是 id=3, 非 id=2!
+                                                                   highestFieldId=3
+```
+
+用 schema-0 写的数据文件里 age 是 id=2 的 INT；用 schema-2 读时，当前 schema 的 age 是 id=3 STRING，旧文件没有 id=3 → age 读出来是 null（而非把旧 INT 值错当新 STRING 列）。这正是 field id 永不回收要防的"列身份混淆"。若按列名映射，旧 age 和新 age 同名会被误认作同一列，类型还不同，必然读错。
+
+### 4.2 SchemaManager 与乐观锁 commit
+
+> 源码：`paimon-core/.../schema/SchemaManager.java`（`@ThreadSafe`）
+
+核心方法：`latest()`（扫目录取最大 id）/ `schema(id)` / `listAll()` / `listAllIds()` / `createTable(schema)` / `commitChanges(changes)` / `mergeSchema(rowType, allowExplicitCast)` / `commit(newSchema)`。
+
+`createTable` 的乐观锁循环——并在写盘前用新 schema 实际构造一次 `FileStoreTable` 来验证配置合法（如 bucket / 主键 / 序列字段配置矛盾会在此暴露）：
+
+```java
+public TableSchema createTable(Schema schema, boolean externalTable) throws Exception {
+    while (true) {
+        Optional<TableSchema> latest = latest();
+        if (latest.isPresent()) {                    // 表已存在
+            if (externalTable) { checkSchemaForExternalTable(latest.get().toSchema(), schema); return latest.get(); }
+            else throw new IllegalStateException("Schema in filesystem exists");
+        }
+        TableSchema newSchema = TableSchema.create(0, schema);          // id=0
+        FileStoreTableFactory.create(fileIO, tableRoot, newSchema).store(); // 配置校验
+        if (commit(newSchema)) return newSchema;     // 原子写 schema-0
+        // 并发建表撞车 → 重试
+    }
 }
 ```
+
+`commitChanges` 同样在乐观锁循环内：`latest()` → 纯函数 `generateTableSchema(oldSchema, changes)` 生成新 schema（id=oldId+1）→ `commit` 原子写 `schema-{newId}`，失败则重新取 latest 再算。`generateTableSchema` 遍历每个 `SchemaChange`：SetOption 改 options map、AddColumn 分配新 fieldId 加字段、RenameColumn 改名并更新 options 引用、DropColumn 移除并校验非主键 / 分区键、UpdateColumnType 检查兼容性后改类型……最后构造 id=oldId+1 的 newTableSchema。
+
+**批量提交为何只产一个 schema 文件**：`commitChanges` 接收 `List<SchemaChange>`，在**一次** `generateTableSchema` 里把整批变更全部应用到 oldSchema 上，只产出**一个**新 schema（id=oldId+1）。所以"加 5 列 + 改 2 个 option"批量提交只写 `schema-{N+1}` 一个文件；若拆成 7 次单独 commitChanges 则写 7 个文件（N+1 到 N+7）。这是 4.4 性能陷阱"高频单条变更刷文件"的对策依据——能合就合成一个 list 一次提交。
+
+### 4.3 SchemaChange 类型与生成纯函数
+
+> 源码：`paimon-api/.../schema/SchemaChange.java`（Jackson `@JsonSubTypes` 多态，供 REST 传输）
+
+| 变更 | 类 | 要点 |
+|---|---|---|
+| SetOption / RemoveOption | 配置增删 | 改 options map |
+| UpdateComment | 表注释 | 更新或清除 |
+| AddColumn | 加列 | 支持嵌套路径、FIRST / AFTER / BEFORE 定位；**必须 nullable** |
+| RenameColumn | 改名 | 同步更新 options 里对该列的引用 |
+| DropColumn | 删列 | 校验非主键 / 分区键 |
+| UpdateColumnType | 改类型 | 兼容性校验（安全扩宽） |
+| UpdateColumnNullability | 改可空 | NULL ↔ NOT NULL |
+| UpdateColumnComment / DefaultValue | 改注释 / 默认值 | |
+| UpdateColumnPosition | 改顺序 | 经 Move(FIRST / AFTER / BEFORE) |
+| DropPrimaryKey | 删主键 | |
+
+Move 类型枚举：`FIRST`（最前）、`AFTER`（指定列后）、`BEFORE`（指定列前）。
+
+**嵌套列与多态序列化**：`AddColumn` / `RenameColumn` / `DropColumn` 都支持 `fieldNames`（字符串数组）表达嵌套路径——如对 ROW 类型列里的子字段操作 `["address", "city"]`。这让结构化类型（ROW / ARRAY\<ROW\> / MAP）也能做 schema 演进。`SchemaChange` 用 Jackson `@JsonTypeInfo` + `@JsonSubTypes` 声明多态：每个子类有 type 标签（如 `"add-column"`），序列化成 JSON 后能被 REST Server 还原成正确的子类——这是 REST 后端把 `alterTable(changes)` 整个变更列表传给服务端执行的前提（filesystem 后端在本地执行，不需要序列化）。
+
+**AddColumn 的位置语义**：`addColumn(name, type)` 默认加到末尾；`addColumn(name, type, comment, Move.first(name))` 加到最前；`Move.after(name, refColumn)` 加到某列后。位置只影响列的展示 / 写入顺序，不影响 field id（id 永远是 highestFieldId+1）。读旧文件时列映射按 id 不按位置，所以调整位置对旧数据读取无影响——位置纯粹是"人类可读顺序"的元数据。这与某些系统"列位置即列身份"（按 ordinal 映射）形成对比：Paimon 位置可随意调而不破坏数据，因为身份锚在 id 上。
+
+`AddColumn` 的 nullable 约束在生成阶段校验：
+
+```java
+// generateTableSchema 内 AddColumn 分支（简化）
+if (!addColumn.isNullable()) {
+    throw new IllegalArgumentException("ADD COLUMN ... cannot specify NOT NULL.");
+}
+int newId = highestFieldId + 1;   // 永不回收
+```
+
+把"算新 schema"做成纯函数 `generateTableSchema` 的好处：重试时只需重新取 latest 再算一遍，无副作用、无脏状态；也便于 REST 后端把 changes 序列化传给服务端由服务端算。
+
+### 4.4 类型变更校验与列映射读取
+
+读取旧数据文件时，文件元数据记录其写入时的 `schemaId`；读 schema（当前）与文件 schema 不一致时，`SchemaEvolutionUtil` 按 **field id**（非列名、非位置）做映射：当前 schema 有而旧文件没有的列补 null，类型不同则做安全转换（如旧文件 INT、当前 BIGINT，读时提升）。这就是"字段 ID 永不回收"的根本动因——列名可变、位置可变，唯有 field id 是稳定锚点。
+
+类型变更校验在 `generateTableSchema` 的 `UpdateColumnType` 分支：默认只放行无损扩宽（数值位宽变大、精度变大），`allowExplicitCast=true`（显式 cast 或 `mergeSchema` 写入合并场景）才放宽到可能有损的转换。`mergeSchema(rowType, allowExplicitCast, ...)` 用于"写入时自动合并 schema"——把写入数据的 RowType 合并进当前 schema，新增列自动 addColumn，是 CDC 入湖自动加列的底层机制。
+
+**实战：一次 `ALTER TABLE ADD COLUMN` 在源码里走过的路**（理解后能定位任何 schema 变更卡点）：
+
+```
+Flink/Spark SQL: ALTER TABLE t ADD COLUMN age INT
+  → Catalog.alterTable(id, [SchemaChange.addColumn("age", INT, null, true)], false)
+  → AbstractCatalog.alterTable: checkNotSystemTable / checkNotBranch
+  → FileSystemCatalog.alterTableImpl → runWithLock(id, () -> schemaManager.commitChanges(changes))
+  → SchemaManager.commitChanges: while(true) {
+        old = latest()                            # 读 schema-5
+        new = generateTableSchema(old, changes)   # 纯函数: age 分配 fieldId=highestFieldId+1, id=6
+        if (commit(new)) return                   # tryToWriteAtomic(schema-6)
+        # 写失败(别人抢先写了 schema-6) → 重试
+     }
+```
+
+常见卡点对应源码位置：`age INT NOT NULL` → `generateTableSchema` 的 AddColumn nullable 校验抛错；删分区键 → DropColumn 校验抛错；并发 DDL 反复重试不收敛 → `commit` 一直返回 false（另有作业高频改 schema），需排查谁在改。
+
+### 4.5 Schema 存储路径与回退分支
+
+```
+主分支:   {tableRoot}/schema/schema-{id}
+其他分支: {tableRoot}/branch/branch-{branchName}/schema/schema-{id}
+```
+
+路径由 `branchPath() + schemaDirectory() + toSchemaPath()` 拼接：
+
+```java
+private String branchPath() { return BranchManager.branchPath(tableRoot, branch); }
+public Path schemaDirectory() { return new Path(branchPath() + "/schema"); }
+public Path toSchemaPath(long id) { return new Path(branchPath() + "/schema/" + SCHEMA_PREFIX + id); }
+```
+
+`commit` 里的 `SchemaValidation.validateFallbackBranch` 校验"回退分支"配置（`scan.fallback-branch`）——主分支查不到数据时回退到指定分支读，要求两分支 schema 兼容，这里在提交新 schema 时就提前校验避免运行期才报错。
+
+**Schema 层排障速查**：
+
+| 现象 | 根因 | 处置 |
+|---|---|---|
+| `ADD COLUMN ... cannot specify NOT NULL` | 新增列强制 nullable | 去掉 NOT NULL，需非空则 overwrite 重写 |
+| `Cannot update partition column type` | 分区列类型不可改 | 重建表或新建分区方案 |
+| 改类型报不兼容 | 非安全转换（如 BIGINT→INT） | overwrite 重写数据，或用 explicit cast 场景 |
+| schema 文件目录爆量 | 高频单条 setOption / addColumn | 批量 `commitChanges(List)` |
+| 并发 DDL 长时间不收敛 | 多作业高频改同表 schema | 排查谁在改，串行化 DDL |
+| 读旧数据列错位 | 误以为按列名映射 | 实际按 field id 映射，确认未手工改 schema 文件 |
+| `nested row type ... update not supported` | 嵌套 ROW 列不支持改类型 | 拆分或重建该列 |
+
+**为何 schema 文件永不删**：任意存活的数据文件都带 `schemaId`，读它时要按对应 schema 做列映射（4.4）。即使该 schema 对应的列后来被删，只要还有用它写的数据文件存活，schema 文件就不能删。所以 schema 目录随时间单调增长是正常的——它远小于数据，通常无需治理；真要清理只能在确认无数据文件引用某 schema 后手工删（极少做）。
 
 ---
 
-## 四、Snapshot 管理
+## 五、Snapshot 管理
 
-### 解决什么问题
+### ① 要解决什么问题
 
-**核心业务问题：**
-1. **时间旅行（Time Travel）**：用户需要查询历史某个时间点的数据，如"查询昨天下午3点的订单表"。
-2. **增量消费**：流式处理需要知道"从上次消费到现在新增了哪些数据"，而不是每次都扫描全表。
-3. **数据回滚**：发现数据错误后需要回滚到之前的正确状态，如"回滚到1小时前的快照"。
-4. **精确一次语义（Exactly-Once）**：分布式写入场景下，需要防止同一批数据被重复提交。
+时间旅行（查历史时点）、增量消费（只读新增变更）、回滚（恢复到正确状态）、精确一次（分布式重试不产生重复提交）。
 
-**没有这个设计的后果：**
-- 无法查询历史数据，只能看到最新状态
-- 增量消费需要对比两次全量扫描的结果，效率极低
-- 数据错误后无法恢复，只能从备份重新导入
-- 分布式写入可能产生重复数据，破坏数据一致性
+### ② 设计原理与取舍（最重要）
 
-**实际场景：**
-```sql
--- 场景1: 时间旅行查询
-SELECT * FROM orders /*+ OPTIONS('scan.timestamp-millis'='1704067200000') */;
+- **Snapshot 只是元数据入口**：不含数据，只引用 ManifestList。建快照是 O(1)（写一个小 JSON），多快照共享底层数据文件，靠"无引用即可清理"管理生命周期。代价是需要引用计数式的过期清理（不能简单删快照就删数据）。
+- **base/delta/changelog 三分**：全量读只看 base，增量消费只看 delta，过期清理只扫 delta，CDC 走 changelog——各取所需，避免增量消费者去 diff 两份全量。这是 Paimon 流式增量读高效的根因。
+- **`(commitUser, commitIdentifier, commitKind)` 三元组去重**：实现精确一次；同一 user 内 identifier 单调递增（如 Flink job id + checkpoint id）。
+- **LATEST hint 乐观加速**：避免每次 list 目录（对象存储 list 慢），但 hint 可能过时，需"看 id+1 是否存在"来验证——一个典型的"乐观假设 + 廉价验证 + 失败降级"模式。
+- **watermark 只增不减**：保证流式单调，回滚也不回退 watermark——这是流式语义的必然要求，代价是回滚后可能跳过部分数据。
 
--- 场景2: 增量消费
-SELECT * FROM orders /*+ OPTIONS('scan.mode'='from-snapshot', 'scan.snapshot-id'='100') */;
+- **schemaId 关联而非内嵌 schema**：Snapshot 只存 `schemaId`（一个 long），不内嵌完整 schema。这让"改 schema 不重写 snapshot、多 snapshot 共享 schema"成立；读取时按 snapshot.schemaId 取对应 schema 文件。代价是读 snapshot 后要多一次 IO 取 schema，但 schema 文件小且可缓存，收益（解耦 + 共享）远大于成本。
 
--- 场景3: 数据回滚
-CALL sys.rollback_to('my_db.orders', 95); -- 回滚到 snapshot-95
+### ③ 关键源码
 
--- 场景4: 精确一次写入
-// Flink checkpoint 100 提交了 snapshot-50
-// 如果 checkpoint 100 失败重启，重新提交时会检测到 snapshot-50 已存在，跳过提交
-```
+见 5.3 的 `latestSnapshot()` 与 `HintFileUtils.findLatest()`。
 
-### 有什么坑
+### ④ 风险/陷阱/边界
 
-**误区陷阱：**
-1. **Snapshot 不是数据备份**：Snapshot 只是元数据的快照，底层数据文件是共享的。删除 Snapshot 不会立即删除数据文件，但过期后会清理。
-   ```java
-   // 误区：以为删除 snapshot 就删除了数据
-   snapshotManager.deleteSnapshot(100); // 只删除 snapshot-100 文件
-   // 数据文件仍然存在，直到没有任何 snapshot 引用它们
-   ```
+- `commitIdentifier` 仅在同 `commitUser` 内唯一，跨 user 可重复——去重必须带上 user 与 kind。
+- `snapshot.time-retained` 过短可能让运行中的长查询读到被删快照而失败；务必配 `num-retained.min` 兜底。
+- Snapshot 删除只删 snapshot 文件，数据文件待无引用后由过期任务清理（异步）。
+- LATEST hint 在高并发写下可能短暂落后，`findLatest` 会自动验证并降级到全量扫描，但全量扫描在对象存储上慢——监控这一退化路径的频率。
 
-2. **commitIdentifier 不是全局唯一的**：它只在同一个 `commitUser` 内唯一。不同的 commitUser 可以有相同的 commitIdentifier。
-   ```java
-   // 正确的去重判断
-   boolean isDuplicate = (snapshot.commitUser().equals(myUser) 
-                          && snapshot.commitIdentifier() == myIdentifier
-                          && snapshot.commitKind() == myKind);
-   ```
+### ⑤ 收益与代价
 
-3. **Snapshot 过期配置要谨慎**：如果 `snapshot.time-retained` 设置太短，可能导致正在运行的长查询失败（查询的 Snapshot 被删除了）。
-   ```java
-   // 危险配置
-   options.put("snapshot.time-retained", "5min"); // 太短
-   // 如果有查询运行超过5分钟，可能读取失败
-   
-   // 安全配置
-   options.put("snapshot.time-retained", "1h");
-   options.put("snapshot.num-retained.min", "10"); // 至少保留10个
-   ```
+收益：O(1) 快照、统一支撑时间旅行 / 增量 / 回滚 / 精确一次。代价：需要引用计数式过期清理、hint 需验证、快照文件数需控量。
 
-**错误配置：**
-```java
-// 错误：只配置了 time-retained，没有配置 num-retained.min
-options.put("snapshot.time-retained", "10min");
-// 如果10分钟内提交了100个 snapshot，全部会被保留，占用大量空间
+**快照保留配置的协同语义**（`time-retained` + `num-retained.min/max` 三者如何共同决定删谁）：过期任务从最早快照向后扫，一个快照被删的条件是——同时满足"超出 `time-retained` 时长"且"删后存活数 ≥ `num-retained.min`"；同时存活数不得超 `num-retained.max`（超了即使没到时间也删）。即 min 是"无论多旧都至少保留这么多"的下限保护，max 是"无论多新都最多保留这么多"的上限，time 是中间的时间策略。
 
-// 正确：同时配置时间和数量限制
-options.put("snapshot.time-retained", "1h");
-options.put("snapshot.num-retained.min", "10");
-options.put("snapshot.num-retained.max", "100");
-```
+**典型误配与后果**：
 
-**生产环境注意事项：**
-1. **LATEST hint 文件可能不准确**：在高并发写入场景下，hint 文件可能指向一个不是最新的 Snapshot。Paimon 会自动验证并回退到目录扫描。
-2. **Snapshot 过期是异步的**：配置 `snapshot.time-retained` 后，过期的 Snapshot 不会立即删除，需要等待后台任务执行。
-3. **Watermark 只增不减**：即使回滚到旧 Snapshot，watermark 也不会回退，这是为了保证流式处理的正确性。
+- 只配 `time-retained=10min` 不配 `num-retained.min`：10 分钟内若提交 100 个快照全保留（没到时间），存储暴涨；且 10 分钟后可能一次性删到只剩很少，长查询撞空。
+- `time-retained` 短于最长查询耗时：运行 15 分钟的批查询读 snapshot-N，期间 N 被过期删除 → 查询读文件失败。**对策**：`num-retained.min` 给足（如 10~20）+ `time-retained` ≥ 最长查询时长。被 Tag 引用的快照不受过期影响（6.1），关键版本打 tag 是更稳的保护。
 
-**性能陷阱：**
-```java
-// 陷阱：频繁调用 latestSnapshot() 导致大量文件系统扫描
-for (int i = 0; i < 1000; i++) {
-    Snapshot snapshot = snapshotManager.latestSnapshot();
-    // 如果 LATEST hint 失效，每次都会扫描目录
-}
+### 5.1 Snapshot 字段表（v3）
 
-// 优化：使用缓存
-Snapshot snapshot = snapshotManager.latestSnapshot(); // 只查询一次
-for (int i = 0; i < 1000; i++) {
-    // 使用缓存的 snapshot
-}
-```
+> 源码：`paimon-api/.../Snapshot.java`
 
-### 核心概念解释
-
-**Snapshot（快照）：**
-表在某个时间点的完整数据视图入口。它不包含实际数据，只包含指向数据文件的元数据（通过 ManifestList）。
-
-**Snapshot ID：**
-全局单调递增的快照编号，从 1 开始。每次提交都会生成新的 Snapshot ID。
-
-**commitUser + commitIdentifier：**
-用于精确一次语义的去重机制：
-- `commitUser`：提交者的唯一标识（如 Flink job ID）
-- `commitIdentifier`：提交者内部的单调递增序列号（如 Flink checkpoint ID）
-- 组合起来可以唯一标识一次提交
-
-**CommitKind（提交类型）：**
-- `APPEND`：追加新数据，不删除已有文件
-- `COMPACT`：压缩合并，不改变逻辑数据
-- `OVERWRITE`：覆写分区或删除文件
-- `ANALYZE`：收集统计信息
-
-**base/delta/changelog 三分法：**
-- `baseManifestList`：截至本次提交的所有有效数据文件（合并后的全量）
-- `deltaManifestList`：本次提交的增量变更（新增/删除的文件）
-- `changelogManifestList`：CDC 变更日志文件（可选）
-
-**Watermark（水位线）：**
-流式处理中的事件时间进度标记。Snapshot 记录了提交时的 watermark，用于流式读取的断点续传。
-
-**LATEST hint 文件：**
-位于 `{snapshot_dir}/LATEST` 的提示文件，记录最新的 Snapshot ID，用于快速定位，避免每次都扫描目录。
-
-### 设计理念
-
-**为什么这样设计：**
-
-1. **base/delta 分离的核心价值**：
-   - 全量查询只需读取 base，性能高
-   - 增量消费只需读取 delta，避免对比全量
-   - Snapshot 过期时只需扫描 delta 即可知道哪些文件可以删除
-   ```java
-   // 全量读取
-   List<ManifestFileMeta> files = manifestList.readDataManifests(snapshot);
-   // 只读取 base + delta
-   
-   // 增量读取
-   List<ManifestFileMeta> delta = manifestList.readDeltaManifests(snapshot);
-   // 只读取 delta，效率高
-   ```
-
-2. **Snapshot 只是元数据，不是数据副本**：
-   - 多个 Snapshot 共享底层数据文件，节省存储空间
-   - 创建 Snapshot 是 O(1) 操作，只需写入一个小的 JSON 文件
-   - 代价是需要引用计数机制来管理数据文件的生命周期
-
-3. **commitIdentifier 的精确一次语义**：
-   - 分布式写入场景下，同一批数据可能因为重试被提交多次
-   - 通过 `(commitUser, commitIdentifier, commitKind)` 三元组去重
-   - 如果发现已存在相同的 Snapshot，直接返回成功，不重复提交
-
-4. **LATEST hint 文件的优化**：
-   - 避免每次都扫描目录（对象存储上的 list 操作很慢）
-   - 但 hint 可能不准确（并发写入、缓存延迟），需要验证
-   - 验证方法：检查 hint 指向的 Snapshot ID + 1 是否存在
-
-**权衡取舍：**
-
-1. **Snapshot 数量 vs 存储空间**：
-   - 每个 Snapshot 都是一个文件，过多会占用空间和 inode
-   - 通过 `snapshot.num-retained.max` 限制数量
-   - 通过 `snapshot.time-retained` 自动过期
-
-2. **LATEST hint 的准确性 vs 性能**：
-   - hint 文件可能不准确，但大多数情况下是准确的
-   - 准确时只需 1-2 次文件操作，不准确时回退到目录扫描
-   - 这是一个"乐观假设"的优化
-
-3. **Watermark 只增不减 vs 回滚灵活性**：
-   - 保证流式处理的单调性，避免数据重复消费
-   - 代价是回滚后 watermark 不会回退，可能导致部分数据被跳过
-   - 这是流式语义的必然要求
-
-**架构演进：**
-
-Snapshot 格式经历了三个版本：
-- **v1 (Paimon 0.4-0.6)**：基础的 Snapshot，只有 manifestList 字段
-- **v2 (Paimon 0.7-0.8)**：增加了 base/delta 分离，增加了 commitKind
-- **v3 (Paimon 0.9+)**：增加了 changelogManifestList、watermark、statistics、nextRowId 等字段
-
-**业界对比：**
-
-| 特性 | Paimon | Iceberg | Delta Lake |
-|------|--------|---------|------------|
-| Snapshot 格式 | JSON 文件 | Avro 文件 | JSON 日志 |
-| 增量追踪 | base/delta 分离 | added_snapshot_id 标记 | 日志追加 |
-| Changelog 支持 | ✅ 原生支持 | ❌ 需要计算 diff | ❌ 需要计算 diff |
-| Watermark | ✅ 原生支持 | ❌ 无 | ❌ 无 |
-| 精确一次 | commitUser + commitIdentifier | sequence number | txn version |
-| LATEST hint | ✅ 有 | ❌ 无 | ✅ 有（_last_checkpoint） |
-
-### 4.1 Snapshot 完整字段表格
-
-> 源码: `paimon-api/src/main/java/org/apache/paimon/Snapshot.java`
-
-Snapshot 是 Paimon 表在某个时间点的完整数据视图入口。当前版本为 v3。
-
-| 字段 | 类型 | 是否可空 | 说明 |
+| 字段 | 类型 | 可空 | 说明 |
 |---|---|---|---|
-| `version` | `int` | 否 | Snapshot 格式版本（当前 v3） |
-| `id` | `long` | 否 | 快照 ID，从 1 开始单调递增 |
-| `schemaId` | `long` | 否 | 对应的 Schema 版本 ID |
-| `baseManifestList` | `String` | 否 | 基线 Manifest 列表文件名（包含所有历史文件的合并结果） |
-| `baseManifestListSize` | `Long` | 是 | 基线列表文件大小（Paimon <=1.0 为 null） |
-| `deltaManifestList` | `String` | 否 | 增量 Manifest 列表文件名（本次提交新增/删除的文件） |
-| `deltaManifestListSize` | `Long` | 是 | 增量列表文件大小（Paimon <=1.0 为 null） |
-| `changelogManifestList` | `String` | 是 | Changelog Manifest 列表文件名（CDC 变更日志） |
-| `changelogManifestListSize` | `Long` | 是 | Changelog 列表文件大小（Paimon <=1.0 为 null） |
-| `indexManifest` | `String` | 是 | 索引 Manifest 文件名（Deletion Vector 等） |
-| `commitUser` | `String` | 否 | 提交者标识（用于去重和冲突检测） |
-| `commitIdentifier` | `long` | 否 | 提交标识符（用于快照去重，精确一次语义） |
-| `commitKind` | `CommitKind` | 否 | 提交类型 (APPEND/COMPACT/OVERWRITE/ANALYZE) |
-| `timeMillis` | `long` | 否 | 提交时间戳（毫秒） |
-| `totalRecordCount` | `long` | 否 | 表的总记录数（累计） |
-| `deltaRecordCount` | `long` | 否 | 本次变更的记录数（新增-删除） |
-| `changelogRecordCount` | `Long` | 是 | Changelog 记录数 |
-| `watermark` | `Long` | 是 | 水位线（用于流式读取） |
-| `statistics` | `String` | 是 | 统计信息文件名 |
-| `properties` | `Map<String,String>` | 是 | 附加属性 |
-| `nextRowId` | `Long` | 是 | 下一个可用的行 ID（Row Tracking 特性） |
+| version / id / schemaId | int / long / long | 否 | 格式版本 v3 / 快照 id（从 1） / 对应 schema |
+| baseManifestList(+Size) | String(+Long) | Size 旧版可空 | 基线 manifest list（历史合并结果） |
+| deltaManifestList(+Size) | String(+Long) | Size 旧版可空 | 本次增量（ADD / DELETE） |
+| changelogManifestList(+Size) | String(+Long) | 是 | CDC 变更日志 |
+| indexManifest | String | 是 | 索引（Deletion Vector 等） |
+| commitUser / commitIdentifier / commitKind | String / long / enum | 否 | 去重三元组 |
+| timeMillis | long | 否 | 提交时间 |
+| totalRecordCount / deltaRecordCount | long | 否 | 累计 / 本次净变更行数 |
+| changelogRecordCount / watermark / statistics / properties | 各 | 是 | changelog 行数 / 水位 / 统计文件名 / 附加属性 |
+| nextRowId | Long | 是 | Row Tracking 下一可用行 id |
 
-**commitIdentifier 的语义:** 如果多个 snapshot 具有相同的 commitIdentifier，则从任一 snapshot 读取的结果必须相同。commitIdentifier 较小的 snapshot 包含较老的数据。这用于 Flink 的精确一次语义下的去重。
+`commitIdentifier` 语义：相同 identifier 的快照读取结果必须一致，较小者含较老数据——这是 Flink 精确一次去重的基础。这也解释了为什么 commitIdentifier 必须在同一 commitUser 内单调递增：去重靠"扫快照链找匹配三元组"，若 identifier 非单调，无法判断"这个 identifier 是否已提交过"。Flink 用 checkpoint id（天然单调）作 identifier 正合此意。
 
-### 4.2 base/delta/changelog 三分法
+**Snapshot 格式版本演进（version 字段）**：v1（早期）只有单一 manifestList；v2 引入 base/delta 分离 + commitKind；v3（当前）加 changelogManifestList、watermark、statistics、properties、nextRowId 等。读取器按 version 决定如何解析——`Snapshot` 类用 `@JsonIgnoreProperties(ignoreUnknown=true)` 容忍未知字段，使新版写的快照能被旧版读（未知字段忽略），旧版写的快照被新版读时缺失字段为 null（如 `baseManifestListSize` 在 ≤1.0 为 null，读取时按 null 处理回退到全量 read）。这种"向前 + 向后"双向兼容是滚动升级的基础——集群里新老版本 Paimon 可短期共存。
 
-Snapshot 中的数据文件信息通过三个 ManifestList 来组织:
+**`baseManifestListSize` 为何要存**：早期版本（≤1.0）读 ManifestList 要先 `getFileStatus` 拿文件大小再读，多一次 IO；新版把 size 直接存进 Snapshot，读时省掉 stat 调用（尤其对象存储 stat 慢）。为 null（旧快照）时回退到先 stat 再读。这是个典型的"用元数据冗余换 IO"小优化——存一个 long，省一次远程 stat。同理 `deltaManifestListSize` / `changelogManifestListSize`。读取代码必须判 null 兼容旧快照，这也是 5.1 字段表里这些 Size 标"旧版可空"的原因。
 
-```
-Snapshot
-  |
-  +-- baseManifestList  -----> [ManifestFileMeta_1, ManifestFileMeta_2, ...]
-  |                               |                    |
-  |                               v                    v
-  |                          ManifestFile_1       ManifestFile_2
-  |                          [Entry_A(ADD),       [Entry_D(ADD),
-  |                           Entry_B(ADD),        Entry_E(ADD)]
-  |                           Entry_C(ADD)]
-  |
-  +-- deltaManifestList -----> [ManifestFileMeta_3]
-  |                               |
-  |                               v
-  |                          ManifestFile_3
-  |                          [Entry_F(ADD),       // 本次新增的文件
-  |                           Entry_G(DELETE)]    // 本次删除的文件
-  |
-  +-- changelogManifestList -> [ManifestFileMeta_4]  (可选)
-                                  |
-                                  v
-                             ManifestFile_4
-                             [changelog entries]  // 用于 CDC 场景
-```
+**`properties` 字段**：v3 加的 `Map<String,String>` 附加属性，存提交时的额外元信息（如来源标记、自定义审计字段）。它让 Snapshot 可携带"约定外"的信息而不改格式——新需求往 properties 塞，不用每次都升 version。这是"留扩展位"的设计：核心字段固定、properties 兜底未来需求。配合 `@JsonIgnoreProperties(ignoreUnknown=true)`，老读者遇到 properties 里的未知约定也不会崩。这种"固定字段 + 开放 properties + 忽略未知"的三件套，是 Paimon 元数据格式能长期平滑演进的工程基础。
 
-**三分法的设计原因:**
-
-1. **baseManifestList（基线）**: 包含了截至本次提交前所有有效数据文件的合并 manifest。它是经过 manifest 合并优化的，可以高效地读取全量文件列表。
-
-2. **deltaManifestList（增量）**: 仅包含本次提交新产生的变更（ADD 和 DELETE entries）。它的好处是:
-   - **快速过期**: 过期旧快照时，只需扫描 delta 部分即可知道需要清理哪些文件
-   - **流式读取**: 增量消费者只需读取 delta 部分即可获取变更
-
-3. **changelogManifestList（变更日志）**: 专门记录 CDC 变更日志文件。与 delta 分离是因为 changelog 文件有独立的生命周期和存储策略。
-
-**为什么不把所有文件放在一个列表中?** 将增量和全量分开存储是一个关键的性能优化。全量扫描只需读取 base，增量消费只需读取 delta，各取所需。如果混在一起，增量消费者需要对比两个版本的全量列表来计算差异，代价极高。
-
-### 4.3 CommitKind 提交类型
-
-> 源码: `paimon-api/src/main/java/org/apache/paimon/Snapshot.java` L454-470
+CommitKind 枚举（`Snapshot.java`）：
 
 ```java
 public enum CommitKind {
-    APPEND,     // 追加新数据文件，不删除已有文件
-    COMPACT,    // 合并压缩（不改变数据内容，只改变物理存储形式）
-    OVERWRITE,  // 覆写分区或删除已有文件后添加新文件
+    APPEND,     // 追加新数据，不删已有文件
+    COMPACT,    // 合并压缩，不改逻辑数据，只改物理组织
+    OVERWRITE,  // 覆写分区或删文件后加新文件
     ANALYZE     // 收集统计信息
 }
 ```
 
-**为什么把 COMPACT 单独作为一种 CommitKind?** 因为 compaction 不改变逻辑数据内容，只改变物理文件组织。这意味着在冲突检测中，COMPACT 提交可以更宽松地处理——它不会与 APPEND 提交产生数据层面的冲突（尽管可能需要处理文件引用冲突）。
+把 COMPACT 单列：它不改逻辑数据，冲突检测可更宽松（不会与 APPEND 产生数据层冲突，只可能文件引用冲突），且流式消费者可跳过 COMPACT 快照只读 APPEND。
 
-### 4.4 SnapshotManager 管理器
+**四种 CommitKind 的产生场景与下游语义**：
 
-> 源码: `paimon-core/src/main/java/org/apache/paimon/utils/SnapshotManager.java`
-
-SnapshotManager 管理快照文件的读写和生命周期:
-
-**核心字段:**
-
-| 字段 | 类型 | 说明 |
+| CommitKind | 由什么产生 | 流式消费者如何对待 |
 |---|---|---|
-| `fileIO` | `FileIO` | 文件系统抽象 |
-| `tablePath` | `Path` | 表根路径 |
-| `branch` | `String` | 分支名称 |
-| `snapshotLoader` | `SnapshotLoader` | 快照加载器（REST 模式用） |
-| `cache` | `Cache<Path, Snapshot>` | 快照缓存 |
+| APPEND | 普通写入新数据 | 消费其 delta 的新增行 |
+| COMPACT | LSM compaction / 小文件合并 | 跳过（数据未变，只是物理重组） |
+| OVERWRITE | INSERT OVERWRITE / APPEND 含 DELETE/DV 升级 | 视为分区 / 文件替换，需重读受影响范围 |
+| ANALYZE | 统计信息收集（ANALYZE TABLE） | 跳过（只更新 statistics，无数据变更） |
 
-**路径规则:**
+流式读默认只关心 APPEND（与 OVERWRITE 的数据变更），COMPACT / ANALYZE 不产出新行——这就是为什么"提交次数 ≠ 流式消费到的变更次数"。下游若把每个快照都当数据变更处理，会在 COMPACT 快照上空转甚至重复消费。`Snapshot.commitKind()` 是流式 source 决定"这个快照要不要发数据"的判据。
+
+**`nextRowId` 与 Row Tracking**：v3 新增的 Row Tracking 特性给每行分配全局唯一、单调的 row id（用于 CDC 去重 / 行级血缘 / 增量物化视图）。`nextRowId` 记录"下一个可分配的 row id"，提交时 `tryCommitOnce` 给本次新增的数据文件分配 `[nextRowId, nextRowId+rowCount)` 区间并更新 snapshot.nextRowId。ManifestFileMeta 的 `minRowId / maxRowId`（7.2）记录文件的 row id 区间用于剪枝，ConflictDetection 的 `checkRowIdRangeConflicts`（8.4）保证并发分配的区间不重叠。这是 8.1 里"APPEND 含 Row ID 检查时也 allowRollback=true"的原因——row id 分配冲突需回滚重分配。
+
+`commitIdentifier` / `commitUser` 的另一用途是**审计追溯**：`$snapshots` 系统表暴露这两列，排查"某个错误数据是哪个作业、哪个 checkpoint 写进来的"时按它定位。
+
+**totalRecordCount vs deltaRecordCount**：前者是累计（截至本快照表的总行数），后者是本次净变更（新增 - 删除）。两者都是"行数"非"文件数"——来自 manifest entry 里 DataFileMeta 的 rowCount 累加。它们让 `$snapshots` 能直接看出每次提交的数据量级、表的增长曲线，无需扫数据文件。负的 deltaRecordCount 说明该快照净删除（DELETE / OVERWRITE 删多于增）。这两个计数在 `tryCommitOnce` 构建 Snapshot 时算出：base 的 totalRecordCount + delta 的净变更 = 新 totalRecordCount。它们是元数据级的"廉价统计"，比 `SELECT count(*)` 快得多（后者要扫数据）。
+
+### 5.2 base/delta/changelog 三分法
 
 ```
-主分支: {tablePath}/snapshot/snapshot-{id}
-其他分支: {tablePath}/branch/branch-{name}/snapshot/snapshot-{id}
+Snapshot
+ ├ baseManifestList   → [ManifestFileMeta...] → ManifestFile [Entry(ADD)...]   全量(合并后)
+ ├ deltaManifestList  → [ManifestFileMeta]    → ManifestFile [ADD/DELETE]      本次增量
+ └ changelogManifestList(可选) → ...           changelog entries                CDC
 ```
 
-**关键方法:**
+`baseManifestList` 经 `ManifestFileMerger` 合并优化，可高效读全量；`deltaManifestList` 只含本次 ADD / DELETE，支撑两件事：
 
-| 方法 | 说明 |
-|---|---|
-| `latestSnapshot()` | 获取最新快照（先尝试 loader，再从文件系统扫描） |
-| `snapshot(id)` | 读取指定 ID 的快照（带缓存） |
-| `snapshotExists(id)` | 检查快照是否存在 |
-| `earliestSnapshotId()` | 获取最早的快照 ID |
-| `latestSnapshotOfUser(commitUser)` | 获取指定用户的最新快照（用于去重） |
-| `deleteSnapshot(id)` | 删除快照文件 |
+1. **快速过期**：清理旧快照时只需扫 delta 即知哪些文件本次新增 / 删除。
+2. **流式增量读**：增量消费者只读 delta 即得变更，无需 diff 两份全量。
 
-**latestSnapshot 的双重加载策略:**
+changelog 单列是因其有独立生命周期与存储策略（changelog 可单独过期、单独配 producer）。**为何不把所有文件放一个列表**：增量与全量分离是关键性能优化；混在一起的话增量消费者要对比两版全量列表算差异，代价极高。一句话：base 服务"读全量"，delta 服务"读增量 + 快速过期"，changelog 服务"CDC 行级消费"——三者的读者不同、生命周期不同，故分三个 list 各自演进。
+
+**delta 与 changelog 的区别**（易混）：delta 记的是"数据文件的增删"（哪些 DataFile 进 / 出表），changelog 记的是"行级变更日志"（INSERT/UPDATE_BEFORE/UPDATE_AFTER/DELETE 的具体行）。主键表更新时，delta 反映新数据文件覆盖旧的（文件级），changelog 则产出"老值 -U / 新值 +U"供下游 CDC 消费（行级）。`changelog-producer` 配置（none / input / lookup / full-compaction）决定是否及如何生成 changelog——none 则 changelogManifestList 为空，下游只能拿到 delta 的文件级变更、自己算行差异。这是 Paimon 流式 CDC 能力的核心开关。
+
+### 5.3 SnapshotManager 与 LATEST hint
+
+> 源码：`paimon-core/.../utils/SnapshotManager.java`、`utils/HintFileUtils.java`
+
+`latestSnapshot()` 双重加载：有 `snapshotLoader`（REST 模式）先走它，抛 `UnsupportedOperationException` 再回退 `latestSnapshotFromFileSystem()`；结果入 `Cache<Path,Snapshot>`：
 
 ```java
 public Snapshot latestSnapshot() {
+    Snapshot snapshot;
     if (snapshotLoader != null) {
-        try {
-            snapshot = snapshotLoader.load().orElse(null); // 尝试 REST 加载
-        } catch (UnsupportedOperationException ignored) {
-            snapshot = latestSnapshotFromFileSystem(); // fallback 到文件系统
-        }
-    } else {
-        snapshot = latestSnapshotFromFileSystem();
-    }
-    // 放入缓存
-    if (snapshot != null && cache != null) {
-        cache.put(snapshotPath(snapshot.id()), snapshot);
-    }
+        try { snapshot = snapshotLoader.load().orElse(null); }
+        catch (UnsupportedOperationException ignored) { snapshot = latestSnapshotFromFileSystem(); }
+    } else { snapshot = latestSnapshotFromFileSystem(); }
+    if (snapshot != null && cache != null) cache.put(snapshotPath(snapshot.id()), snapshot);
     return snapshot;
 }
 ```
 
-**`latestSnapshotFromFileSystem()` 的查找策略：hint 文件优先 + 验证 + 目录列表兜底。** 
+文件系统侧最终调 `HintFileUtils.findLatest`，逻辑精确如下：
 
-Paimon 维护了一个 LATEST hint 文件（位于 `{snapshot_dir}/LATEST`），用于快速定位最新快照。`HintFileUtils.findLatest()` 的查找逻辑：
+```java
+@Nullable
+public static Long findLatest(FileIO fileIO, Path dir, String prefix, Function<Long,Path> file)
+        throws IOException {
+    Long snapshotId = readHint(fileIO, LATEST, dir);          // 读 {dir}/LATEST
+    if (snapshotId != null && snapshotId > 0) {
+        long nextSnapshot = snapshotId + 1;
+        if (!fileIO.exists(file.apply(nextSnapshot))) {        // id+1 不存在 → hint 确为最新
+            return snapshotId;
+        }
+    }
+    return findByListFiles(fileIO, Math::max, dir, prefix);    // 否则全量 list 取最大
+}
+```
 
-1. 首先尝试读取 LATEST hint 文件获取快照 ID
-2. 如果 hint 存在且有效（> 0），验证该 ID 的下一个快照（ID+1）是否存在
-3. 只有当下一个快照不存在时，才确认 hint 指向的是真正的最新快照
-4. 如果 hint 文件不存在、无效或已过时（下一个快照存在），则回退到列出目录下所有快照文件取最大 ID 的方式（`findByListFiles()`）
-5. 提交成功后通过 `commitLatestHint()` 更新 hint 文件
+`readHint` 自带 3 次重试（间隔 1ms）抵御瞬时读失败；`commitLatestHint` 写 hint 时也 3 次重试 + 随机退避（500~1500ms），失败抛出。**为何要验证 id+1**：hint 可能因并发写、文件系统缓存、网络延迟而落后；用"下一个不存在"廉价确认最新——命中时仅 1~2 次文件操作，失效时自动降级全量扫描，兼顾性能与正确性。`EARLIEST` 同理，但验证条件是"该 id 文件存在"（`findEarliest`）。`isEmpty()` 也复用：`readHint(EARLIEST)==null` 即视为空表。
 
-**为什么需要验证步骤？** hint 文件可能因为并发写入、网络延迟、文件系统缓存等原因指向一个不是最新的快照。通过验证 ID+1 是否存在，可以确保 hint 的准确性，避免返回过期的快照 ID。这种设计兼顾了性能（hint 命中时只需 1-2 次文件操作）和正确性（hint 失效时自动降级到全量扫描）。
+**hint 不是真相、只是加速器**：hint 文件写失败（`commitLatestHint` 抛异常）不影响正确性——下次 `findLatest` 读到旧 hint，验证 id+1 存在后自动降级全量扫描仍得正确结果。所以 hint 写入用"尽力而为 + 重试"而非"必须成功"。这是把"性能优化"与"正确性保证"彻底解耦的设计：真相永远是"目录里 id 最大的 snapshot 文件"，hint 只是大多数情况下省去 list 的捷径。理解这点就明白为何高并发下偶尔 list 全目录不是 bug 而是预期的降级路径——监控它的频率而非试图消除它。
+
+### 5.4 快照过期与去重查询
+
+SnapshotManager 其他关键方法：`snapshot(id)`（带缓存读）、`snapshotExists(id)`、`earliestSnapshotId()`（`findEarliest` + `EARLIEST_SNAPSHOT_DEFAULT_RETRY_NUM=3` 重试容忍并发删除）、`latestSnapshotOfUser(commitUser)`（去重用，扫快照链找该 user 最新提交）、`deleteSnapshot(id)`。
+
+`latestSnapshotOfUser` 是精确一次的关键查询：Flink 重启后要知道"我（commitUser）上次提交到哪个 checkpoint（commitIdentifier）了"，据此跳过已提交的 checkpoint。`earliestSnapshotId` 带 3 次重试是因为过期任务可能正在删最早快照，单次读可能撞上"文件刚被删"的窗口。
+
+**时间旅行 / 增量读如何落到 Snapshot**（理解 scan.mode 的源码语义）：
+
+| scan 配置 | 解析到的起始/范围 | 走哪个 SnapshotManager 方法 |
+|---|---|---|
+| `scan.snapshot-id=N` | 从 snapshot-N 读全量 | `snapshot(N)` |
+| `scan.timestamp-millis=T` | 找 timeMillis ≤ T 的最大快照 | 遍历快照链按 timeMillis 二分 |
+| `scan.mode=from-snapshot` + id | 从该 id 起读 delta（增量） | 逐个 `snapshot(i)` 读 deltaManifestList |
+| `scan.mode=latest-full`（默认流式起点） | 当前 latest 全量 + 后续增量 | `latestSnapshot()` 再追 delta |
+| `scan.tag-name=X` / `scan.version` | 读 tag X 指向的快照 | TagManager 读 tag 文件 |
+
+时间旅行查历史时点的本质是"定位到某个 snapshot id 再按全量读路径走"；增量读的本质是"连续读多个 snapshot 的 deltaManifestList"。这就是为什么 base/delta 分离（5.2）能让增量读高效——增量读永远只碰 delta。
+
+```sql
+-- 时间旅行: 三种等价定位方式
+SELECT * FROM t /*+ OPTIONS('scan.snapshot-id'='100') */;                  -- 按 id
+SELECT * FROM t /*+ OPTIONS('scan.timestamp-millis'='1704067200000') */;  -- 按时间
+SELECT * FROM t /*+ OPTIONS('scan.tag-name'='release_v1') */;             -- 按 tag
+-- 增量读: 读 [start, end] 之间的 delta
+SELECT * FROM t /*+ OPTIONS('incremental-between'='95,100') */;
+-- 流式: 从某快照起持续读后续 delta
+SELECT * FROM t /*+ OPTIONS('scan.mode'='from-snapshot','scan.snapshot-id'='100') */;
+```
+
+这些 hint 最终都落到 `SnapshotManager` 的某个方法 + 三分法的某个 manifest list 读取上——理解了 5.1~5.3 就能反推任意 scan hint 的源码行为。
+
+**过期清理（SnapshotDeletion / ExpireSnapshots）与本章的关系**：过期任务按 `snapshot.time-retained` + `num-retained.min/max` 决定删哪些旧快照；删快照时要算"哪些数据文件不再被任何存活快照引用"——它只需扫被删快照的 deltaManifestList（本次新增 / 删除的文件），而非全量 base，这正是 delta 设计的第三个收益。被 Tag 引用的快照不在删除范围（6.1）。
+
+具体清理算法（为何只扫 delta 就够）：要删快照 S（id=N），其 deltaManifestList 记了 S 相对 N-1 新增 / 删除的文件。一个文件能被物理删除的条件是"它在某个被删快照里被 ADD，且在所有存活快照里都不再被引用"。由于 base 是历史合并、delta 是增量，逐个删最早快照时只需看该快照 delta 里 ADD 的文件是否在更晚的存活快照里仍有效——有效则保留、无效（已被后续 DELETE）则可清。这把"全量引用计数"降成"扫 delta 增量"，是过期清理在大表上可行的关键。**注意**：清理是后台异步的，删 snapshot 文件与删数据文件分两步，中间崩溃也安全（孤儿数据文件下次清理再回收，不会误删存活文件）。
 
 ---
 
-## 五、Tag 和 Branch 机制
+## 六、Tag 与 Branch
 
-### 解决什么问题
+### ① 要解决什么问题
 
-**核心业务问题：**
-1. **数据版本管理**：需要为重要的数据版本打标签，如"2024年度财报数据"、"v1.0发布版本"，防止被自动过期删除。
-2. **并行开发隔离**：多个团队需要在同一张表上进行独立的开发和测试，互不干扰，类似 Git 的分支功能。
-3. **A/B 测试**：需要在生产数据的基础上创建实验分支，测试新的数据处理逻辑，不影响生产环境。
-4. **数据快照保留**：某些快照需要长期保留（如月末快照），但又不想保留所有中间快照。
+Tag：给重要快照命名并阻止过期（月末快照、发布版本）。Branch：在同表上开独立演进路径做并行开发 / AB 实验，互不污染。
 
-**没有这个设计的后果：**
-- 重要的历史数据会被自动过期删除，无法追溯
-- 多团队开发时相互干扰，测试数据污染生产数据
-- 无法进行安全的实验，只能在生产环境直接修改
-- 需要手动管理快照保留策略，容易出错
+### ② 设计原理与取舍（最重要）
 
-**实际场景：**
-```sql
--- 场景1: 为月末快照打标签
-CALL sys.create_tag('my_db.orders', 'month_end_2024_01', 100);
+- **Tag = Snapshot 副本（+TTL）**：tag 文件内容就是被标记 snapshot 的 JSON（可选追加 TTL 字段），读 tag 即读 snapshot，无需额外映射表。实现极简，但代价是 tag 会阻止其引用的数据被过期清理。
+- **Branch = 写时复制**：建分支只复制 schema / snapshot / tag 这些小元数据文件，data / manifest 目录共享；O(1) 创建，新写入产生新文件。删分支时需判定哪些文件是分支独占的（逻辑复杂）。
+- **fast-forward 只快进不合并**：要求主分支无新提交（分支是主分支的直接后继），避免三方合并的冲突解决复杂度——若主分支已前进，fast-forward 失败需人工处理。
 
--- 场景2: 创建开发分支进行测试
-CALL sys.create_branch('my_db.orders', 'dev_team_a', 'month_end_2024_01');
--- 在分支上进行开发
-INSERT INTO `my_db.orders$branch_dev_team_a` VALUES (...);
+为何 Tag 文件直接是 Snapshot JSON（+TTL）而非引用：若 Tag 只存"指向 snapshot-N"的引用，那 snapshot-N 被过期删除后 Tag 就悬空了。Paimon 让 Tag 文件**内联完整 snapshot 内容**——即使原 snapshot 文件被删，Tag 仍自包含可读（它引用的数据文件因 Tag 存在而不被清理）。这就是 6.1 "Tag 阻止数据清理" 的实现基础：Tag 文件本身就是一个独立的、永不随快照链过期的 snapshot 副本。`trimToSnapshot()` 则反向——从 Tag 剥掉 TTL 字段还原成纯 Snapshot（建分支时用）。
 
--- 场景3: 测试通过后合并到主分支
-CALL sys.fast_forward('my_db.orders', 'dev_team_a');
+### ③ 关键源码
 
--- 场景4: 设置 Tag 自动过期
-CALL sys.create_tag('my_db.orders', 'daily_backup', 100, '7 d'); -- 7天后自动删除
-```
-
-### 有什么坑
-
-**误区陷阱：**
-1. **Tag 不是数据副本**：Tag 只是对 Snapshot 的引用，底层数据文件是共享的。删除 Tag 不会立即删除数据，但如果没有其他引用，数据会被清理。
-   ```java
-   // 误区：以为 Tag 是独立的数据副本
-   tagManager.createTag(snapshot, "backup", null, null, false);
-   // Tag 只是引用，不会复制数据文件
-   ```
-
-2. **分支不能直接 DDL**：尝试 `DROP TABLE my_table$branch_dev` 会失败，必须使用 `BranchManager.dropBranch()`。
-   ```sql
-   -- 错误
-   DROP TABLE my_table$branch_dev; -- 抛异常
-   
-   -- 正确
-   CALL sys.drop_branch('my_db.my_table', 'dev');
-   ```
-
-3. **fast_forward 不是 merge**：`fast_forward` 只是将主分支的指针移动到分支的最新 Snapshot，不会合并冲突。如果主分支在此期间有新提交，fast_forward 会失败。
-   ```java
-   // 场景：主分支和分支都有新提交
-   // main: snapshot-100 → snapshot-101
-   // dev:  snapshot-100 → snapshot-102
-   branchManager.fastForward("dev"); // 失败，因为 main 已经前进到 101
-   ```
-
-**错误配置：**
-```java
-// 错误：Tag TTL 设置太短
-tagManager.createTag(snapshot, "important", Duration.ofHours(1), ...);
-// 1小时后 Tag 就会被删除，可能还没来得及使用
-
-// 错误：创建分支时忘记指定 Tag
-branchManager.createBranch("dev"); // 从最新 Schema 创建空分支
-// 如果想从某个历史版本创建分支，必须先打 Tag
-```
-
-**生产环境注意事项：**
-1. **Tag 会阻止数据清理**：被 Tag 引用的 Snapshot 和数据文件不会被过期删除，即使超过了 `snapshot.time-retained`。
-2. **分支共享数据文件**：分支创建时不会复制数据文件，只复制元数据（Schema/Snapshot/Tag）。新写入的数据会生成新文件。
-3. **删除分支要谨慎**：`dropBranch` 会删除分支独有的数据文件。如果分支有重要数据，删除前要先 fast_forward 或导出。
-
-**性能陷阱：**
-```java
-// 陷阱：频繁创建和删除 Tag
-for (int i = 0; i < 1000; i++) {
-    tagManager.createTag(snapshot, "temp_" + i, null, null, false);
-    tagManager.deleteTag("temp_" + i, ...);
-}
-// 每次都会进行文件 IO，性能差
-
-// 优化：使用 Snapshot 的 num-retained 配置，而不是手动管理 Tag
-options.put("snapshot.num-retained.min", "1000");
-```
-
-### 核心概念解释
-
-**Tag（标签）：**
-对某个 Snapshot 的命名引用，类似 Git Tag。Tag 的物理文件内容就是被标记 Snapshot 的完整 JSON（可能附加 TTL 信息）。
-
-**Tag TTL（Time To Live）：**
-Tag 的自动过期时间。创建 Tag 时可以指定 `timeRetained`，到期后 Tag 会被自动删除。
-
-**Branch（分支）：**
-表的独立演进路径，拥有自己的 Schema、Snapshot、Tag，但共享底层数据文件。类似 Git 的分支。
-
-**Main Branch（主分支）：**
-默认的分支，名称为 `"main"`。所有表创建时都在主分支上。
-
-**Fast Forward（快进）：**
-将分支的最新状态合并到主分支。要求主分支没有新的提交（即分支是主分支的"直接后继"）。
-
-**写时复制（Copy-on-Write）：**
-分支创建时不复制数据文件，只复制元数据。新写入的数据会生成新文件，不会修改已有文件。
-
-### 设计理念
-
-**为什么这样设计：**
-
-1. **Tag 即 Snapshot 副本**：
-   - Tag 文件的内容就是 Snapshot 的 JSON，加上可选的 TTL 信息
-   - 这使得 Tag 的实现非常简单，不需要额外的数据结构
-   - 读取 Tag 就是读取 Snapshot，无需额外的映射表
-   ```java
-   // Tag 文件内容
-   {
-     "version": 3,
-     "id": 100,
-     "schemaId": 5,
-     "baseManifestList": "manifest-list-xxx",
-     ...
-     "tagCreateTime": "2024-01-01T00:00:00",  // Tag 特有字段
-     "tagTimeRetained": "PT168H"              // Tag 特有字段
-   }
-   ```
-
-2. **分支共享数据文件的写时复制**：
-   - 分支创建是 O(1) 操作，只需复制少量元数据文件
-   - 节省存储空间，避免大量数据复制
-   - 新写入的数据会生成新文件，不会影响其他分支
-   ```
-   main:   snapshot-100 → file-1, file-2
-   branch: snapshot-100 → file-1, file-2  (共享)
-           snapshot-101 → file-1, file-2, file-3  (file-3 是新的)
-   ```
-
-3. **分支路径的文件系统布局**：
-   - 主分支：`{table}/schema/`, `{table}/snapshot/`, `{table}/tag/`
-   - 其他分支：`{table}/branch/branch-{name}/schema/`, `{table}/branch/branch-{name}/snapshot/`
-   - 数据文件和 manifest 文件在 `{table}/manifest/` 和 `{table}/data/` 下共享
-
-4. **fast_forward 的限制**：
-   - 只允许"快进"式合并，不支持"三方合并"
-   - 这简化了实现，避免了复杂的冲突解决逻辑
-   - 如果需要合并有冲突的分支，需要手动处理
-
-**权衡取舍：**
-
-1. **Tag 阻止数据清理 vs 存储成本**：
-   - Tag 会阻止被引用的数据文件被删除，可能导致存储空间持续增长
-   - 通过 Tag TTL 机制自动清理过期 Tag
-   - 需要在数据保留和存储成本之间平衡
-
-2. **分支隔离 vs 数据共享**：
-   - 分支之间逻辑隔离，但物理共享数据文件
-   - 优势：创建分支快速，节省存储
-   - 劣势：删除分支时需要判断哪些文件是独有的，逻辑复杂
-
-3. **fast_forward 的简单性 vs 灵活性**：
-   - 只支持快进式合并，不支持复杂的合并策略
-   - 优势：实现简单，不需要冲突解决
-   - 劣势：如果主分支有新提交，无法自动合并
-
-**架构演进：**
-
-Tag 和 Branch 机制的演进：
-- **v0.4-0.6**：只有 Snapshot，没有 Tag 和 Branch
-- **v0.7-0.8**：引入 Tag 机制，支持命名快照
-- **v0.9+**：引入 Branch 机制，支持并行开发
-- **v1.0+**：增加 Tag TTL 自动过期功能
-
-**业界对比：**
-
-| 特性 | Paimon | Iceberg | Delta Lake |
-|------|--------|---------|------------|
-| Tag 支持 | ✅ 原生支持 | ✅ 通过 Ref（1.5+） | ❌ 无 |
-| Branch 支持 | ✅ 原生支持 | ✅ 通过 Ref（1.5+） | ❌ 无 |
-| Tag TTL | ✅ 支持 | ❌ 无 | - |
-| Fast Forward | ✅ 支持 | ✅ 支持 | - |
-| 写时复制 | ✅ 是 | ✅ 是 | - |
-| 文件系统布局 | 独立目录 | 通过 Ref 文件 | - |
-
-### 5.1 TagManager 标签管理
-
-> 源码: `paimon-core/src/main/java/org/apache/paimon/utils/TagManager.java`
-
-Tag 是对某个 Snapshot 的命名引用，类似 Git Tag。Tag 的物理文件内容就是被标记 Snapshot 的完整 JSON（可能附加 TTL 信息）。
-
-**路径规则:**
-
-```
-{tablePath}/[branch/branch-{name}/]tag/tag-{tagName}
-```
-
-**核心方法:**
-
-| 方法 | 说明 |
-|---|---|
-| `createTag(snapshot, tagName, timeRetained, callbacks, ignoreIfExists)` | 创建 Tag |
-| `replaceTag(snapshot, tagName, timeRetained, callbacks)` | 替换已有 Tag |
-| `deleteTag(tagName, tagDeletion, snapshotManager, callbacks)` | 删除 Tag 及其独有的数据文件 |
-| `deleteAllTagsOfOneSnapshot(tagNames, tagDeletion, snapshotManager)` | 删除指向同一快照的所有 Tag |
-| `renameTag(tagName, targetTagName)` | 重命名 Tag |
-| `tagExists(tagName)` | 检查 Tag 是否存在 |
-| `taggedSnapshots()` | 获取所有 Tag 对应的快照列表 |
-
-**Tag 创建的文件写入:**
+Tag 创建（`TagManager`，幂等覆写）：
 
 ```java
-private void createOrReplaceTag(Snapshot snapshot, String tagName,
-        Duration timeRetained, List<TagCallback> callbacks) {
+private void createOrReplaceTag(Snapshot snapshot, String tagName, Duration timeRetained,
+        List<TagCallback> callbacks) {
     validateNoAutoTag(tagName, snapshot);
     String content = timeRetained != null
-            ? Tag.fromSnapshotAndTagTtl(snapshot, timeRetained, LocalDateTime.now()).toJson()
-            : snapshot.toJson();
-    Path tagPath = tagPath(tagName);
-    fileIO.overwriteFileUtf8(tagPath, content);  // 直接覆写（幂等操作）
-    // 触发回调（如 Iceberg 兼容层）
-    if (callbacks != null) {
-        callbacks.forEach(callback -> callback.notifyCreation(tagName, snapshot.id()));
-    }
+        ? Tag.fromSnapshotAndTagTtl(snapshot, timeRetained, LocalDateTime.now()).toJson()
+        : snapshot.toJson();
+    fileIO.overwriteFileUtf8(tagPath(tagName), content);   // 直接覆写(幂等)
+    if (callbacks != null) callbacks.forEach(cb -> cb.notifyCreation(tagName, snapshot.id()));
 }
 ```
 
-**Tag 删除的安全逻辑:**
+### ④ 风险/陷阱/边界
 
-当删除 Tag 时，需要判断被标记的 Snapshot 是否仍然被其他 Snapshot 或 Tag 引用:
-- 如果对应的 Snapshot 仍然存在于快照链中 → 只删除 Tag 文件
-- 如果 Snapshot 已被过期删除，Tag 是最后一个引用 → 还需要清理被 Tag 独占的数据文件
+- Tag 阻止其引用的 snapshot 与数据文件被过期清理，可能让存储持续增长——用 TTL 自动回收。
+- 分支不能直接 `DROP TABLE $branch_x`，须 `dropBranch`。`dropBranch` 会删分支独有的数据文件，删前确认无需保留。
+- 分支名禁用：`main`（保留）、空白、纯数字（避免与 snapshot id 混淆）。
+- fast-forward 不是 merge：主分支若在分支期间有新提交，fast-forward 失败。
 
-### 5.2 Tag TTL 机制
+### ⑤ 收益与代价
 
-> 源码: `paimon-core/src/main/java/org/apache/paimon/tag/Tag.java`
+收益：命名快照保护 + 轻量并行开发，全部共享数据零拷贝。代价：删分支需判文件独占性、Tag 长期保留拖住存储。
 
-Tag 类继承自 Snapshot，额外添加了 TTL 相关字段:
+### 6.1 TagManager 与 Tag TTL
 
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `tagCreateTime` | `LocalDateTime` (nullable) | Tag 创建时间 |
-| `tagTimeRetained` | `Duration` (nullable) | Tag 保留时间 |
+> 源码：`paimon-core/.../utils/TagManager.java`、`paimon-core/.../tag/Tag.java`
 
-**向后兼容设计:** 当 `timeRetained` 未指定时，不写入 `tagCreateTime` 字段。这确保了老版本 Paimon（<= 0.7）的读取器仍然能正确解析 Tag 文件（因为 Tag 文件的 JSON 格式使用了 `@JsonIgnoreProperties(ignoreUnknown = true)`，未知字段会被忽略）。
+路径 `{tablePath}/[branch/branch-{name}/]tag/tag-{tagName}`。核心方法：`createTag` / `replaceTag` / `deleteTag(tagName, tagDeletion, snapshotManager, callbacks)` / `deleteAllTagsOfOneSnapshot` / `renameTag` / `tagExists` / `taggedSnapshots`。
 
-**TTL 过期处理:** TagManager 持有一个 `TagPeriodHandler`，在 Flink/Spark 作业的生命周期中周期性检查 Tag 是否过期:
+`Tag` 继承 `Snapshot`，加两字段 `tagCreateTime`(LocalDateTime?) / `tagTimeRetained`(Duration?)：
 
 ```java
-// 过期条件: tagCreateTime + tagTimeRetained < 当前时间
+// 过期判定
 if (tag.tagCreateTime() != null && tag.tagTimeRetained() != null) {
-    LocalDateTime expireTime = tag.tagCreateTime().plus(tag.tagTimeRetained());
-    if (expireTime.isBefore(LocalDateTime.now())) {
-        // 执行删除
-    }
+    LocalDateTime expire = tag.tagCreateTime().plus(tag.tagTimeRetained());
+    if (expire.isBefore(LocalDateTime.now())) { /* 删除 */ }
 }
 ```
 
-### 5.3 BranchManager 分支管理
+**向后兼容**：未指定 TTL 时不写这两字段，老版本读取器靠 `@JsonIgnoreProperties(ignoreUnknown=true)` 忽略未知字段，仍能把 tag 文件当普通 Snapshot 解析。
 
-> 接口: `paimon-core/src/main/java/org/apache/paimon/utils/BranchManager.java`
-> 实现: `paimon-core/src/main/java/org/apache/paimon/utils/FileSystemBranchManager.java`
+`renameTag` / `replaceTag` 的语义：`renameTag(from, to)` 改名（拷贝到新名删旧名）；`replaceTag` 用新 snapshot 内容覆写已有 tag（`overwriteFileUtf8` 幂等覆写）——常用于"把某个稳定 tag 指向更新的快照"。`deleteAllTagsOfOneSnapshot` 处理"多个 tag 指向同一快照"时的批量删除（一个快照可被多个 tag 命名）。这些操作都只动 tag 文件（小 JSON），不碰数据——Tag 管理的轻量正源于"tag = 一个自包含 snapshot JSON 副本"这个朴素设计。
 
-BranchManager 管理表的分支机制。分支允许在同一张表上创建独立的演进路径，类似 Git 的分支。
+`taggedSnapshots()` 返回所有 tag 对应的快照列表，过期清理时用它判断"哪些快照被 tag 引用因而不能删"。这把 Tag 的"保护语义"落到清理逻辑：过期任务在删快照前先查 `taggedSnapshots`，被引用的跳过。所以即便快照超出 `time-retained`，只要有 tag 指着就不删——Tag 是凌驾于快照过期策略之上的"钉子"。生产中给关键版本打 tag 比调大 `num-retained` 更精准（后者保留一段连续快照，前者只钉住需要的那几个）。
 
-**接口方法:**
+**删除 Tag 的安全逻辑**：若被标记 snapshot 仍在快照链中 → 只删 tag 文件；若 snapshot 已过期且 tag 是最后引用 → 还需清理 tag 独占的数据文件（`tagDeletion` 负责判定哪些文件不再被任何快照 / tag 引用）。
 
-| 方法 | 说明 |
-|---|---|
-| `createBranch(branchName)` | 从最新 Schema 创建空分支 |
-| `createBranch(branchName, tagName)` | 从指定 Tag 创建分支 |
-| `dropBranch(branchName)` | 删除分支及其所有数据 |
-| `fastForward(branchName)` | 将分支的最新状态快进到主分支 |
-| `renameBranch(fromBranch, toBranch)` | 重命名分支 |
-| `branches()` | 列出所有分支 |
+**自动创建 Tag（`tag.automatic-creation`）**：除手动 `createTag`，Paimon 支持按时间周期自动打 tag（如每天 / 每小时一个），由 `TagPeriodHandler` 驱动。配置 `tag.automatic-creation=process-time/watermark`、`tag.creation-period=daily/hourly`、`tag.default-time-retained`（自动 tag 的 TTL）。`validateNoAutoTag(tagName, snapshot)`（见上面 `createOrReplaceTag`）防止手动 tag 名与自动 tag 命名规则撞车。自动 tag 常用于"每天保留一个稳定快照供下游批读"——下游按 tag 名（如 `2024-01-01`）读当天数据，不受快照过期影响。这是流批一体里"流写 + 批读固定版本"的关键机制。
 
-**静态工具方法:**
+**process-time vs watermark 触发**：`automatic-creation=process-time` 按墙钟时间到点打 tag（简单但若作业有延迟，tag 对应的数据可能不完整）；`=watermark` 按事件时间 watermark 越过周期边界才打（保证 tag 数据"事件时间完整"，但 watermark 推不动就不打）。下游若严格要求"某天的 tag 含当天全部数据"应用 watermark 触发——它把 5.3 的 watermark 单调性与 tag 创建挂钩，确保 tag 是"事件时间意义上完整"的版本。这是 Paimon 把流式 watermark 语义延伸到版本管理的一个精巧设计。
+
+### 6.2 BranchManager 写时复制
+
+> 源码：`utils/BranchManager.java`（接口）、`utils/FileSystemBranchManager.java`（实现）
+
+接口方法：`createBranch(branchName)`（从最新 schema 建空分支）/ `createBranch(branchName, tagName)`（从 tag 建）/ `dropBranch` / `fastForward` / `renameBranch` / `branches()`。
+
+静态工具：
 
 ```java
-// 构建分支路径
 static String branchPath(Path tablePath, String branch) {
-    return isMainBranch(branch)
-            ? tablePath.toString()
-            : tablePath.toString() + "/branch/" + BRANCH_PREFIX + branch;
+    return isMainBranch(branch) ? tablePath.toString()
+        : tablePath.toString() + "/branch/" + BRANCH_PREFIX + branch;
 }
-
-// 规范化分支名（null/空 → "main"）
 static String normalizeBranch(String branch) {
-    return StringUtils.isNullOrWhitespaceOnly(branch) ? DEFAULT_MAIN_BRANCH : branch;
+    return StringUtils.isNullOrWhitespaceOnly(branch) ? DEFAULT_MAIN_BRANCH : branch;  // "main"
 }
 ```
 
-**分支名验证规则:**
-1. 不能是 `"main"`（保留名称）
-2. 不能为空或全空白
-3. 不能是纯数字字符串（避免与 snapshot ID 混淆）
+分支名验证规则（`validateBranch`）：(1) 不能是 `main`（保留名）；(2) 不能空 / 全空白；(3) 不能纯数字（避免与 snapshot id 混淆——`branchPath` 解析 `branch/branch-{name}` 时纯数字名会引起歧义）。`normalizeBranch` 把 null / 空白归一为 `main`，使"不指定分支"与"指定 main"等价——上层无需到处判 null。
 
-### 5.4 分支路径规则与文件布局
+从 Tag 建分支（复制 tag + snapshot + 到该 schemaId 为止的所有 schema，data / manifest 不复制）：
 
-**FileSystemBranchManager 的创建逻辑:**
-
-**从最新 Schema 创建空分支:**
-```java
-public void createBranch(String branchName, boolean ignoreIfExists) {
-    validateBranch(branchName);
-    TableSchema latestSchema = schemaManager.latest().get();
-    copySchemasToBranch(branchName, latestSchema.id());
-    // 结果: {table}/branch/branch-{name}/schema/schema-0..N 被复制
-}
-```
-
-**从 Tag 创建分支:**
 ```java
 public void createBranch(String branchName, String tagName, boolean ignoreIfExists) {
     validateBranch(branchName);
     Snapshot snapshot = tagManager.getOrThrow(tagName).trimToSnapshot();
-    // 复制 Tag 文件
     fileIO.copyFile(tagManager.tagPath(tagName),
                     tagManager.copyWithBranch(branchName).tagPath(tagName), true);
-    // 复制 Snapshot 文件
     fileIO.copyFile(snapshotManager.snapshotPath(snapshot.id()),
                     snapshotManager.copyWithBranch(branchName).snapshotPath(snapshot.id()), true);
-    // 复制所有 Schema 文件（到 tag 对应的 schema id）
     copySchemasToBranch(branchName, snapshot.schemaId());
 }
 ```
 
-**文件布局示例:**
+文件布局示意：
 
 ```
-{warehouse}/my_db.db/my_table/
-  +-- schema/                          # 主分支 schema
-  |    +-- schema-0
-  |    +-- schema-1
-  +-- snapshot/                        # 主分支 snapshot
-  |    +-- snapshot-1
-  |    +-- snapshot-2
-  +-- tag/                             # 主分支 tag
-  |    +-- tag-release_v1
-  +-- branch/
-  |    +-- branch-dev/                 # dev 分支
-  |    |    +-- schema/
-  |    |    |    +-- schema-0
-  |    |    |    +-- schema-1
-  |    |    +-- snapshot/
-  |    |    |    +-- snapshot-1        # 从 tag 复制而来
-  |    |    +-- tag/
-  |    |         +-- tag-release_v1   # 从主分支复制而来
-  |    +-- branch-feature_x/           # feature_x 分支
-  |         +-- schema/
-  |              +-- schema-0
-  |              +-- schema-1
-  +-- manifest/                        # 共享的 manifest 文件
-  +-- data/                            # 共享的数据文件
+{table}/
+  schema/  snapshot/  tag/                 # main 分支元数据
+  branch/branch-dev/{schema,snapshot,tag}/ # dev 分支元数据(复制而来)
+  manifest/  bucket-*/                      # 全分支共享(写时复制)
 ```
 
-**为什么分支共享 manifest 和 data 目录?** 分支创建时通过复制 snapshot/schema/tag 文件实现逻辑隔离，但底层的数据文件和 manifest 文件是共享的。这是一个写时复制（Copy-on-Write）策略——分支创建是轻量的 O(1) 操作，新的写入会生成新的数据文件，不会修改已有文件。
+**为何共享 manifest / data**：分支隔离靠复制 snapshot / schema / tag 实现，底层文件共享——建分支是轻量 O(1)，新写入产生新文件不改已有文件。这与 Git 的对象共享思路一致。
+
+**fastForward 的语义与限制**：`fastForward(branchName)` 把主分支指针"快进"到分支的最新快照——前提是分支是主分支的直接后继（主分支自分支创建后无新提交）。实现上需把分支的 snapshot / schema / tag 复制 / 提升回主分支，并更新主分支 LATEST hint。若主分支已前进（`main: 100→101`，`dev: 100→102`），fastForward 检测到主分支非分支祖先而失败——Paimon 不做三方合并，需人工取舍。这与 Git fast-forward only 的 merge 策略同理：简单、无冲突解决逻辑，但要求线性历史。
+
+**删分支的文件独占判定**：`dropBranch` 删 `branch/branch-{name}/` 元数据目录后，还需识别"仅该分支写入、不被主分支或其它分支引用"的数据文件并清理——这比建分支复杂得多（建分支只复制元数据，删分支要做引用分析）。这就是"分支隔离 vs 数据共享"取舍的代价落点。
+
+**Tag / Branch 典型工作流**（流批一体场景）：
+
+```sql
+-- 1. 流作业持续写主分支(write-only), 独立 compaction 作业做合并
+-- 2. 每天自动打 tag(或手动)固定一个稳定版本
+CALL sys.create_tag('my_db.orders', 'snapshot_2024_01_01', 100);
+-- 3. 批作业按 tag 读固定版本, 不受快照过期影响
+SELECT * FROM `my_db.orders` /*+ OPTIONS('scan.tag-name'='snapshot_2024_01_01') */;
+-- 4. 从 tag 开实验分支跑新逻辑, 不污染生产
+CALL sys.create_branch('my_db.orders', 'exp_dedup', 'snapshot_2024_01_01');
+INSERT INTO `my_db.orders$branch_exp_dedup` SELECT ... ;  -- 在分支上写
+SELECT * FROM `my_db.orders$branch_exp_dedup`;            -- 验证
+-- 5. 实验通过且主分支无新提交 → fast-forward 合回; 否则丢弃
+CALL sys.drop_branch('my_db.orders', 'exp_dedup');
+```
+
+要点：tag 解决"批读需要稳定版本"，branch 解决"实验不污染生产"，二者都靠"共享数据文件 + 独立元数据"实现零拷贝。**生产建议**：实验分支用完即删（避免独占文件长期占存储），重要版本用 tag 长期固定（配 TTL 自动回收临时 tag）。
 
 ---
 
-## 六、Manifest 三级结构
+## 七、Manifest 三级结构
 
-### 解决什么问题
+### ① 要解决什么问题
 
-**核心业务问题：**
-1. **大表的元数据可伸缩性**：一个大表可能包含数百万个数据文件，如果全部记录在 Snapshot 中，每次提交都需要重写整个文件，代价极高。
-2. **增量提交的效率**：每次提交只涉及少量文件的变更，不应该重写所有文件的元数据。
-3. **查询时的文件过滤**：查询时需要根据分区、桶、LSM level 等条件快速过滤出相关的数据文件，避免读取所有元数据。
-4. **Manifest 文件的碎片化**：随着提交次数增加，Manifest 文件数量也会增加，需要周期性合并以减少读取时的 IO 次数。
+大表可有数百万数据文件。若全记在 Snapshot 里，每次提交都要重写整块；查询时也无法按分区 / 桶 / level 快速剪枝；提交多了 manifest 碎片化拖慢读取。需要可伸缩、增量、可过滤、可合并的元数据组织。
 
-**没有这个设计的后果：**
-- Snapshot 文件会随着表的增长而无限膨胀，最终无法处理
-- 每次提交都需要重写所有文件的元数据，性能极差
-- 查询时需要读取所有数据文件的元数据，无法快速过滤
-- 元数据文件碎片化严重，影响查询性能
+### ② 设计原理与取舍（最重要）
 
-**实际场景：**
-```java
-// 场景1: 大表的增量提交
-// 表有 1,000,000 个数据文件
-// 本次提交只新增了 10 个文件
-// 如果没有三级结构，需要重写包含 1,000,010 个文件的元数据
-// 有了三级结构，只需写入包含 10 个文件的新 ManifestFile
+- **三级**（Snapshot→ManifestList→ManifestFile→DataFile）：Snapshot 恒定小（只存 list 文件名），每次提交只写新增的 ManifestFile + 新 ManifestList。增量写入是核心收益。
+- **ManifestFileMeta 摘要剪枝**：在 list 层就带 partitionStats、min/maxBucket、min/maxLevel，查询时跳过整个无关 ManifestFile，不读其内容。用少量统计换大量 IO 节省。
+- **ADD/DELETE 逻辑化**：entry 不动文件系统，提交是纯追加写；合并所有 entry 得有效文件集。这使提交无需修改已有文件，天然适配对象存储。
+- **取舍**：多一层间接与合并成本，换来大表可伸缩与查询剪枝；统计信息占额外存储，但性价比高。
 
-// 场景2: 分区过滤
-// 查询 WHERE partition_date = '2024-01-01'
-// ManifestFileMeta 的 partitionStats 记录了每个 ManifestFile 的分区范围
-// 可以快速跳过不相关的 ManifestFile，避免读取其内容
+### ③ 关键源码
 
-// 场景3: Manifest 合并
-// 经过 100 次提交，产生了 100 个小的 ManifestFile
-// 合并为 10 个大的 ManifestFile，减少读取时的 IO 次数
-```
-
-### 有什么坑
-
-**误区陷阱：**
-1. **ManifestFileMeta 的统计信息可能为空**：`minBucket`、`maxBucket`、`minLevel`、`maxLevel` 等字段是后来添加的优化字段，旧版本生成的 ManifestFileMeta 中这些字段为 null。
-   ```java
-   // 错误：直接使用可能为 null 的字段
-   if (meta.minBucket() == 0) { ... } // NPE 风险
-   
-   // 正确：先判空
-   if (meta.minBucket() != null && meta.minBucket() == 0) { ... }
-   ```
-
-2. **ManifestEntry 的 ADD/DELETE 不是物理操作**：它们是逻辑操作记录，不会立即修改文件系统。
-   ```java
-   // 误区：以为 DELETE entry 会立即删除文件
-   ManifestEntry entry = new ManifestEntry(FileKind.DELETE, partition, bucket, file);
-   // 文件仍然存在于文件系统，只是逻辑上被标记为删除
-   ```
-
-3. **Manifest 合并不是实时的**：合并在提交时触发，但有阈值限制（`manifest.merge-min-count`）。如果 ManifestFile 数量未达到阈值，不会合并。
-   ```java
-   // 配置了合并阈值
-   options.put("manifest.merge-min-count", "30");
-   // 只有当 ManifestFile 数量 >= 30 时才会触发合并
-   ```
-
-**错误配置：**
-```java
-// 错误：manifest.target-file-size 设置太小
-options.put("manifest.target-file-size", "1MB"); // 太小
-// 导致 ManifestFile 数量过多，查询时需要读取大量小文件
-
-// 错误：manifest.merge-min-count 设置太大
-options.put("manifest.merge-min-count", "1000"); // 太大
-// 导致 ManifestFile 长期不合并，碎片化严重
-
-// 推荐配置
-options.put("manifest.target-file-size", "8MB");
-options.put("manifest.merge-min-count", "30");
-options.put("manifest.full-compaction-threshold-size", "16MB");
-```
-
-**生产环境注意事项：**
-1. **ManifestList 文件不会被清理**：即使 Snapshot 被删除，其引用的 ManifestList 文件也不会立即删除。需要等待 Snapshot 过期后，后台任务才会清理。
-2. **Manifest 缓存要合理配置**：`CachingCatalog` 会缓存 Manifest 文件内容，但如果缓存配置不当，可能占用大量内存。
-3. **对象存储上的 Manifest 读取性能**：对象存储的小文件读取性能较差，建议增大 `manifest.target-file-size`。
-
-**性能陷阱：**
-```java
-// 陷阱：频繁读取 ManifestFile 内容
-for (ManifestFileMeta meta : manifestList.read(...)) {
-    List<ManifestEntry> entries = manifestFile.read(meta.fileName(), meta.fileSize());
-    // 每次都会进行文件 IO
-}
-
-// 优化：利用 ManifestFileMeta 的统计信息过滤
-for (ManifestFileMeta meta : manifestList.read(...)) {
-    if (!partitionFilter.test(meta.partitionStats())) {
-        continue; // 跳过不相关的 ManifestFile
-    }
-    List<ManifestEntry> entries = manifestFile.read(meta.fileName(), meta.fileSize());
-}
-```
-
-### 核心概念解释
-
-**三级结构：**
-```
-Snapshot (JSON 文件)
-  ↓ 引用
-ManifestList (二进制文件, 包含 ManifestFileMeta 列表)
-  ↓ 引用
-ManifestFile (二进制文件, 包含 ManifestEntry 列表)
-  ↓ 引用
-Data Files (实际数据文件)
-```
-
-**ManifestList（清单列表）：**
-包含多个 `ManifestFileMeta` 的二进制文件。Snapshot 通过 `baseManifestList`、`deltaManifestList`、`changelogManifestList` 三个字段引用不同类型的 ManifestList。
-
-**ManifestFileMeta（清单文件元数据）：**
-ManifestFile 的"摘要信息"，包含文件名、大小、ADD/DELETE 数量、分区统计信息等。用于快速过滤不需要读取的 ManifestFile。
-
-**ManifestFile（清单文件）：**
-包含多个 `ManifestEntry` 的二进制文件。每个 ManifestEntry 表示一个数据文件的添加或删除操作。
-
-**ManifestEntry（清单条目）：**
-表示一个数据文件的逻辑操作（ADD 或 DELETE），包含分区、桶、文件元数据等信息。
-
-**FileKind（文件操作类型）：**
-- `ADD (0)`：文件添加
-- `DELETE (1)`：文件删除
-
-**Manifest 合并（Manifest Merge）：**
-将多个小的 ManifestFile 合并为少量大的 ManifestFile，减少读取时的 IO 次数。合并时会消除 DELETE entries（如果对应的 ADD entry 也在合并范围内）。
-
-### 设计理念
-
-**为什么这样设计：**
-
-1. **三级结构的核心价值**：
-   - **可伸缩性**：支持数百万个数据文件，Snapshot 文件大小保持恒定（只包含 ManifestList 的文件名）
-   - **增量写入**：每次提交只需写入新的 ManifestFile 和 ManifestList，不需要重写所有元数据
-   - **快速过滤**：通过 ManifestFileMeta 的统计信息快速跳过不相关的 ManifestFile
-
-2. **ManifestFileMeta 的统计信息**：
-   - `partitionStats`：记录分区字段的 min/max/null count，支持分区过滤
-   - `minBucket`/`maxBucket`：支持桶级过滤
-   - `minLevel`/`maxLevel`：支持 LSM level 过滤
-   - 这些统计信息使得查询时可以跳过大量不相关的 ManifestFile，大幅提升性能
-
-3. **ADD/DELETE 的逻辑操作**：
-   - ManifestEntry 不直接修改文件系统，只记录逻辑操作
-   - 通过合并所有 ManifestEntry 可以得到有效文件列表
-   - 这使得提交操作是纯粹的追加写入，不需要修改已有文件
-
-4. **Manifest 合并的必要性**：
-   - 随着提交次数增加，ManifestFile 数量也会增加
-   - 过多的小文件会导致查询时的 IO 次数过多
-   - 合并可以消除 DELETE entries，减少元数据大小
-   ```java
-   // 合并前
-   ManifestFile-1: [ADD file-1, ADD file-2]
-   ManifestFile-2: [DELETE file-1, ADD file-3]
-   ManifestFile-3: [ADD file-4]
-   
-   // 合并后
-   ManifestFile-merged: [ADD file-2, ADD file-3, ADD file-4]
-   // file-1 的 ADD 和 DELETE 被消除
-   ```
-
-**权衡取舍：**
-
-1. **三级结构的复杂性 vs 可伸缩性**：
-   - 三级结构增加了实现复杂度，需要管理多层文件
-   - 但这是支持大表的唯一方式，否则 Snapshot 文件会无限膨胀
-
-2. **ManifestFileMeta 统计信息的准确性 vs 存储开销**：
-   - 统计信息需要额外的存储空间
-   - 但可以大幅减少查询时的 IO，性价比很高
-
-3. **Manifest 合并的频率 vs 写入性能**：
-   - 频繁合并可以减少 ManifestFile 数量，提升查询性能
-   - 但合并本身需要读取和重写 ManifestFile，影响写入性能
-   - 通过 `manifest.merge-min-count` 和 `manifest.full-compaction-threshold-size` 平衡
-
-**架构演进：**
-
-Manifest 结构的演进：
-- **v0.1-0.3**：只有两级结构（Snapshot → DataFile），无法支持大表
-- **v0.4-0.6**：引入三级结构（Snapshot → ManifestList → ManifestFile → DataFile）
-- **v0.7-0.8**：增加 ManifestFileMeta 的统计信息（partitionStats）
-- **v0.9+**：增加 minBucket/maxBucket/minLevel/maxLevel 等优化字段
-
-**业界对比：**
-
-| 特性 | Paimon | Iceberg | Delta Lake |
-|------|--------|---------|------------|
-| 层级结构 | 三级 | 三级 | 两级（Snapshot → DataFile） |
-| 统计信息 | ✅ 丰富（分区/桶/level） | ✅ 丰富（分区/列） | ✅ 基础（分区） |
-| Manifest 合并 | ✅ 自动合并 | ✅ 自动合并 | ❌ 无 |
-| 增量追踪 | base/delta 分离 | added_snapshot_id | 日志追加 |
-| 文件格式 | 二进制（Avro） | Avro | Parquet |
-
-### 6.1 整体架构
-
-Paimon 使用三级 Manifest 结构来管理数据文件的元数据:
-
-```
-Snapshot (JSON 文件)
-  |
-  |  baseManifestList / deltaManifestList / changelogManifestList
-  |           (文件名引用)
-  |
-  v
-ManifestList (二进制文件, 包含 ManifestFileMeta 列表)
-  |
-  |  fileName 引用
-  |
-  v
-ManifestFile (二进制文件, 包含 ManifestEntry 列表)
-  |
-  |  DataFileMeta 引用
-  |
-  v
-Data Files (实际数据文件: ORC / Parquet / Avro)
-```
-
-**为什么用三级结构而不是直接在 Snapshot 中记录所有文件?**
-
-1. **可伸缩性**: 一个大表可能包含数百万个数据文件。如果全部记录在 Snapshot JSON 中，每次提交都需要重写整个文件，代价极高。
-2. **增量写入**: 通过三级结构，每次提交只需:
-   - 写入新的 ManifestFile（包含新增/删除的 entries）
-   - 写入新的 ManifestList（引用更新后的 ManifestFile 集合）
-   - 写入新的 Snapshot（引用新的 ManifestList）
-3. **Manifest 合并优化**: 随着提交次数增加，ManifestFile 数量也会增加。可以周期性地将多个小 ManifestFile 合并为大文件，减少读取时的 IO 次数。
-
-### 6.2 ManifestList 清单列表
-
-> 源码: `paimon-core/src/main/java/org/apache/paimon/manifest/ManifestList.java`
-
-ManifestList 继承自 `ObjectsFile<ManifestFileMeta>`，是一个包含多个 `ManifestFileMeta` 的二进制文件:
-
-**读取方法:**
-
-| 方法 | 说明 |
-|---|---|
-| `readAllManifests(snapshot)` | 读取所有 manifest（data + changelog） |
-| `readDataManifests(snapshot)` | 读取数据 manifest（base + delta） |
-| `readDeltaManifests(snapshot)` | 仅读取 delta manifest |
-| `readChangelogManifests(snapshot)` | 仅读取 changelog manifest |
-
-**读取实现:**
+ManifestList 读数据 manifest（base+delta，`ManifestList.java`）：
 
 ```java
 public List<ManifestFileMeta> readDataManifests(Snapshot snapshot) {
@@ -1990,804 +1316,535 @@ public List<ManifestFileMeta> readDataManifests(Snapshot snapshot) {
 }
 ```
 
-**写入方法:**
+### ④ 风险/陷阱/边界
+
+- `minBucket / maxBucket / minLevel / maxLevel / minRowId / maxRowId` 是后加优化字段，旧文件里为 null，用前必判空否则 NPE。
+- Manifest 合并非实时：受 `manifest.merge-min-count`（默认 30）阈值约束，未达阈值不合并。
+- `manifest.target-file-size` 过小→ManifestFile 过多、读小文件多；过大→合并成本高。对象存储建议增大。
+- ManifestList / ManifestFile 在 snapshot 过期前不会清理。
+
+### ⑤ 收益与代价
+
+收益：支撑百万级文件、增量提交、多维剪枝。代价：层级与合并复杂度、统计信息存储开销、对象存储下小 manifest 读较慢。
+
+### 7.1 三级结构与 ObjectsFile
+
+> 源码：`manifest/ManifestList.java`、`manifest/ManifestFile.java`（均继承 `ObjectsFile<T>`）
+
+```
+Snapshot (JSON)
+  │ baseManifestList / deltaManifestList / changelogManifestList (文件名)
+  ▼
+ManifestList (二进制 ObjectsFile<ManifestFileMeta>)
+  │ fileName 引用
+  ▼
+ManifestFile (二进制 ObjectsFile<ManifestEntry>)
+  │ DataFileMeta 引用
+  ▼
+Data Files (ORC / Parquet / Avro)
+```
+
+`ManifestList` 是 `ObjectsFile<ManifestFileMeta>`，`write` 用 `writeWithoutRolling`（list 文件不大、不滚动）；`ManifestFile` 是 `ObjectsFile<ManifestEntry>`，支持滚动写（达 `target-file-size` 自动开新文件）。读方法：`readAllManifests`(data+changelog) / `readDataManifests`(base+delta) / `readDeltaManifests` / `readChangelogManifests`。
+
+**`ObjectsFile<T>` 是什么**：一个把对象列表序列化进单个自描述文件的通用容器——内部用 Paimon 的行格式（含 schema 头）把每个 T 写成一行，读时按行反序列化。manifest 用它而非 JSON 是因为：(1) 二进制紧凑（百万 entry 时 JSON 体积与解析都不可接受）；(2) 自描述（文件头带 schema，向后兼容字段增减）；(3) 支持按 offset 部分读。ManifestList 不滚动是因其条目少（几十到几百个 ManifestFileMeta）；ManifestFile 滚动是因 entry 可能极多（一个大提交几十万文件），需控制单文件大小。
+
+`readDataManifests` 返回 base + delta 的全部 ManifestFileMeta（全量视图）；`readDeltaManifests` 只返回 delta（增量视图）；`readChangelogManifests` 取 changelog。这三个方法的分工直接对应 5.2 三分法——全量读调第一个，增量 / CDC 读调后两个，各取所需不互相拖累。
+
+### 7.2 ManifestFileMeta 过滤剪枝
+
+> 源码：`manifest/ManifestFileMeta.java`
+
+| 字段 | 类型 | 用途 |
+|---|---|---|
+| fileName / fileSize | String / long | 文件定位 |
+| numAddedFiles / numDeletedFiles | long | ADD / DELETE 计数（合并决策） |
+| partitionStats | SimpleStats | 分区 min / max / nullCount → 分区剪枝 |
+| schemaId | long | 写入时 schema |
+| minBucket / maxBucket | Integer? | 桶剪枝 |
+| minLevel / maxLevel | Integer? | LSM level 剪枝 |
+| minRowId / maxRowId | Long? | Row Tracking 剪枝 |
+
+`FileStoreScan` 用 `partitionStats` + 分区谓词在 list 层就过滤掉整个无关 ManifestFile，避免读其全部 entry——这是大表查询性能的关键剪枝点：
 
 ```java
-public Pair<String, Long> write(List<ManifestFileMeta> metas) {
-    return super.writeWithoutRolling(metas.iterator());
-    // 返回 (文件名, 文件大小)
+// 读取流程(FileStoreScan, 简化)
+for (ManifestFileMeta meta : manifestList.readDataManifests(snapshot)) {
+    if (!partitionFilter.test(meta.partitionStats())) continue;   // 剪枝：整文件跳过
+    entries.addAll(manifestFile.read(meta.fileName(), meta.fileSize()));
 }
+entries = FileEntry.mergeEntries(entries);   // 合并得有效文件列表
 ```
 
-ManifestList 写入时不使用滚动写入（rolling write），因为一个 ManifestList 文件通常不会太大（只包含 ManifestFileMeta 的元数据，不包含实际数据条目）。
+**为何 min/maxBucket 等可空**：后加的优化字段，为兼容旧版生成的 meta 设为可空；为 null 时该维度无法剪枝但不影响正确性（退化为读取后再过滤）。
 
-### 6.3 ManifestFileMeta 字段详解
+**`partitionStats`（SimpleStats）的结构与剪枝原理**：它对该 ManifestFile 内所有 entry 的分区字段值聚合出 `minValues` / `maxValues`（BinaryRow）+ `nullCounts`。查询带分区谓词（如 `dt = '2024-01-01'` 或 `dt > '2024-01'`）时，`PartitionPredicate` 用 min/max 做区间判断：若谓词与 [min, max] 无交集，整个 ManifestFile 跳过。这是"分区裁剪"的元数据级实现——不读 ManifestFile 内容就能排除整批文件。代价是每个 ManifestFile 多存一份 SimpleStats，但相对其包含的成百上千 entry，开销可忽略，剪枝收益极大。桶剪枝（`minBucket/maxBucket`）、level 剪枝（`minLevel/maxLevel`）同理——分别支持"只查特定 bucket"和"LSM 分层读取"。
 
-> 源码: `paimon-core/src/main/java/org/apache/paimon/manifest/ManifestFileMeta.java`
+### 7.3 ManifestEntry 与合并语义
 
-ManifestFileMeta 是 ManifestFile 的"摘要信息"，用于快速过滤不需要读取的 ManifestFile:
+> 源码：`manifest/ManifestEntry.java`、`manifest/FileKind.java`
 
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `fileName` | `String` | ManifestFile 的文件名 |
-| `fileSize` | `long` | 文件大小（字节） |
-| `numAddedFiles` | `long` | 包含的 ADD 类型 entry 数量 |
-| `numDeletedFiles` | `long` | 包含的 DELETE 类型 entry 数量 |
-| `partitionStats` | `SimpleStats` | 分区字段的统计信息（min/max/null count） |
-| `schemaId` | `long` | 写入时的 Schema ID |
-| `minBucket` | `Integer` (nullable) | 最小桶编号 |
-| `maxBucket` | `Integer` (nullable) | 最大桶编号 |
-| `minLevel` | `Integer` (nullable) | 最小 LSM level |
-| `maxLevel` | `Integer` (nullable) | 最大 LSM level |
-| `minRowId` | `Long` (nullable) | 最小行 ID（Row Tracking） |
-| `maxRowId` | `Long` (nullable) | 最大行 ID |
-
-**过滤优化的核心:** `partitionStats` 字段记录了该 ManifestFile 中所有 entry 的分区字段 min/max。在查询时，可以根据分区过滤条件快速跳过不相关的 ManifestFile，避免读取其内容。类似地，`minBucket`/`maxBucket` 和 `minLevel`/`maxLevel` 也支持桶级和 level 级的过滤。
-
-**为什么 minBucket/maxBucket 等字段可空?** 这些是后来添加的优化字段。为了向后兼容旧版本生成的 ManifestFileMeta，这些字段设计为可空。当为 null 时，无法进行对应维度的过滤，但不影响正确性。
-
-### 6.4 ManifestFile 与 ManifestEntry
-
-> 源码:
-> - `paimon-core/src/main/java/org/apache/paimon/manifest/ManifestFile.java`
-> - `paimon-core/src/main/java/org/apache/paimon/manifest/ManifestEntry.java`
-> - `paimon-core/src/main/java/org/apache/paimon/manifest/FileKind.java`
-
-**ManifestFile** 继承自 `ObjectsFile<ManifestEntry>`，包含多个 `ManifestEntry`。它支持滚动写入（rolling write），当文件大小达到阈值时自动滚动到新文件。
-
-**ManifestEntry** 表示一个数据文件的添加或删除操作:
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `_KIND` | `TinyInt` (FileKind) | ADD=0 表示添加文件, DELETE=1 表示删除文件 |
-| `_PARTITION` | `bytes` (BinaryRow) | 分区值 |
-| `_BUCKET` | `int` | 桶编号 |
-| `_TOTAL_BUCKETS` | `int` | 总桶数 |
-| `_FILE` | `DataFileMeta` | 数据文件的完整元数据 |
-
-**FileKind 枚举:**
+ManifestEntry 字段：`_KIND`(FileKind: ADD=0 / DELETE=1)、`_PARTITION`(BinaryRow)、`_BUCKET`(int)、`_TOTAL_BUCKETS`(int)、`_FILE`(DataFileMeta 完整元数据)。
 
 ```java
-public enum FileKind {
-    ADD((byte) 0),     // 文件添加
-    DELETE((byte) 1);  // 文件删除
-}
+public enum FileKind { ADD((byte) 0), DELETE((byte) 1); }
 ```
 
-**ADD/DELETE 的语义:** ManifestEntry 并不直接修改文件系统上的数据文件。它们是逻辑操作记录:
-- `ADD`: 表示一个新的数据文件被添加到表中
-- `DELETE`: 表示一个已有的数据文件从逻辑上被移除（物理文件在 snapshot 过期时才会被清理）
+ADD / DELETE 是逻辑标记（DELETE 不立即删物理文件，过期才清）。`FileEntry.mergeEntries` 把所有 entry 归并：同一文件最后一个 entry 决定其存在与否（ADD 后又 DELETE 即抵消），得到有效文件列表。这是"提交即追加、读取即合并"的核心——写路径永不修改旧文件，读路径通过合并还原逻辑状态。
 
-通过对所有 ManifestEntry 进行合并（merge），可以得到表在某个 snapshot 时的完整有效文件列表: 同一个文件的最后一个 entry 决定其状态。
-
-### 6.5 Manifest 写入与读取流程
-
-**写入流程（在 FileStoreCommitImpl.tryCommitOnce 中）:**
+合并语义的具体例子：
 
 ```
-1. 收集变更 (collectChanges)
-   CommitMessage[] --> ManifestEntryChanges
-   分离为: appendTableFiles, compactTableFiles, appendChangelog, compactChangelog
-
-2. 合并旧的 base manifest
-   mergeBeforeManifests = manifestList.readDataManifests(latestSnapshot)
-   mergeAfterManifests = ManifestFileMerger.merge(
-       mergeBeforeManifests,
-       manifestFile,
-       targetSize,          // 目标文件大小
-       mergeMinCount,       // 最小合并文件数
-       fullCompactionSize,  // 全量压缩阈值
-       partitionType,
-       parallelism)
-   baseManifestList = manifestList.write(mergeAfterManifests)
-
-3. 写入增量 delta
-   deltaManifestList = manifestList.write(manifestFile.write(deltaFiles))
-
-4. 写入 changelog（如有）
-   changelogManifestList = manifestList.write(manifestFile.write(changelogFiles))
-
-5. 写入 index manifest（如有）
-   indexManifest = indexManifestFile.writeIndexFiles(oldIndexManifest, indexFiles)
+ManifestFile-1: [ADD file-a, ADD file-b]
+ManifestFile-2: [DELETE file-a, ADD file-c]   # compaction 把 a 合进 c
+ManifestFile-3: [ADD file-d]
+                       ↓ FileEntry.mergeEntries
+有效文件: {file-b, file-c, file-d}            # file-a 的 ADD 被后续 DELETE 抵消
 ```
 
-**读取流程（在 FileStoreScan 中）:**
+注意合并是按"文件标识 +（分区, 桶）"分组判定的——同一物理文件在同一 (partition, bucket) 下的 ADD 与 DELETE 才能抵消。这保证了 LSM compaction（把若干小文件合成大文件 = DELETE 旧 + ADD 新）在元数据层正确反映：旧文件逻辑消失、新文件逻辑出现，读取者只看到合并后的有效集。`SimpleFileEntry` 是 `ManifestEntry` 的轻量投影（只留冲突检测必需字段），冲突检测用它而非完整 entry 以省内存。
+
+**为何冲突检测用 SimpleFileEntry 而非完整 ManifestEntry**：冲突检测只需要 (kind, partition, bucket, 文件标识, keyRange, level, rowIdRange)，不需要完整 DataFileMeta（含列统计、schema id、各种 min/max 等几十个字段）。高并发提交时，变更分区可能含成千上万文件，若都用完整 entry 做检测，内存与 GC 压力大；`SimpleFileEntry` 把每条压到必需字段，让冲突检测在大变更集下仍可控。这也是 8.3 增量冲突检测缓存 `baseDataFiles` 用 `List<SimpleFileEntry>` 而非完整 entry 的原因——缓存的是轻量投影，重试时增量 merge 也省内存。这种"为特定用途做窄投影"的模式在 Paimon 里反复出现（如 `SimpleStats` 之于完整统计），核心是"按需取最小字段集"以控成本。
+
+### 7.4 Manifest 合并时机与策略
+
+每次提交（`tryCommitOnce` 构建新 Snapshot 时）都会尝试合并旧 base manifest：
 
 ```
-1. 读取 Snapshot（从 SnapshotManager）
-
-2. 通过 ManifestList 读取 ManifestFileMeta 列表
-   List<ManifestFileMeta> metas = manifestList.readDataManifests(snapshot)
-
-3. 利用 ManifestFileMeta 的 partitionStats 过滤不相关的 manifest
-   metas = metas.stream()
-       .filter(meta -> partitionFilter.test(meta.partitionStats()))
-       .collect(...)
-
-4. 读取过滤后的 ManifestFile 获取 ManifestEntry 列表
-   for (ManifestFileMeta meta : metas) {
-       entries.addAll(manifestFile.read(meta.fileName(), meta.fileSize()))
-   }
-
-5. 合并 entries (FileEntry.mergeEntries)
-   得到有效的数据文件列表
+mergeBefore = manifestList.readDataManifests(latestSnapshot)
+mergeAfter  = ManifestFileMerger.merge(mergeBefore, manifestFile,
+                targetSize,          // manifest.target-file-size (8MB)
+                mergeMinCount,       // manifest.merge-min-count (30)
+                fullCompactionSize,  // manifest.full-compaction-threshold-size (16MB)
+                partitionType, parallelism)
+baseManifestList = manifestList.write(mergeAfter)
 ```
 
-**Manifest 合并（ManifestFileMerger）的时机和策略:** 每次提交时都会尝试合并旧的 base manifest 文件。合并规则:
-- 当 ManifestFile 中的 DELETE entries 过多（已删除文件的比例高）时，合并可以消除这些无效记录
-- 当小的 ManifestFile 数量超过阈值时，合并可以减少后续读取的 IO 次数
-- 合并结果的目标文件大小由 `manifest.target-file-size` 控制
+合并触发条件：小 ManifestFile 数超过 `merge-min-count`（减少后续读 IO），或 DELETE entries 占比高（消除无效记录、缩小元数据）。合并时若一对 ADD / DELETE 都在合并范围内可直接消除。`full-compaction-threshold-size` 控制何时做全量压缩（把所有 manifest 重整为目标大小的大文件）。合并是写入路径的一部分——所以频繁小提交会反复触发合并、拖慢写入，应增大批量。
+
+**完整写入流程（在 tryCommitOnce 构建 Snapshot 阶段）：**
+
+```
+1. collectChanges: CommitMessage[] → 分桶 appendTableFiles / compactTableFiles /
+   appendChangelog / compactChangelog / appendIndexFiles / compactIndexFiles
+2. 合并旧 base manifest:
+   mergeBefore = manifestList.readDataManifests(latestSnapshot)
+   mergeAfter  = ManifestFileMerger.merge(mergeBefore, manifestFile, targetSize,
+                   mergeMinCount, fullCompactionSize, partitionType, parallelism)
+   baseManifestList = manifestList.write(mergeAfter)
+3. 写增量 delta:  deltaManifestList = manifestList.write(manifestFile.write(deltaFiles))
+4. 写 changelog(如有): changelogManifestList = manifestList.write(manifestFile.write(changelogFiles))
+5. 写 index manifest(如有): indexManifest = indexManifestFile.writeIndexFiles(oldIndexManifest, indexFiles)
+```
+
+注意第 2 步：**每次提交都重写 base manifest list**（合并后），但 ManifestFileMerger 在文件数 / DELETE 占比未达阈值时会尽量复用旧 ManifestFile（只新建必要的），所以"重写 list"不等于"重写所有 manifest 内容"——list 本身很小（只含 ManifestFileMeta）。这是 Paimon 在"提交轻量"与"读取不碎片化"之间的平衡点。
+
+**索引写入的增量复用（第 5 步）**：`indexManifestFile.writeIndexFiles(oldIndexManifest, indexFiles)` 不是从头重写，而是读旧 index manifest + 叠加本次新增 / 删除的索引文件条目，写出新 index manifest。这与 data manifest 合并思路一致——增量更新、复用旧条目，避免大表每次提交重写全部索引元数据。DV 表频繁删除（每次删都产新 DV 文件）时这个增量复用尤其重要，否则 index manifest 会和数据一样膨胀。至此五步（分桶 → 合并 base → 写 delta → 写 changelog → 写 index）全部串起：每步都是"增量产出 + 尽量复用旧文件"，最终汇成一个 Snapshot 引用的几个 list 文件名——这就是把"一次提交"压到几 KB 元数据写入的工程实现。
+
+**三级结构的伸缩性算账**（为何非要三级）：设一张表 100 万数据文件，每个 DataFileMeta 约 200 字节。
+
+- **若两级（Snapshot 直接列文件）**：每个 snapshot 要存 100 万 × 200B ≈ 200MB，每次提交（哪怕只加 10 个文件）都要重写这 200MB——完全不可行。
+- **三级**：Snapshot 只存 3 个 list 文件名（几十字节）；ManifestList 存 N 个 ManifestFileMeta（每个约 100 字节，N 通常几十到几百）；ManifestFile 才存 DataFileMeta。新增 10 个文件只需写一个含 10 条 entry 的新 ManifestFile（2KB）+ 一个新 ManifestList（几 KB）+ 一个新 Snapshot（几百字节），其余 ManifestFile 原样复用。提交成本从 200MB 降到几 KB——这就是三级结构的全部意义。
+
+读取时再靠 ManifestFileMeta 的统计（7.2）剪枝：分区谓词命中少数 ManifestFile 就只读那几个，避免把 100 万文件的元数据全读一遍。**伸缩性（增量写）+ 剪枝（按需读）**是三级结构的两大收益，缺一不可。
+
+**与 LSM 的协同**：ManifestFileMeta 的 `minLevel/maxLevel` 让读取能按 LSM level 组织——主键表 merge-on-read 时要把同 key 的多个版本（分散在不同 level）合并，先按 level 剪枝拿到相关 ManifestFile、再读出文件做归并。`minBucket/maxBucket` 则支持"只读某 bucket"（点查或按 bucket 并行）。这两个维度的剪枝是 Paimon LSM 主键表点查（配合 LookupLevels）和并行扫描的元数据基础——没有它们，每次点查都要扫全表 manifest。这也回扣 8.4 的 key-range 冲突检测：写时保证同 level 同 bucket 无 key 重叠，读时才能按 level/bucket 高效定位。元数据剪枝（读）与冲突检测（写）共同维护 LSM 的有序结构。
+
+**Manifest 性能调优速查**：
+
+| 症状 | 配置 | 调整方向 | 原因 |
+|---|---|---|---|
+| 查询读大量小 manifest 慢（尤其对象存储） | `manifest.target-file-size` | 调大（如 16~32MB） | 减少 ManifestFile 个数，合并成大文件少 IO |
+| ManifestFile 长期碎片化不合并 | `manifest.merge-min-count` | 调小（如 10） | 更早触发合并 |
+| 写入因频繁全量合并变慢 | `manifest.full-compaction-threshold-size` | 调大 | 推迟全量压缩频率 |
+| 元数据膨胀（DELETE entry 多） | 提交时自动合并 | 增大批量提交 | 合并消除 ADD/DELETE 对 |
+| Catalog 侧重复读 manifest | `cache.manifest-small-file-memory` | 调大 | SegmentsCache 容纳更多小文件 |
+
+调优总原则：**对象存储偏向"大文件少 IO"（调大 target-file-size + manifest 缓存），HDFS 容忍更多小文件**。批量提交（减少提交频次）几乎总是正收益——它同时减轻 manifest 合并、冲突检测、快照膨胀三方面压力。
 
 ---
 
-## 七、Commit 流程
+## 八、Commit 乐观锁全流程
 
-### 解决什么问题
+### ① 要解决什么问题
 
-**核心业务问题：**
-1. **并发写入的安全性**：多个写入者可能同时向同一张表提交数据，需要保证数据不会相互覆盖或产生冲突。
-2. **精确一次语义（Exactly-Once）**：分布式写入场景下，同一批数据可能因为重试被提交多次，需要自动去重。
-3. **数据一致性**：提交必须是原子的——要么全部成功，要么全部失败，不能出现部分成功的中间状态。
-4. **冲突检测**：对于主键表，需要检测并发写入是否产生了 key range 重叠，避免破坏主键唯一性。
-5. **APPEND 和 COMPACT 的分离**：追加新数据和压缩旧数据是两种不同的操作，需要分别提交和管理。
+多写并发安全、精确一次去重、提交原子性、主键表 key-range 冲突检测、APPEND 与 COMPACT 语义分离。
 
-**没有这个设计的后果：**
-- 并发写入会相互覆盖，导致数据丢失
-- 重试会产生重复数据，破坏数据一致性
-- 提交失败后可能留下不一致的中间状态
-- 主键表可能出现重复的主键值
-- 无法区分数据变更和物理优化，影响流式消费
+### ② 设计原理与取舍（最重要）
 
-**实际场景：**
+- **乐观锁 + 重试退避**：读 latest → 算新 snapshot → 原子写 `snapshot-{id+1}`，撞车则随机退避重试，受 `commit.max-retries`（10）与 `commit.timeout` 双限。无锁服务依赖，低冲突场景一次成功。
+- **APPEND / COMPACT 分两次提交**：语义清晰（新数据 vs 物理优化）、流式消费可只吃 APPEND、错误恢复策略不同（APPEND 可回滚、COMPACT 不回滚）。代价是一次 commit 可能产两个 snapshot。
+- **增量冲突检测**：重试时不重读全部 base，只增量补 `[上次latest, 现latest]` 的变更再 merge——大幅降低高冲突下的重试 IO。
+- **多层冲突检测**：桶数一致性、delta 内部一致性、删除存在性、key-range 重叠、Row ID 范围——比 Iceberg / Delta 的分区 / 文件级更细。
+- **取舍**：低冲突无锁高吞吐；高冲突反复重试（极端下需关写侧 compaction + 独立 compaction 作业，见官方 concurrency-control 文档）。
+
+### ③ 关键源码
+
+`FileStoreCommitImpl` 类注释明确警告：**任何 commit 期间的异常绝不能吞，必须抛出以重启作业**；建议把 `FileStoreCommitTest` 跑上千次验证修改正确性（`FileStoreCommitImpl.java:124-126`）。核心协作者：`snapshotCommit`（原子提交，filesystem 走原子写、REST 走服务端）、`conflictDetection`、`scanner`（CommitScanner，增量读）、`rollback`（CommitRollback，可空）、`retryWaiter`、`strictModeChecker`（可空）。
+
+### ④ 风险/陷阱/边界
+
+- 一次 `commit()` 产生 0~2 个 snapshot（无变更且 `ignoreEmptyCommit` 则 0）。
+- 冲突检测仅针对变更分区，不同分区并发不冲突。
+- APPEND 若含 DELETE / DV，经 `shouldBeOverwriteCommit` 升级为 OVERWRITE 并允许回滚（不是简单"if hasDelete||hasDV"，由该方法综合判定）。
+- 对象存储须配外部锁（hive / jdbc + `lock.enabled`），否则原子写不可靠可能丢快照。
+
+### ⑤ 收益与代价
+
+收益：无锁高吞吐、精确一次、细粒度冲突检测、可回滚。代价：高冲突下重试放大延迟、冲突检测需读变更分区元数据、双快照增加元数据量。
+
+### 8.1 commit() 与 APPEND/COMPACT 分离
+
+> 源码：`paimon-core/.../operation/FileStoreCommitImpl.java:290-380`
+
 ```java
-// 场景1: 并发写入
-// 两个 Flink job 同时向同一张表写入数据
-// Job A: 提交 snapshot-100（新增 file-1, file-2）
-// Job B: 提交 snapshot-100（新增 file-3, file-4）
-// 乐观锁机制确保只有一个成功，另一个重试为 snapshot-101
-
-// 场景2: 精确一次语义
-// Flink checkpoint 100 提交了 snapshot-50
-// 如果 checkpoint 100 失败重启，重新提交时会检测到 snapshot-50 已存在
-// 通过 (commitUser, commitIdentifier, commitKind) 去重，跳过重复提交
-
-// 场景3: 冲突检测
-// 两个写入者同时向同一个 bucket 写入数据
-// Writer A: 写入 key range [1, 100]
-// Writer B: 写入 key range [50, 150]
-// 冲突检测发现 key range 重叠，拒绝提交
-
-// 场景4: APPEND/COMPACT 分离
-// 一次提交包含新数据和压缩结果
-// 生成两个 snapshot: snapshot-100 (APPEND), snapshot-101 (COMPACT)
-// 流式消费者只消费 APPEND 类型的 snapshot
-```
-
-### 有什么坑
-
-**误区陷阱：**
-1. **commit() 可能生成 0-2 个 Snapshot**：不是每次 commit 都会生成 Snapshot。如果没有变更且 `ignoreEmptyCommit=true`，不会生成 Snapshot。
-   ```java
-   // 误区：以为每次 commit 都会生成 Snapshot
-   int count = commit.commit(committable, true);
-   // count 可能是 0（无变更）、1（只有 APPEND 或 COMPACT）、2（APPEND + COMPACT）
-   ```
-
-2. **冲突检测不是全局的**：只检测变更分区内的冲突，不同分区的并发写入不会冲突。
-   ```java
-   // 不会冲突：写入不同分区
-   Writer A: INSERT INTO t PARTITION(dt='2024-01-01') ...
-   Writer B: INSERT INTO t PARTITION(dt='2024-01-02') ...
-   
-   // 可能冲突：写入相同分区
-   Writer A: INSERT INTO t PARTITION(dt='2024-01-01') ...
-   Writer B: INSERT INTO t PARTITION(dt='2024-01-01') ...
-   ```
-
-3. **OVERWRITE 会自动升级**：如果 APPEND 提交包含 DELETE 操作或 Deletion Vector，会自动升级为 OVERWRITE，启用更严格的冲突检测。
-   ```java
-   // 原本是 APPEND
-   CommitKind kind = CommitKind.APPEND;
-   // 但如果包含 DELETE 或 DV
-   if (hasDelete || hasDV) {
-       kind = CommitKind.OVERWRITE; // 自动升级
-   }
-   ```
-
-**错误配置：**
-```java
-// 错误：commit.max-retries 设置太小
-options.put("commit.max-retries", "1"); // 太少
-// 在高并发场景下容易失败
-
-// 错误：commit.timeout 设置太短
-options.put("commit.timeout", "10s"); // 太短
-// 如果冲突检测需要读取大量文件，可能超时
-
-// 推荐配置
-options.put("commit.max-retries", "10");
-options.put("commit.timeout", "5min");
-options.put("commit.min-retry-wait", "10ms");
-options.put("commit.max-retry-wait", "10s");
-```
-
-**生产环境注意事项：**
-1. **对象存储必须启用锁**：S3/OSS 等对象存储的原子操作能力有限，必须配置 `CatalogLock` 来保证并发安全。
-2. **重试会增加延迟**：在高并发场景下，重试次数可能很多，导致提交延迟增加。需要监控 `retryCount` 指标。
-3. **冲突检测会读取大量文件**：如果变更的分区包含大量数据文件，冲突检测需要读取所有文件的元数据，影响性能。
-
-**性能陷阱：**
-```java
-// 陷阱：频繁的小批量提交
-for (int i = 0; i < 1000; i++) {
-    commit.commit(singleRecord, true);
-    // 每次都会进行冲突检测和 Manifest 合并，性能差
+public int commit(ManifestCommittable committable, boolean checkAppendFiles) {
+    int generatedSnapshot = 0, attempts = 0;
+    ManifestEntryChanges changes = collectChanges(committable.fileCommittables());
+    List<SimpleFileEntry> appendSimpleEntries = SimpleFileEntry.from(changes.appendTableFiles);
+    if (!ignoreEmptyCommit || !changes.appendTableFiles.isEmpty()
+            || !changes.appendChangelog.isEmpty() || !changes.appendIndexFiles.isEmpty()) {
+        CommitKind commitKind = CommitKind.APPEND;
+        if (appendCommitCheckConflict) checkAppendFiles = true;
+        boolean allowRollback = false;
+        if (conflictDetection.shouldBeOverwriteCommit(appendSimpleEntries, changes.appendIndexFiles)) {
+            commitKind = CommitKind.OVERWRITE; checkAppendFiles = true; allowRollback = true;  // 升级
+        }
+        if (conflictDetection.hasRowIdCheckFromSnapshot()) { checkAppendFiles = true; allowRollback = true; }
+        attempts += tryCommit(CommitChangesProvider.provider(changes.appendTableFiles,
+                changes.appendChangelog, changes.appendIndexFiles),
+                committable.identifier(), committable.watermark(), committable.properties(),
+                commitKind, allowRollback, checkAppendFiles, null);
+        generatedSnapshot += 1;
+    }
+    if (!changes.compactTableFiles.isEmpty() || !changes.compactChangelog.isEmpty()
+            || !changes.compactIndexFiles.isEmpty()) {
+        attempts += tryCommit(..., CommitKind.COMPACT, false /*不回滚*/, true /*强制检冲突*/, null);
+        generatedSnapshot += 1;
+    }
+    return generatedSnapshot;
 }
-
-// 优化：批量提交
-List<CommitMessage> batch = new ArrayList<>();
-for (int i = 0; i < 1000; i++) {
-    batch.add(singleRecord);
-}
-commit.commit(ManifestCommittable.fromMessages(batch), true);
 ```
 
-### 核心概念解释
+`collectChanges` 把所有 `CommitMessage` 按 append / compact × table / changelog / index 六类分桶。APPEND 在前、COMPACT 在后。**为何分离**：(1) 语义清晰，流式消费者可只消费 APPEND；(2) 冲突隔离，APPEND 可回滚而 COMPACT 不可，分离后各自处理错误恢复；(3) APPEND→OVERWRITE 升级逻辑不应波及 COMPACT。
 
-**CommitMessage（提交消息）：**
-表示一次写入操作产生的文件变更，包含新增的数据文件、删除的数据文件、changelog 文件、索引文件等。
+**一次 commit 的 snapshot 产出矩阵**（理解 `commit()` 返回值）：
 
-**ManifestCommittable（清单可提交对象）：**
-包含多个 `CommitMessage` 的聚合对象，表示一次完整的提交。
+| 变更内容 | 产出 snapshot | 返回值 |
+|---|---|---|
+| 只有新数据 | 1 个 APPEND | 1 |
+| 新数据含 DELETE / DV | 1 个 OVERWRITE（APPEND 升级） | 1 |
+| 只有压缩 | 1 个 COMPACT | 1 |
+| 新数据 + 压缩 | APPEND(或 OVERWRITE) + COMPACT，先后两个 | 2 |
+| 无变更且 `ignoreEmptyCommit=true` | 无 | 0 |
+| 无变更且 `ignoreEmptyCommit=false` | 1 个空 APPEND | 1 |
 
-**CommitKind（提交类型）：**
-- `APPEND`：追加新数据，不删除已有文件
-- `COMPACT`：压缩合并，不改变逻辑数据
-- `OVERWRITE`：覆写分区或删除文件
-- `ANALYZE`：收集统计信息
+`ignoreEmptyCommit` 默认 true（流式场景空 checkpoint 不该产快照），但某些场景（如需要 watermark 推进的空提交）会设 false。**误以为"每次 commit 必产 1 个 snapshot"是常见 bug 源**——下游若按"提交次数 = 快照数"假设做位点管理会错位。`appendCommitCheckConflict` 字段控制 APPEND 是否强制检冲突（默认 false，APPEND 通常无冲突），仅在特殊表配置下置 true。
 
-**乐观锁（Optimistic Locking）：**
-不使用分布式锁，而是通过"读取-计算-写入-检查"的方式实现并发控制。如果写入失败（别人已经写了相同的 Snapshot ID），则重试。
+### 8.2 tryCommit 重试退避
 
-**冲突检测（Conflict Detection）：**
-检查并发写入是否产生了数据冲突，如 key range 重叠、桶数不一致等。
-
-**去重检测（Deduplication）：**
-通过 `(commitUser, commitIdentifier, commitKind)` 三元组判断提交是否已经完成，避免重复提交。
-
-**回滚（Rollback）：**
-当检测到冲突且允许回滚时，尝试删除冲突的文件，然后重试提交。
-
-**增量冲突检测优化：**
-重试时不重新读取所有 base 数据文件，而是在上次读取的基础上增量更新。
-
-### 设计理念
-
-**为什么这样设计：**
-
-1. **APPEND 和 COMPACT 分离提交**：
-   - 语义清晰：APPEND 表示新数据，COMPACT 表示物理优化
-   - 流式消费者可以只消费 APPEND 类型的 Snapshot
-   - 冲突处理不同：APPEND 可能需要回滚，COMPACT 不需要
-   ```java
-   // 一次 commit 可能生成两个 Snapshot
-   commit(committable) {
-       if (hasAppend) {
-           tryCommit(..., CommitKind.APPEND, ...); // snapshot-100
-       }
-       if (hasCompact) {
-           tryCommit(..., CommitKind.COMPACT, ...); // snapshot-101
-       }
-   }
-   ```
-
-2. **乐观锁的核心价值**：
-   - 避免了分布式锁的复杂性和性能开销
-   - 在低冲突场景下性能更好（大多数情况下一次成功）
-   - 代价是高冲突场景下需要多次重试
-   ```java
-   while (true) {
-       Snapshot latest = snapshotManager.latestSnapshot();
-       Snapshot newSnapshot = buildSnapshot(latest.id() + 1, ...);
-       boolean success = fileIO.tryToWriteAtomic(snapshotPath, newSnapshot);
-       if (success) break; // 成功
-       // 失败则重试
-   }
-   ```
-
-3. **精确一次语义的去重机制**：
-   - 分布式写入场景下，同一批数据可能因为重试被提交多次
-   - 通过 `(commitUser, commitIdentifier, commitKind)` 三元组去重
-   - 如果发现已存在相同的 Snapshot，直接返回成功
-   ```java
-   // 检查是否已经提交
-   for (long id = lastSnapshot.id() + 1; id <= latestSnapshot.id(); id++) {
-       Snapshot s = snapshotManager.snapshot(id);
-       if (s.commitUser().equals(myUser) 
-           && s.commitIdentifier() == myIdentifier
-           && s.commitKind() == myKind) {
-           return SuccessCommitResult; // 已经提交过了
-       }
-   }
-   ```
-
-4. **冲突检测的多层次检查**：
-   - 桶数一致性：同一分区内的所有文件必须具有相同的 totalBuckets
-   - Key Range 重叠：主键表的文件 key range 不能重叠
-   - 删除文件存在性：要删除的文件必须存在于 base 中
-   - Row ID 范围冲突：Row Tracking 场景下的 ID 范围不能重叠
-
-5. **增量冲突检测优化**：
-   - 重试时不重新读取所有 base 数据文件
-   - 在上次读取的基础上增量更新（读取 [lastSnapshot, latestSnapshot] 之间的变更）
-   - 大幅减少重试时的 IO 开销
-   ```java
-   if (isRetry && hasBaseDataFiles) {
-       baseDataFiles = previousBaseDataFiles;
-       List<SimpleFileEntry> incremental = scanner.readIncrementalChanges(
-           previousSnapshot, latestSnapshot, changedPartitions);
-       baseDataFiles.addAll(incremental);
-       baseDataFiles = FileEntry.mergeEntries(baseDataFiles);
-   }
-   ```
-
-**权衡取舍：**
-
-1. **乐观锁 vs 悲观锁**：
-   - 乐观锁：低冲突场景性能好，高冲突场景需要多次重试
-   - 悲观锁：性能稳定，但需要分布式锁服务，增加复杂度
-   - Paimon 选择乐观锁，通过配置 `commit.max-retries` 和随机退避平衡
-
-2. **冲突检测的粒度 vs 性能**：
-   - 细粒度检测（key range 级别）可以减少误判，提高并发度
-   - 但需要读取所有文件的元数据，影响性能
-   - 通过增量检测优化减少重试时的开销
-
-3. **APPEND/COMPACT 分离 vs 提交次数**：
-   - 分离提交使得语义清晰，流式消费更高效
-   - 但一次 commit 可能生成两个 Snapshot，增加元数据数量
-   - 通过 Snapshot 过期机制自动清理
-
-**架构演进：**
-
-Commit 流程的演进：
-- **v0.1-0.3**：简单的乐观锁，无冲突检测
-- **v0.4-0.6**：增加冲突检测，支持 key range 检查
-- **v0.7-0.8**：增加 APPEND/COMPACT 分离，增加去重检测
-- **v0.9+**：增加增量冲突检测优化，增加 Deletion Vector 支持
-
-**业界对比：**
-
-| 特性 | Paimon | Iceberg | Delta Lake |
-|------|--------|---------|------------|
-| 并发控制 | 乐观锁 | 乐观锁 | 乐观锁 |
-| 冲突检测 | 分区/桶/key range | 分区/文件 | 分区/文件 |
-| 精确一次 | commitUser + commitIdentifier | sequence number | txn version |
-| 重试策略 | 随机退避 + 超时 | 固定次数 | 固定次数 |
-| APPEND/COMPACT 分离 | ✅ 是 | ❌ 否 | ❌ 否 |
-| 增量冲突检测 | ✅ 支持 | ❌ 无 | ❌ 无 |
-| 回滚机制 | ✅ 支持 | ❌ 无 | ❌ 无 |
-
-### 7.1 FileStoreCommitImpl.commit() 完整流程
-
-> 源码: `paimon-core/src/main/java/org/apache/paimon/operation/FileStoreCommitImpl.java`
-
-`commit(ManifestCommittable committable, boolean checkAppendFiles)` 是 Paimon 数据写入的最终汇聚点。其完整流程如下:
-
-```
-commit(committable, checkAppendFiles)
-  |
-  +-- [1] collectChanges(committable.fileCommittables())
-  |     |-- 遍历所有 CommitMessage
-  |     |-- 分类到 ManifestEntryChanges:
-  |     |     appendTableFiles    (新增数据文件)
-  |     |     compactTableFiles   (压缩产生的文件变更)
-  |     |     appendChangelog     (追加 changelog)
-  |     |     compactChangelog    (压缩产生的 changelog)
-  |     |     appendIndexFiles   (新增索引文件)
-  |     |     compactIndexFiles  (压缩产生的索引变更)
-  |
-  +-- [2] 判断是否需要 APPEND 提交
-  |     |-- 条件: appendTableFiles/appendChangelog/appendIndexFiles 非空 或 ignoreEmptyCommit=false
-  |     |-- 确定 commitKind = APPEND
-  |     |-- 特殊情况: 如果 appendFiles 中包含 DELETE 或 DV
-  |     |     +-- 升级为 commitKind = OVERWRITE, 允许回滚
-  |     |
-  |     +-- tryCommit(appendFiles, APPEND/OVERWRITE, ...)  --------> [详见 7.2]
-  |     |     generatedSnapshot += 1
-  |
-  +-- [3] 判断是否需要 COMPACT 提交
-  |     |-- 条件: compactTableFiles/compactChangelog/compactIndexFiles 非空
-  |     +-- tryCommit(compactFiles, COMPACT, ...)
-  |           generatedSnapshot += 1
-  |
-  +-- [4] 报告指标 (commitMetrics)
-  |
-  +-- return generatedSnapshot  // 可能是 0, 1, 或 2
-```
-
-**关键设计: APPEND 和 COMPACT 分离为两次独立提交.** 一次 `commit()` 调用可能产生 0 到 2 个 Snapshot:
-- 如果只有追加数据: 1 个 APPEND snapshot
-- 如果只有压缩: 1 个 COMPACT snapshot
-- 如果两者都有: 2 个 snapshot（先 APPEND 再 COMPACT）
-- 如果全部为空且 ignoreEmptyCommit=true: 0 个 snapshot
-
-### 7.2 tryCommit 乐观锁重试机制
-
-> 源码: `FileStoreCommitImpl.java` L683-732
+> 源码：`FileStoreCommitImpl.java:692-741`
 
 ```java
-private int tryCommit(
-        CommitChangesProvider changesProvider,
-        long identifier, Long watermark, Map<String,String> properties,
-        CommitKind commitKind, boolean allowRollback,
-        boolean detectConflicts, String statsFileName) {
-    int retryCount = 0;
-    RetryCommitResult retryResult = null;
+private int tryCommit(CommitChangesProvider changesProvider, long identifier, @Nullable Long watermark,
+        Map<String,String> properties, CommitKind commitKind, boolean allowRollback,
+        boolean detectConflicts, @Nullable String statsFileName) {
+    int retryCount = 0; RetryCommitResult retryResult = null;
     long startMillis = System.currentTimeMillis();
-
     while (true) {
-        // [1] 获取最新快照
         Snapshot latestSnapshot = snapshotManager.latestSnapshot();
-
-        // [2] 获取变更内容（可能随 latestSnapshot 变化而不同，如 OVERWRITE）
-        CommitChanges changes = changesProvider.provide(latestSnapshot);
-
-        // [3] 尝试单次提交
-        CommitResult result = tryCommitOnce(
-                retryResult, changes.tableFiles, changes.changelogFiles,
-                changes.indexFiles, identifier, watermark, properties,
-                commitKind, allowRollback, latestSnapshot,
-                detectConflicts, statsFileName);
-
-        // [4] 成功则退出
+        CommitChanges changes = changesProvider.provide(latestSnapshot);   // OVERWRITE 随 latest 变化
+        CommitResult result = tryCommitOnce(retryResult, changes.tableFiles, changes.changelogFiles,
+                changes.indexFiles, identifier, watermark, properties, commitKind,
+                allowRollback, latestSnapshot, detectConflicts, statsFileName);
         if (result.isSuccess()) break;
-
-        // [5] 失败检查超时和最大重试次数
         retryResult = (RetryCommitResult) result;
         if (System.currentTimeMillis() - startMillis > options.commitTimeout()
                 || retryCount >= options.commitMaxRetries()) {
-            throw new RuntimeException("Commit failed after " + ... + " retries");
+            throw new RuntimeException(String.format(
+                "Commit failed after %s millis with %s retries, there maybe exist commit conflicts "
+                + "between multiple jobs.", options.commitTimeout(), retryCount), retryResult.exception);
         }
-
-        // [6] 等待后重试（随机退避）
-        retryWaiter.retryWait(retryCount);
+        retryWaiter.retryWait(retryCount);   // 随机退避 [commit.min-retry-wait, commit.max-retry-wait]
         retryCount++;
     }
-    return retryCount + 1; // 返回总尝试次数
+    return retryCount + 1;
 }
 ```
 
-**RetryWaiter 退避策略:** 使用配置的 `commit.min-retry-wait` 和 `commit.max-retry-wait` 之间的随机时间进行退避，避免多个提交者同时重试造成惊群效应。
+`RetryWaiter` 由 `(commit.min-retry-wait=10ms, commit.max-retry-wait=10s)` 构造，用随机退避避免多写者惊群。**为何 `while(true)` 而非定次循环**：超时与重试次数是两个独立闸门——流式场景可能需较久持续重试（等其它 compaction 落地），但仍受 `commit.timeout` 上限保护；`changesProvider.provide(latestSnapshot)` 每轮重算 changes 是因为 OVERWRITE 的 DELETE 集合依赖当前 latest（要删的"已有文件"随 latest 变化）。
 
-**为什么用 `while(true)` 而不是固定次数?** 因为超时和重试次数是两个独立的限制条件。在流式处理场景下，可能需要在较长时间内持续重试（如等待其他 compaction 完成），但同时也不能无限重试。
+**返回值 `retryCount + 1` 的含义**：返回总尝试次数（首次 + 重试次数），上报给 `CommitMetrics.attempts`。监控这个指标的 P99 能直接反映冲突激烈程度——长期 > 1 说明并发写撞车频繁，该考虑 write-only + 独立 compaction。`commit.timeout` 与 `commit.max-retries` 谁先触发就抛异常：超时优先用于"重试不贵但就是一直撞"的场景兜底，max-retries 用于"每次重试都很贵（读大量 base）"的场景限次。两者配合避免无限重试拖垮作业。
 
-### 7.3 tryCommitOnce 单次提交详解
+### 8.3 tryCommitOnce 去重与增量冲突检测
 
-> 源码: `FileStoreCommitImpl.java` L765-1046
+> 源码：`FileStoreCommitImpl.java`（`tryCommitOnce`，约 760~1050 行）
 
-`tryCommitOnce` 是一次完整的提交尝试:
+流程：
 
 ```
-tryCommitOnce(retryResult, deltaFiles, changelogFiles, indexFiles,
-              identifier, watermark, properties, commitKind,
-              allowRollback, latestSnapshot, detectConflicts, statsFileName)
-  |
-  +-- [1] 检查提交是否已完成（去重）
-  |     |-- 如果是 CommitFailRetryResult 且 latestSnapshot 不为 null
-  |     |-- 扫描 [上次snapshot.id+1 ... latestSnapshot.id] 范围的所有 snapshot
-  |     +-- 如果找到 commitUser + identifier + commitKind 匹配的 snapshot
-  |           return SuccessCommitResult  // 提交已经成功了，无需再提交
-  |
-  +-- [2] 确定 newSnapshotId = latestSnapshot.id + 1 (或 1 如果无历史)
-  |
-  +-- [3] 严格模式检查 (strictModeChecker)
-  |
-  +-- [4] 冲突检测（如果 detectConflicts = true）
-  |     |-- 读取已变更分区的所有文件 (baseDataFiles)
-  |     |-- 利用增量读取优化（如果是重试，从上次的 baseDataFiles 开始增量更新）
-  |     |-- 丢弃重复文件（discardDuplicate 选项）
-  |     |-- conflictDetection.checkConflicts(latestSnapshot, baseDataFiles, deltaFiles, ...)
-  |     |     |
-  |     |     +-- [详见 7.4]
-  |     |-- 如果冲突 + 允许回滚:
-  |     |     rollback.tryToRollback(latestSnapshot) → RetryCommitResult
-  |     |-- 如果冲突 + 不允许回滚: throw RuntimeException
-  |
-  +-- [5] 构建新 Snapshot
-  |     |-- 读取并合并旧 base manifest → 写入新 baseManifestList
-  |     |-- 写入 deltaManifestList
-  |     |-- 写入 changelogManifestList（如有）
-  |     |-- 写入 indexManifest（如有）
-  |     |-- 处理 watermark 合并（取当前和历史的最大值）
-  |     |-- Row Tracking 行 ID 分配
-  |     |-- 计算 totalRecordCount, deltaRecordCount
-  |     |-- 构造 Snapshot 对象
-  |
-  +-- [6] 触发 commitPreCallbacks
-  |
-  +-- [7] 原子提交 Snapshot
-  |     |-- success = commitSnapshotImpl(newSnapshot, deltaStatistics)
-  |     |-- 内部: snapshotCommit.commit(snapshot, ...) 或 fileIO.tryToWriteAtomic(...)
-  |
-  +-- [8] 处理结果
-        |-- 成功: 触发 commitCallbacks, return SuccessCommitResult
-        |-- 失败 (AtomicRename 返回 false): return RetryCommitResult(CommitFail)
-        |-- 异常: return RetryCommitResult(CommitFail + exception)
+[1] 去重：重试且 latestSnapshot 非空时，扫 [上次id+1, latest.id] 找
+        (commitUser, commitIdentifier, commitKind) 匹配的快照 → 命中即 SuccessCommitResult
+[2] newSnapshotId = latest.id + 1 (无历史则 1)
+[3] strictModeChecker 检查(可选)
+[4] 冲突检测(detectConflicts):
+      读变更分区 base 文件(重试走增量优化) → discardDuplicate(可选)
+      → conflictDetection.checkConflicts(...)
+      冲突 + 允许回滚 → rollback.tryToRollback(latest) → RetryCommitResult
+      冲突 + 不许回滚 → throw
+[5] 构建新 Snapshot:
+      合并旧 base → 写 baseManifestList; 写 deltaManifestList;
+      写 changelog/index manifest; watermark 取 max; Row Tracking 行 id 分配;
+      算 total/deltaRecordCount; 构造 Snapshot
+[6] commitPreCallbacks
+[7] 原子提交: commitSnapshotImpl → snapshotCommit.commit(...) (filesystem 原子写 / REST 服务端)
+[8] 成功 → commitCallbacks + SuccessCommitResult; 原子写返回 false/异常 → RetryCommitResult
 ```
 
-**去重检测的核心:** 步骤 [1] 中的去重逻辑确保了 exactly-once 语义。如果由于网络超时等原因，客户端不确定上次提交是否成功，在重试时会先检查上次的提交是否已经被持久化。判断条件是三元组 `(commitUser, commitIdentifier, commitKind)` 的匹配。
-
-**增量冲突检测优化:** 步骤 [4] 中，如果是重试（retryResult != null），不会重新读取所有 base 数据文件，而是在上次读取的基础上增量更新:
+去重（步骤 1）是精确一次兜底：网络超时后客户端不确定上次是否成功，重试时先查是否已持久化，判据是三元组匹配。增量冲突检测（步骤 4，重试时不重读全部 base）：
 
 ```java
 if (commitFailRetry != null && commitFailRetry.baseDataFiles != null) {
     baseDataFiles = new ArrayList<>(commitFailRetry.baseDataFiles);
     List<SimpleFileEntry> incremental = scanner.readIncrementalChanges(
-            commitFailRetry.latestSnapshot, latestSnapshot, changedPartitions);
+        commitFailRetry.latestSnapshot, latestSnapshot, changedPartitions);   // 只读增量
     baseDataFiles.addAll(incremental);
     baseDataFiles = new ArrayList<>(FileEntry.mergeEntries(baseDataFiles));
 }
 ```
 
-### 7.4 冲突检测 ConflictDetection
+**Flink 精确一次的端到端配合**：Flink Sink 用 `commitUser = job uid`（跨重启稳定）、`commitIdentifier = checkpoint id`（单调递增）。checkpoint barrier 对齐后 Sink 把本 checkpoint 的 CommitMessage 攒成 `ManifestCommittable` 提交。若 checkpoint 100 提交后 JM 失败、作业从 checkpoint 99 恢复并重发 checkpoint 100 的提交，去重逻辑（步骤 1）扫到已有 `(job_uid, 100, APPEND)` 快照即返回成功、不重复写——这就是 Paimon 在 Flink 下无重复数据的根本保证。`latestSnapshotOfUser`（5.4）则用于恢复时确定"我提交到哪了"。
 
-> 源码: `paimon-core/src/main/java/org/apache/paimon/operation/commit/ConflictDetection.java`
+**两阶段提交的 Paimon 映射**：Flink 的两阶段提交 Sink 中，"prepare"阶段把数据写成文件（产 CommitMessage，但还没进 snapshot——对读者不可见）、"commit"阶段（checkpoint 完成时）才 `FileStoreCommitImpl.commit` 把它们提进 snapshot。即使 commit 阶段重复触发（恢复重放），去重保证幂等。这把"分布式两阶段提交"压缩成"写文件（可重做）+ 原子写 snapshot（幂等去重）"两步——没有真正的分布式事务协调者，靠"snapshot 原子写 + 三元组去重"达成等效的精确一次。这是理解 Paimon 为何不需要外部事务协调即可精确一次的关键。
 
-ConflictDetection 在提交时检测与已有数据的冲突:
+**回滚（CommitRollback）与严格模式（StrictModeChecker）**：
 
-```java
-public Optional<RuntimeException> checkConflicts(
-        Snapshot latestSnapshot,
-        List<SimpleFileEntry> baseEntries,
-        List<SimpleFileEntry> deltaEntries,
-        List<IndexManifestEntry> deltaIndexEntries,
-        CommitKind commitKind) {
-    // [1] DV 场景下的 entry 增强（enrichment）
-    //     为 base 和 delta 的 entry 附加 DV 信息
-    if (deletionVectorsEnabled && bucketMode == BUCKET_UNAWARE) {
-        baseEntries = buildBaseEntriesWithDV(...);
-        deltaEntries = buildDeltaEntriesWithDV(...);
-    }
+- `rollback`（可空）：仅当 `allowRollback=true`（OVERWRITE 或 Row ID 检查场景）时启用。检测到冲突时 `rollback.tryToRollback(latestSnapshot)` 尝试删除本次已写但未提交成功的文件，返回 `RetryCommitResult` 触发重试——避免重试残留垃圾文件。APPEND / COMPACT 普通提交 `allowRollback=false`，冲突直接抛异常由作业 failover 处理（更简单、由框架兜底清理）。
+- `strictModeChecker`（可空，由 `commit.strict-mode.last-safe-snapshot` 等配置启用）：在提交前做更严格的安全检查，用于对一致性要求极高的场景，发现风险即拒绝提交。
 
-    // [2] 桶数一致性检查
-    //     同一分区内的所有文件必须具有相同的 totalBuckets
-    checkBucketKeepSame(baseEntries, deltaEntries, commitKind, ...);
+`FileStoreCommitImpl` 的 `commitCleaner` 在异常路径负责清理半成品文件，与类注释"任何异常必须抛出"配合——异常抛出后由上层 failover，cleaner 尽力清理已写的孤儿文件，但**真正的安全保证来自"未写成功的 snapshot 文件不会被任何人读到"**（snapshot 是最后一步原子写）。
 
-    // [3] Delta 内部一致性检查
-    //     不允许对同一个文件同时 ADD 和 DELETE
-    FileEntry.mergeEntries(deltaEntries);
+**watermark 合并的具体规则**：构建新 Snapshot 时（步骤 5），新 watermark = max(本次提交的 watermark, latestSnapshot 的 watermark)。这保证 watermark 单调不减——即使本次提交携带的 watermark 比上一个快照小（如某 subtask 进度落后），也取历史最大值。**为何必须单调**：下游流式读用 watermark 做事件时间推进、触发窗口计算；若 watermark 回退，已触发的窗口会被认为"还能来数据"，破坏 exactly-once 与窗口正确性。回滚到旧快照也不会让后续提交的 watermark 回退，正是这个 max 规则的体现——这是"watermark 只增不减"在源码里的落点。
 
-    // [4] Base + Delta 合并检查
-    //     验证要删除的文件确实存在于 base 中
-    mergedEntries = FileEntry.mergeEntries(allEntries);
+**`commit.strict-mode.last-safe-snapshot`**：严格模式下 `StrictModeChecker` 会校验提交相对某个"安全快照"的关系，用于对一致性极敏感的场景额外加固（牺牲一点吞吐换更强保证）。默认关闭，普通场景靠乐观锁 + 冲突检测已足够。
 
-    // [5] 合并后检查删除标记
-    //     确保合并后没有残留的 DELETE entry（即被删除的文件确实存在）
-    checkDeleteInEntries(mergedEntries, conflictException);
+### 8.4 ConflictDetection 多层检查
 
-    // [6] Key Range 重叠检查
-    //     对于主键表，检查 delta 文件的 key range 是否与 base 文件冲突
-    checkKeyRange(baseEntries, deltaEntries, mergedEntries, baseCommitUser);
+> 源码：`paimon-core/.../operation/commit/ConflictDetection.java`（独立类，778 行）
 
-    // [7] Row ID 范围冲突检查
-    checkRowIdRangeConflicts(commitKind, mergedEntries);
+`checkConflicts(latestSnapshot, baseEntries, deltaEntries, deltaIndexEntries, commitKind)` 逐层：
 
-    // [8] Row ID 从特定 Snapshot 开始的检查
-    checkForRowIdFromSnapshot(latestSnapshot, deltaEntries, deltaIndexEntries);
-}
-```
+1. **DV enrichment**：DV 开启且 `BUCKET_UNAWARE` 时，给 base / delta entry 附 DV 信息（`SimpleFileEntryWithDV`），让后续检查能感知删除向量。
+2. **桶数一致性** `checkBucketKeepSame`：同分区所有文件 `totalBuckets` 必须一致。**OVERWRITE 跳过此检查**——覆写整分区，桶数可随表配置变更而变（如改 bucket 数后重写），合法。
+3. **delta 内部一致性**：`mergeEntries(deltaEntries)` 不允许对同一文件同时 ADD+DELETE。
+4. **base+delta 合并 + 删除存在性** `checkDeleteInEntries`：要删的文件必须在 base 中存在，否则说明被别的作业删过（files conflict）→ 合并后残留 DELETE 即报冲突。
+5. **Key Range 重叠** `checkKeyRange`：主键表 delta 文件的 [minKey, maxKey] 不能与 base 同 bucket 同 level 文件重叠——否则同 key 落多文件破坏 LSM 正确性。用 `RangeHelper` / `Range` 做区间重叠判定。
+6. **Row ID 范围冲突** `checkRowIdRangeConflicts` 与 **从特定 snapshot 起的 Row ID 检查** `checkForRowIdFromSnapshot`（Row Tracking）。
 
-**Key Range 检查的含义:** 对于主键表，每个数据文件记录了其包含的 key 范围（minKey/maxKey）。如果两个并发写入产生了 key 范围重叠的文件，可能导致同一个 key 出现在多个文件中，违反主键唯一性约束。
+`checkConflicts` 返回 `Optional<RuntimeException>` 而非直接抛——让调用方（`tryCommitOnce`）决定"冲突 + 允许回滚则触发 rollback 重试，否则抛出"。这个返回值设计把"检测"与"处置"解耦：同一套检测逻辑，APPEND/COMPACT 直接抛、OVERWRITE/Row-ID 场景走回滚重试。
 
-**为什么 OVERWRITE 提交跳过桶数一致性检查?** 因为 OVERWRITE 会替换整个分区的数据，新数据的桶数可能与旧数据不同（例如表配置变更后的重写），这是合法的。
+Key Range 检查是 Paimon 比 Iceberg / Delta 更细的冲突粒度（后者多止于分区 / 文件级）——对 LSM 主键表的正确性至关重要。`shouldBeOverwriteCommit` 与 `hasRowIdCheckFromSnapshot` 也定义在此类，供 `commit()` 决定是否升级 OVERWRITE / 强制检冲突。
 
-### 7.5 APPEND/COMPACT 分离提交
+**逐层检查的"快速失败"顺序设计**：检查从廉价到昂贵排列——桶数一致性（只比整数）→ delta 内部合并（小集合）→ base+delta 合并 + 删除存在性（中等）→ key range 重叠（需区间排序比较，最贵）。任一层失败立即返回 `Optional<RuntimeException>`，避免做完后面昂贵检查才发现前面就该失败。这种"廉价检查前置"是冲突检测在高并发下仍可接受的关键。
 
-在 `commit()` 方法中，APPEND 和 COMPACT 被分为两次独立的 `tryCommit()` 调用:
+**为何 OVERWRITE 跳过桶数一致性而仍做其它检查**：OVERWRITE 替换整分区，新数据桶数可与旧不同（合法）；但它仍不能违反"要删的文件必须存在"（否则与别的覆写冲突）和 key range 正确性。所以是"跳过特定一层"而非"跳过全部"——精确放宽而非粗放。
 
-```java
-// 第一次提交: APPEND（新数据）
-if (!appendTableFiles.isEmpty() || !appendChangelog.isEmpty() || !appendIndexFiles.isEmpty()) {
-    tryCommit(
-        CommitChangesProvider.provider(appendTableFiles, appendChangelog, appendIndexFiles),
-        committable.identifier(), committable.watermark(), committable.properties(),
-        CommitKind.APPEND, allowRollback, checkAppendFiles, null);
-    generatedSnapshot += 1;
-}
+**DV（Deletion Vector）场景的特殊处理**：DV 开启 + `BUCKET_UNAWARE`（append-only 表的删除）时，删除不是删整个数据文件，而是给文件附一个删除位图。冲突检测必须感知"两个作业是否对同一文件的重叠行打了删除标记"，故先做 enrichment 把 DV 信息附到 entry 上（`SimpleFileEntryWithDV`），再让后续检查能正确判定行级冲突——这是 merge-on-read 表并发删除安全的基础。
 
-// 第二次提交: COMPACT（压缩结果）
-if (!compactTableFiles.isEmpty() || !compactChangelog.isEmpty() || !compactIndexFiles.isEmpty()) {
-    tryCommit(
-        CommitChangesProvider.provider(compactTableFiles, compactChangelog, compactIndexFiles),
-        committable.identifier(), committable.watermark(), committable.properties(),
-        CommitKind.COMPACT, false, true, null);
-    generatedSnapshot += 1;
-}
-```
-
-**为什么分离?**
-
-1. **语义清晰**: APPEND 表示新数据的到来，COMPACT 表示物理存储的优化。将它们分为不同的 snapshot 让流式消费者可以精确控制只消费 APPEND 类型的变更。
-
-2. **冲突隔离**: APPEND 提交可能需要回滚（当检测到冲突时），但 COMPACT 提交不需要。分离后可以独立处理各自的错误恢复逻辑。
-
-3. **特殊 APPEND → OVERWRITE 升级**: 当 APPEND 的变更中包含 DELETE 操作或 Deletion Vector 时，会自动升级为 OVERWRITE 提交，启用更严格的冲突检测和回滚机制。这个升级逻辑不应影响 COMPACT 提交。
-
-### 7.6 Overwrite 分区覆写
-
-> 源码: `FileStoreCommitImpl.java` L411-538
-
-`overwritePartition()` 方法处理分区覆写逻辑:
+**冲突检测的具体冲突例子**（主键表 key range 重叠）：
 
 ```
-overwritePartition(partition, committable, properties)
-  |
-  +-- collectChanges(committable.fileCommittables())
-  |
-  +-- 确定 partitionFilter:
-  |     |-- 动态分区覆写 (dynamicPartitionOverwrite=true):
-  |     |     从 appendTableFiles 中提取实际写入的分区
-  |     |-- 静态分区覆写:
-  |     |     根据指定的 partition map 构建 PartitionPredicate
-  |     |     + 校验所有变更文件都属于指定分区
-  |
-  +-- tryUpgrade (overwriteUpgrade=true 时)
-  |     如果 overwrite 的文件没有 key range 重叠，升级到最高 level
-  |
-  +-- tryOverwritePartition(partitionFilter, ...)
-  |     |-- 内部调用 scanner.readOverwriteChanges()
-  |     |     读取匹配分区的所有已有文件，生成 DELETE entries
-  |     |     合并 DELETE entries + 新的 ADD entries
-  |     +-- tryCommit(..., CommitKind.OVERWRITE, ...)
-  |
-  +-- COMPACT 提交（如果有压缩变更）
+base:  bucket-0, level-0, file-X  keyRange=[1, 100]
+作业A: bucket-0, level-0, 新增 file-Y keyRange=[50, 150]   # 与 X 重叠!
+       → checkKeyRange 发现 [50,150] ∩ [1,100] ≠ ∅ 且同 bucket 同 level
+       → 报冲突: 同一 key(如 60) 会同时存在于 X 和 Y, 违反主键唯一性/LSM 有序性
 ```
 
-**动态 vs 静态分区覆写:**
-- **静态覆写**: 用户明确指定要覆写的分区（如 `INSERT OVERWRITE PARTITION(dt='2024-01-01')`）。所有变更文件必须属于指定分区，否则抛异常。
-- **动态覆写**: 系统根据实际写入的数据自动确定要覆写的分区。如果没有写入任何数据，则跳过覆写（不删除任何文件）。
+为何这对 LSM 致命：LSM 读取假设同一 level 的 SortedRun 之间 key 不重叠（可二分定位），重叠会让点查 / 合并读到重复或错乱的 key。Iceberg / Delta 无 LSM 结构、主键去重靠 merge-on-read delete file，不需要这层检查——这是 Paimon 为主键表 LSM 正确性付出的额外冲突检测成本，也是它能做高效点查（LookupLevels）的前提。`checkBucketKeepSame` 的例子：分区 dt=x 下 base 文件 totalBuckets=4，若 delta 文件 totalBuckets=8（表 rescale 过但未 OVERWRITE）→ 报冲突，因为同分区桶数必须一致才能正确路由 key 到桶。
+
+### 8.5 Overwrite 分区覆写
+
+> 源码：`FileStoreCommitImpl.java`（`overwrite`，约 435-543 行）
+
+```
+overwrite(partition, committable, properties)
+  → collectChanges
+  → partitionFilter:
+        动态覆写(dynamicPartitionOverwrite): 从写入文件提取实际分区
+        静态覆写: 按指定 partition map 构 PartitionPredicate + 校验变更文件都属该分区
+  → tryUpgrade(overwriteUpgrade): 覆写文件无 key 重叠则升到最高 level
+  → tryOverwritePartition: scanner.readOverwriteChanges 读匹配分区已有文件生成 DELETE,
+        合并 DELETE + 新 ADD → tryCommit(..., CommitKind.OVERWRITE, ...)
+  → 有 compact 变更再提一次 COMPACT
+```
+
+静态覆写：变更文件必须全属指定分区，否则抛异常（防止 `INSERT OVERWRITE PARTITION(dt='x')` 误写到别的分区）。动态覆写：无写入则跳过（不删任何文件）——这点常被误解，动态覆写空数据不会清空分区。
+
+**静态 vs 动态覆写的实战差异**：
+
+```sql
+-- 静态: 明确指定分区, 该分区被整体替换(即使新数据为空也清空该分区)
+INSERT OVERWRITE t PARTITION (dt='2024-01-01') SELECT ... ;
+
+-- 动态(dynamic-partition-overwrite=true, 默认): 只覆写实际写入数据涉及的分区
+INSERT OVERWRITE t SELECT ... ;  -- 写入数据落在 dt in (01-01, 01-02) 则只覆这两个分区,
+                                 -- 其它分区不动; 若 SELECT 结果为空则什么都不删
+```
+
+源码上 `tryOverwritePartition` 先用 `scanner.readOverwriteChanges(partitionFilter)` 读匹配分区的所有现存文件生成 DELETE entries，再合并本次的 ADD entries，整体作为一次 OVERWRITE 提交。这就是为什么覆写是原子的——DELETE 旧 + ADD 新在同一个 snapshot 里生效，不存在"删完旧的、还没写新的"中间态。`tryUpgrade`（`overwriteUpgrade=true`）会在覆写文件无 key 重叠时把它们提升到最高 LSM level，省去后续 compaction——这是覆写场景的一个小优化。**误删风险**：静态覆写空 SELECT 会清空指定分区（符合 SQL OVERWRITE 语义但易误操作），动态覆写空 SELECT 则安全（什么都不删），生产中要分清用哪个。
+
+### 8.6 提交排障速查
+
+| 现象 | 可能根因 | 排查 / 处置 |
+|---|---|---|
+| `Commit failed after ... retries` | 多作业高并发写同分区，乐观锁反复撞车 | 关写侧 compaction（`write-only=true`）+ 独立 compaction 作业；调大 `commit.max-retries` / `commit.timeout` |
+| 对象存储偶发丢快照 | 无原子 rename 且未配锁 | hive / jdbc metastore + `lock.enabled=true` |
+| 长查询读取报快照不存在 | `snapshot.time-retained` 过短 | 调大保留时间，配 `num-retained.min` |
+| files conflict 反复重启 | 两流式作业同写、compaction 删文件冲突 | 同第一行：分离 compaction |
+| 一次写入产生 2 个 snapshot | APPEND + COMPACT 分离提交 | 正常现象，非 bug |
+| 提交极慢 | 变更分区数据文件多，冲突检测读全量 base | 增大批量、减少分区扇出；关注增量检测是否生效 |
+
+**官方推荐的根治高冲突方案（concurrency-control 文档核心结论）**：冲突的本质是"删文件"，而删文件源于 compaction。两个流式作业同时写同一张表、各自做 compaction，会互相删对方的文件 → files conflict → 不断 failover 重启。根治办法是**关掉写作业的 compaction**（表配置 `write-only=true`），另起一个独立的专用 compaction 作业（dedicated compaction job）统一做合并。这样写作业只 APPEND 不删文件、不产生 files conflict，compaction 由单一作业串行执行无并发删除——这是 Paimon 多写场景的标准部署模式。
+
+**snapshot conflict 与 files conflict 的本质区别**（排障时先分清是哪种）：
+
+- **snapshot conflict**：快照 ID 被抢（别人先写了 `snapshot-{id+1}`）——`tryCommit` 重新取 latest 重算即可恢复，对用户透明，是"正常的并发竞争"。
+- **files conflict**：要删的文件已被别人删了（`checkDeleteInEntries` 报合并后残留 DELETE）——这是"语义冲突"，无法靠重试解决（重试还是删不到），流式作业故意 failover 从最新状态重来，仍冲突则反复重启。看到作业反复 restart 且日志含 conflict，基本是 files conflict，按上面的 write-only 方案处置。
+
+**官方文档的核心论断再强调**：concurrency-control 文档明确"冲突的本质在于删文件，而删文件源于 compaction"。所以单写作业（无并发）永远不会有 files conflict；只有多个作业同时写同一表且各自做 compaction 才会。这把排查方向收窄到"是不是多作业并发写 + 都开了 compaction"——是则 write-only + 独立 compaction，否则查其它（如对象存储锁配置、时钟、超时配置）。Paimon 保证此处不丢不重，但反复重启不是好状态，需主动消除并发删除源。
 
 ---
 
-## 八、CoreOptions 配置体系
+## 九、系统表与 CoreOptions
 
-> 源码: `paimon-api/src/main/java/org/apache/paimon/CoreOptions.java`
+**系统表**（`table/system/`，经 `SystemTableLoader` 按 `$名` 加载，只读、不可 DDL）：`$snapshots`（快照链：id / schemaId / commitKind / commitUser / 记录数 / watermark）、`$schemas`（schema 历史）、`$manifests`（当前快照的 ManifestFileMeta）、`$files`（当前数据文件 + 统计）、`$options`、`$partitions`、`$buckets`、`$tags`、`$branches`、`$consumers`（流式消费位点）、`$audit_log`（含 rowkind 的变更审计）等。它们是把上述元数据文件投影成行的"虚拟视图"，是排障第一入口——例如查 `$snapshots` 看 commitKind / commitUser 定位是谁在反复提交、查 `$files` 看文件分布是否倾斜。
 
-CoreOptions 是 Paimon 的配置中心，定义了所有表级配置项。与 Catalog 和元数据管理相关的配置:
+**系统表排障实战 SQL**（与本文各章对应）：
 
-**Commit 相关:**
-
-| 配置项 | 默认值 | 说明 |
-|---|---|---|
-| `commit.timeout` | - | 提交超时时间（无默认值） |
-| `commit.max-retries` | `10` | 最大重试次数 |
-| `commit.min-retry-wait` | `10ms` | 最小重试等待 |
-| `commit.max-retry-wait` | `10s` | 最大重试等待 |
-| `commit.discard-duplicate-files` | `false` | 是否丢弃重复文件 |
-
-**Manifest 相关:**
-
-| 配置项 | 默认值 | 说明 |
-|---|---|---|
-| `manifest.target-file-size` | `8MB` | Manifest 文件目标大小 |
-| `manifest.merge-min-count` | `30` | 触发 manifest 合并的最小文件数 |
-| `manifest.full-compaction-threshold-size` | `16MB` | 全量压缩阈值 |
-
-**Snapshot/Tag 相关:**
-
-| 配置项 | 默认值 | 说明 |
-|---|---|---|
-| `snapshot.time-retained` | `1h` | Snapshot 保留时间 |
-| `snapshot.num-retained.min` | `10` | 最少保留的 Snapshot 数 |
-| `snapshot.num-retained.max` | `∞` | 最多保留的 Snapshot 数 |
-| `tag.automatic-creation` | `none` | 自动创建 Tag 的模式 |
-| `tag.creation-period` | - | 自动 Tag 创建周期 |
-| `tag.default-time-retained` | - | Tag 默认保留时间 |
-
-**Schema 相关:**
-
-| 配置项 | 默认值 | 说明 |
-|---|---|---|
-| `bucket` | `-1` | 桶数（-1=动态） |
-| `bucket-key` | - | 桶键（为空则使用主键） |
-| `sequence.field` | - | 序列字段 |
-| `partition.default-name` | `__DEFAULT_PARTITION__` | 默认分区名 |
-
-**Cache 相关（CatalogOptions）:**
-
-| 配置项 | 默认值 | 说明 |
-|---|---|---|
-| `cache-enabled` | `true` | 启用 Catalog 缓存 |
-| `cache.expire-after-access` | `10min` | 访问后过期时间 |
-| `cache.expire-after-write` | `30min` | 写入后过期时间 |
-| `cache.manifest-small-file-memory` | `128MB` | 小 manifest 缓存内存 |
-| `cache.manifest-small-file-threshold` | `1MB` | 小文件阈值 |
-| `cache.manifest-max-memory` | - | manifest 最大缓存内存 |
-| `cache.partition-max-num` | `0` | 分区缓存最大数量 |
-| `cache.snapshot.max-num-per-table` | `20` | 每表最大缓存快照数 |
-| `cache.deletion-vectors.max-num` | `100000` | DV 元数据最大缓存数 |
-
-配置项通过 `CoreOptions.fromMap(options)` 工厂方法创建，内部使用 Paimon 自定义的 `Options` 类进行类型安全的配置读取:
-
-```java
-public class CoreOptions implements Serializable {
-    private final Options options;
-
-    public CoreOptions(Map<String, String> options) {
-        this(Options.fromMap(options));
-    }
-
-    public int bucket() {
-        return options.get(BUCKET);
-    }
-
-    // ... 其他配置的 getter
-}
+```sql
+-- 谁在反复提交、提交类型分布(对应第八章)
+SELECT commit_user, commit_kind, count(*) FROM my_db.t$snapshots GROUP BY 1,2;
+-- schema 演进历史(对应第四章)
+SELECT schema_id, fields, partition_keys, primary_keys FROM my_db.t$schemas;
+-- manifest 是否碎片化(对应第七章): 看行数与文件大小
+SELECT count(*), avg(file_size), sum(num_added_files), sum(num_deleted_files)
+  FROM my_db.t$manifests;
+-- 数据是否倾斜: 各分区/桶文件数与大小
+SELECT partition, bucket, count(*), sum(file_size_in_bytes) FROM my_db.t$files GROUP BY 1,2;
+-- 流式消费位点(排查消费滞后)
+SELECT * FROM my_db.t$consumers;
+-- tag/branch 现状
+SELECT * FROM my_db.t$tags;  SELECT * FROM my_db.t$branches;
 ```
+
+系统表本身不缓存（CachingCatalog 缓存原表后动态包装，见 2.5），所以查 `$snapshots` 总是反映最新文件系统状态——适合做实时排障。
+
+**CoreOptions / CatalogOptions 关键项**（`paimon-api/.../CoreOptions.java`，通过 `CoreOptions.fromMap` 经类型安全的 `Options` 读取）：
+
+| 类别 | 配置 | 默认 | 说明 |
+|---|---|---|---|
+| Commit | commit.max-retries | 10 | 乐观锁最大重试 |
+| | commit.timeout | - | 提交超时（与重试次数共同限流） |
+| | commit.min / max-retry-wait | 10ms / 10s | 随机退避区间 |
+| | commit.discard-duplicate-files | false | 丢弃重复文件 |
+| Manifest | manifest.target-file-size | 8MB | ManifestFile 目标大小 |
+| | manifest.merge-min-count | 30 | 触发合并的最小文件数 |
+| | manifest.full-compaction-threshold-size | 16MB | 全量压缩阈值 |
+| Snapshot/Tag | snapshot.time-retained | 1h | 快照保留时长 |
+| | snapshot.num-retained.min / max | 10 / ∞ | 保留数量上下限 |
+| | tag.automatic-creation / creation-period / default-time-retained | none / - / - | 自动 Tag |
+| Schema | bucket | -1 | 桶数（-1=动态） |
+| | bucket-key / sequence.field | - | 桶键（空则用主键） / 序列字段 |
+| | partition.default-name | `__DEFAULT_PARTITION__` | 默认分区名 |
+| Cache | cache.expire-after-access / write | 10min / 30min | Catalog 缓存过期 |
+| | cache.manifest-small-file-memory / threshold | 128MB / 1MB | 小 manifest 缓存 |
+| | cache.snapshot.max-num-per-table | 20 | 每表快照缓存数 |
+| | cache.partition-max-num | 0 | 分区缓存（0=关） |
+| | cache.deletion-vectors.max-num | 100000 | DV 元数据缓存数 |
+| REST | data-token.enabled | false | 按表 data token（PVFS / 直连数据） |
+| | token.provider / token | - | bear / dlf；bear 的静态 token |
+| | dlf.access-key-id/secret、dlf.token-path、dlf.token-loader | - | DLF 凭证来源 |
+
+配置项通过 `CoreOptions.fromMap(options)` 工厂创建，内部用类型安全的 `Options` + `ConfigOption` 读取（每个配置有 key / 类型 / 默认值 / 描述），避免散落的字符串硬编码。
+
+**缓存配置调优要点**：
+
+- `cache.expire-after-access` / `expire-after-write`：单进程独占 warehouse 可放宽（减少重读）；多进程共享必须收紧 write 过期（一致性窗口）。
+- `cache.snapshot.max-num-per-table`（20）：流式频繁取快照的表可调大，减少重复读 snapshot 文件。
+- `cache.manifest-small-file-memory`（128MB）/ `manifest-max-memory`：manifest 多的大表调大可显著减少 manifest 重读 IO；内存紧张则调小。
+- `cache.partition-max-num`（0=关）：分区数可控（几千以内）且频繁列分区时可开启；分区爆炸（百万级）保持关闭避免 OOM。
+- `cache.deletion-vectors.max-num`（10万）：merge-on-read + DV 表调大可加速 DV 查找。
+
+**一条总规律**：缓存换内存换一致性。读多写少、单进程、表元数据稳定 → 放宽缓存；多进程共享、元数据频繁变 → 收紧或显式失效。REST 模式下还有服务端可驱动失效，一致性更可控。
+
+**配置读取的类型安全保障**：`ConfigOption` 把每个配置的 key / 类型 / 默认值 / 校验绑在一起（如 `commit.max-retries` 是 `intType().defaultValue(10)`），`Options.get(CONFIG_OPTION)` 直接返回正确类型并应用默认值——避免了"到处 `Integer.parseInt(map.get("..."))` 且各处默认值不一致"的散乱。改一个默认值只动 `CoreOptions` 里的 `ConfigOption` 定义，全局生效。这是 Paimon 配置体系的工程基础，也是为什么本文各处给的默认值能信赖——它们就是源码里 ConfigOption 的 defaultValue。
 
 ---
 
-## 九、与 Iceberg 的设计对比
+## 十、与 Iceberg 的设计对比
 
-### 9.1 Snapshot 设计对比
-
-| 维度 | Paimon | Iceberg |
-|---|---|---|
-| **快照文件格式** | JSON 文件（`snapshot-{id}`） | 独立的 snap-{id}.avro 文件 |
-| **Manifest 层级** | 三级: Snapshot → ManifestList → ManifestFile → DataFile | 三级: Snapshot → ManifestList → ManifestFile → DataFile |
-| **增量追踪** | base/delta/changelog 三分法 | 每个 manifest 文件有 `added_snapshot_id` 标记所属的快照 |
-| **Changelog 支持** | 原生支持 changelogManifestList | 无内建 changelog，需要对比两个 snapshot 计算 diff |
-| **版本号** | 全局单调递增 ID (`snapshot-1`, `snapshot-2`) | 全局单调递增序列号 + UUID |
-| **提交类型** | CommitKind: APPEND/COMPACT/OVERWRITE/ANALYZE | operation: append/overwrite/replace/delete |
-| **统计信息** | 独立的 statistics 文件引用 | 内嵌在 manifest file 中 |
-| **Watermark** | 原生支持 watermark 字段 | 无内建 watermark |
-
-**Paimon 的 delta 优势:** Paimon 的 base/delta 分离设计使得增量消费非常高效——流式读取器只需读取 delta manifest 即可获取变更，无需比对全量。Iceberg 需要通过 `added_snapshot_id` 过滤或对比两个版本的 manifest list 来实现类似功能。
-
-**Paimon 的 changelog 优势:** Paimon 原生支持 changelog 文件，可以在写入时直接产生 CDC 格式的变更记录。Iceberg 需要通过 "equality delete files" 或 "position delete files" 的增量读取来间接实现 CDC，语义表达不如 Paimon 直接。
-
-### 9.2 Catalog 设计对比
+### 10.1 Snapshot 与元数据
 
 | 维度 | Paimon | Iceberg |
 |---|---|---|
-| **默认 Catalog** | FileSystemCatalog（文件系统即元数据） | HadoopCatalog / RESTCatalog |
-| **SPI 机制** | CatalogFactory（Java SPI） | CatalogUtil + catalog-impl 配置 |
-| **缓存策略** | CachingCatalog（装饰器模式，Caffeine） | CachingCatalog（类似装饰器，Caffeine） |
-| **锁机制** | CatalogLockFactory SPI（可选） | LockManager（写入内置锁） |
-| **Schema 存储** | 独立 schema-{id} 文件，每次变更新增文件 | 嵌入在 table metadata v{version}.metadata.json 中 |
-| **分支支持** | 原生 BranchManager，文件系统级实现 | 通过 Ref（Iceberg 1.5+）, 需要 Catalog 级支持 |
-| **Tag 支持** | 原生 TagManager，Tag 即 Snapshot 副本 | 通过 Ref 引用 Snapshot |
+| 快照格式 | JSON `snapshot-{id}` | Avro `snap-{id}.avro` |
+| Manifest 层级 | 三级 | 三级 |
+| 增量追踪 | base/delta/changelog 三分 | manifest 带 `added_snapshot_id` |
+| Changelog | 原生 changelogManifestList | 无内建，靠 equality/position delete 间接 |
+| Watermark | 原生字段 | 无 |
+| 统计 | 独立 statistics 文件引用 | 内嵌 manifest |
+| 精确一次 | commitUser + commitIdentifier | sequence number |
 
-**Schema 演进对比:**
-- Paimon: 每次 schema 变更写入新的 `schema-{id}` 文件。旧数据文件通过 `schemaId` 关联读取时需要的 schema，在 `SchemaEvolutionUtil` 中进行列映射和类型转换。
-- Iceberg: schema 变更嵌入在 `metadata.json` 文件中，每次变更重写整个 metadata 文件。通过 `schema-id` 字段追踪版本。
+**Paimon 的 delta 优势**：流式增量只读 delta manifest，无需 diff 全量；Iceberg 需按 `added_snapshot_id` 过滤或比对两版 manifest list。**Paimon 的 changelog 优势**：写入时直接产 CDC 变更记录，语义比 Iceberg 的 delta file 间接读更直接。
 
-**Paimon 独立 schema 文件的好处:**
-1. 不需要重写整个 metadata 文件，变更操作更轻量
-2. 乐观锁基于文件原子创建实现，不需要读取-修改-写入（RMW）操作
-3. schema 历史天然可追溯，每个版本独立存在
-
-**Iceberg 合并 metadata 的好处:**
-1. 所有元数据在一个文件中，读取时不需要多次 IO
-2. metadata 文件中包含 schema、partition spec、sort order 等完整信息
-
-### 9.3 并发控制对比
+### 10.2 Catalog 与 Schema
 
 | 维度 | Paimon | Iceberg |
 |---|---|---|
-| **写入并发控制** | 乐观锁（原子文件创建） + 可选 CatalogLock | 乐观锁（CAS on metadata.json）+ 可选 LockManager |
-| **冲突检测粒度** | 分区级 + 桶级 + Key Range 级 | 分区级 + 文件级 |
-| **重试策略** | 随机退避 + 超时限制 | 固定次数重试 |
-| **Exactly-Once** | commitUser + commitIdentifier 去重 | snapshot sequence number 去重 |
+| 默认 Catalog | FileSystemCatalog | HadoopCatalog / RESTCatalog |
+| SPI | CatalogFactory（Java SPI） | CatalogUtil + catalog-impl |
+| 缓存 | CachingCatalog（Caffeine 装饰器） | CachingCatalog（类似） |
+| 锁 | CatalogLockFactory SPI（可选） | LockManager（内置） |
+| Schema 存储 | 独立 schema-{id}，每变更新增文件 | 嵌入 metadata.json，每变更重写整块 |
+| 分支 / Tag | 原生 BranchManager / TagManager（FS 级） | Ref（1.5+），Catalog 级 |
 
-**Paimon 的 Key Range 冲突检测更精细:** Paimon 会检查新写入文件的 key range 是否与现有文件重叠。这对于 LSM-tree 的正确性至关重要——同一个 bucket 内不应该在同一个 level 出现 key range 重叠的文件。Iceberg 主要关注分区级别的冲突。
+**Paimon 独立 schema 文件的好处**：变更轻量、乐观锁基于文件原子创建（无需 RMW）、历史天然可追溯。**Iceberg 合并 metadata 的好处**：单文件读取一次到位、信息完整（schema + partition spec + sort order）。
 
-### 9.4 总结
+### 10.3 并发控制
 
-Paimon 和 Iceberg 在 Catalog 与元数据管理层面采用了相似的分层架构（Snapshot → ManifestList → ManifestFile），但在细节设计上各有侧重:
+| 维度 | Paimon | Iceberg |
+|---|---|---|
+| 写并发 | 乐观锁（原子文件 / 服务端仲裁）+ 可选 CatalogLock | 乐观锁（CAS on metadata.json）+ 可选 LockManager |
+| 冲突粒度 | 分区 + 桶 + Key Range + Row ID | 分区 + 文件 |
+| 重试 | 随机退避 + 超时 | 固定次数 |
+| Exactly-Once | commitUser + commitIdentifier 去重 | sequence number |
 
-- **Paimon 更侧重流式场景**: 原生的 changelog 支持、watermark 追踪、delta 增量读取，使其在实时数据湖场景下具有优势。
-- **Paimon 更轻量**: 独立的 schema 文件、文件系统即元数据的设计，使得部署和运维成本更低，不强制依赖外部元数据服务。
-- **Iceberg 更成熟**: 在事务语义、多引擎兼容性、SQL 标准支持等方面积累更深。
-- **两者都在演进**: Paimon 新增了 REST Catalog 支持，Iceberg 也在增强流式能力，设计差异在逐步缩小。
+**Paimon 的 Key Range 冲突检测更精细**：检查新文件 key range 是否与现有文件重叠，对 LSM 主键表正确性至关重要（同 bucket 同 level 不应有重叠文件）；Iceberg 主要关注分区 / 文件级。
+
+**REST Catalog 的对位**：Iceberg 的 REST Catalog 规范较成熟、生态广（多引擎已支持）；Paimon REST Catalog 是后起但定位更"重"——不仅做元数据控制面，还管 data token 下发与 PVFS 路径虚拟化，把存储鉴权也收编。两者都把"控制面集中化、客户端轻量化"作为方向，差异在 Paimon 把流式语义（changelog / watermark / 精确一次）与存储凭证治理一起做进了协议。
+
+**小结**：Paimon 更侧重流式（原生 changelog / watermark / delta 增量读）、更轻量（独立 schema 文件、文件即元数据、可选 REST）；Iceberg 在事务语义、多引擎兼容、SQL 标准积累更深。两者都在演进——Paimon 加 REST Catalog，Iceberg 增强流式，差异在收敛。
+
+**选型建议落点**：纯批 / 多引擎互操作（Trino + Spark + Flink 同读一表）成熟度优先 → Iceberg 当前更稳；实时入湖 + CDC + 流批一体 + 主键更新 → Paimon 的 LSM + changelog + key-range 冲突检测是结构性优势；云上多租户集中治理 → 两者 REST Catalog 都可选，看现有生态。元数据运维成本上 Paimon filesystem 后端最低（零外部依赖、可手工修复），但生产高并发仍建议 hive/jdbc/rest 配锁或服务端仲裁。
+
+---
+
+## 十一、设计决策总结
+
+| 决策点 | 选择 | 取舍 / 代价 | 替代方案 |
+|---|---|---|---|
+| 元数据存储 | 文件即元数据（独立 JSON / 二进制文件） | 读路径多次 IO；文件单调累积 | 内嵌单一 metadata（Iceberg / Delta），需 RMW 重写整块 |
+| 并发控制 | 乐观锁（原子文件创建 / 服务端仲裁）+ 重试退避 | 高冲突反复重试；对象存储需外部锁 | 悲观分布式锁，性能稳但重依赖 |
+| Catalog 扩展 | 模板方法(AbstractCatalog) + 装饰器(Delegate) + SPI | 一层间接 + 能力矩阵心智负担 | 各引擎各实现，易不一致 |
+| 后端选型 | filesystem / hive / jdbc / rest 四选一 | 各有能力缺口 | 绑死单一后端 |
+| Schema 演进 | 独立 schema-{id} + field id 永不回收 | schema 文件累积 | 内嵌 schema 重写 metadata |
+| 类型变更 | 仅安全扩宽（除非 allowExplicitCast） | 不安全转换需 overwrite 重写 | 宽松转换，风险丢精度 |
+| Snapshot | 仅元数据入口 + base/delta/changelog 三分 | 需引用计数式过期清理 | 单 manifest，增量需 diff 全量 |
+| LATEST hint | 乐观 hint + id+1 验证 + list 兜底 | hint 失效退化为全量扫描 | 每次 list 目录，对象存储慢 |
+| Tag / Branch | Tag=Snapshot 副本；Branch=写时复制 | 删分支需判文件独占；Tag 拖住存储 | 复制数据，慢且费空间 |
+| Manifest | 三级 + Meta 多维统计剪枝 | 层级与合并复杂度 | 两级，无法支撑大表 |
+| Commit 语义 | APPEND / COMPACT 分离 + 细粒度 key-range 冲突 | 双快照增量；冲突检测读元数据 | 单一提交 + 分区级冲突，粒度粗 |
+| 增量冲突检测 | 重试只增量补 [上次, 现] 变更再 merge | 需缓存上次 baseDataFiles | 每次重读全量 base，高冲突慢 |
+| REST 认证 | AuthProvider 抽象 + DLF v4 签名 + 1h 提前刷新 | 网络依赖 + 时钟敏感 | 仅静态长期凭证，安全性差 |
+| REST 数据访问 | data token + RESTTokenFileIO（按 token 缓存 FileIO）+ PVFS | 强依赖服务端下发凭证 | 客户端持长期强凭证直连，权限难收敛 |
+| 系统表 | 元数据文件的运行时投影（只读、不可 DDL） | 不可写、随原表变 | 物化成真实表，需同步维护 |
+| 配置体系 | ConfigOption 类型安全 + 默认值集中 | — | 散落字符串 parse，默认值易不一致 |

@@ -1,0 +1,116 @@
+---
+title: "生态系统"
+sidebar_position: 6
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# Iceberg 生态系统 {#iceberg-ecosystems}
+
+## AWS Athena {#aws-athena}
+
+AWS Athena 可能会使用旧版 manifest 读取器按名称读取 Iceberg manifest（清单）文件，因此我们应让 Paimon 生成旧版 Iceberg
+manifest 列表文件，你可以启用：`'metadata.iceberg.manifest-legacy-version'`。
+
+## DuckDB {#duckdb}
+
+DuckDB 可能依赖于放置在 `root/data` 目录下的文件，而 Paimon 通常直接放置在 `root`
+目录下，因此你可以为表配置该参数以实现兼容：
+`'data-file.path-directory' = 'data'`。
+
+## Trino Iceberg {#trino-iceberg}
+
+在本示例中，我们使用 Trino Iceberg 连接器，通过 Iceberg Hive Catalog 访问 Paimon 表。
+在尝试本示例之前，请确保你已配置好 Trino Iceberg 连接器。
+更多信息请参阅 [Trino 文档](https://trino.io/docs/current/connector/iceberg.html#general-configuration)。
+
+首先，我们创建一张启用了 Iceberg 兼容性的 Paimon 表。
+
+<Tabs groupId="paimon-append-only-table-trino-1">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+```sql
+CREATE CATALOG paimon_catalog WITH (
+    'type' = 'paimon',
+    'warehouse' = '<path-to-warehouse>'
+);
+
+CREATE TABLE paimon_catalog.`default`.animals (
+    kind STRING,
+    name STRING
+) WITH (
+    'metadata.iceberg.storage' = 'hive-catalog',
+    'metadata.iceberg.uri' = 'thrift://<host>:<port>'
+);
+
+INSERT INTO paimon_catalog.`default`.animals VALUES ('mammal', 'cat'), ('mammal', 'dog'), ('reptile', 'snake'), ('reptile', 'lizard');
+```
+
+</TabItem>
+
+<TabItem value="spark-sql" label="Spark SQL">
+
+使用以下命令行启动 `spark-sql`。
+
+```bash
+spark-sql --jars <path-to-paimon-jar> \
+    --conf spark.sql.catalog.paimon_catalog=org.apache.paimon.spark.SparkCatalog \
+    --conf spark.sql.catalog.paimon_catalog.warehouse=<path-to-warehouse> \
+    --packages org.apache.iceberg:iceberg-spark-runtime-<iceberg-version> \
+    --conf spark.sql.catalog.iceberg_catalog=org.apache.iceberg.spark.SparkCatalog \
+    --conf spark.sql.catalog.iceberg_catalog.type=hadoop \
+    --conf spark.sql.catalog.iceberg_catalog.warehouse=<path-to-warehouse>/iceberg \
+    --conf spark.sql.catalog.iceberg_catalog.cache-enabled=false \ # disable iceberg catalog caching to quickly see the result
+    --conf spark.sql.extensions=org.apache.paimon.spark.extensions.PaimonSparkSessionExtensions,org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+```
+
+运行以下 Spark SQL 来创建 Paimon 表、插入/更新数据，并使用 Iceberg Catalog 进行查询。
+
+```sql
+CREATE TABLE paimon_catalog.`default`.animals (
+    kind STRING,
+    name STRING
+) TBLPROPERTIES (
+    'metadata.iceberg.storage' = 'hive-catalog',
+    'metadata.iceberg.uri' = 'thrift://<host>:<port>'
+);
+
+INSERT INTO paimon_catalog.`default`.animals VALUES ('mammal', 'cat'), ('mammal', 'dog'), ('reptile', 'snake'), ('reptile', 'lizard');
+```
+
+</TabItem>
+
+</Tabs>
+
+使用 Iceberg Catalog 启动 Trino，并从 Paimon 表中查询数据。
+
+```sql
+SELECT * FROM animals WHERE class = 'mammal';
+/*
+   kind | name 
+--------+------
+ mammal | cat  
+ mammal | dog  
+*/
+```

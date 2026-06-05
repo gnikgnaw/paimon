@@ -1,0 +1,442 @@
+---
+title: "理解文件"
+sidebar_position: 1
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+import Label from '@site/src/components/Label';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# 理解文件 {#understand-files}
+
+本文专门用于阐明各种文件操作对文件所产生的影响。
+
+本页面提供了具体的示例和实用的技巧，帮助你有效地管理这些文件。此外，通过深入探究 commit（提交）和 compact（Compaction）等操作，我们希望能够帮助你深入理解文件的创建与更新过程。
+
+## 前置条件 {#prerequisite}
+
+在进一步深入阅读本页面之前，请确保你已经通读了以下章节：
+
+1. [基本概念](../concepts/basic-concepts)，
+2. [主键表](../primary-key-table/overview) 和 [Append 表](../append-table/overview)
+3. 如何在 [Flink](../flink) 中使用 Paimon。
+
+## 理解文件操作 {#understand-file-operations}
+
+### 创建 Catalog {#create-catalog}
+
+通过 `./sql-client.sh` 启动 Flink SQL 客户端，并逐条执行以下语句来创建一个 Paimon Catalog。
+```sql
+CREATE CATALOG paimon WITH (
+'type' = 'paimon',
+'warehouse' = 'file:///tmp/paimon'
+);
+
+USE CATALOG paimon;
+```
+
+这只会在给定路径 `file:///tmp/paimon` 下创建一个目录。
+
+### 创建表 {#create-table}
+
+执行以下建表语句将创建一个包含 3 个字段的 Paimon 表：
+
+```sql
+CREATE TABLE T (
+  id BIGINT,
+  a INT,
+  b STRING,
+  dt STRING COMMENT 'timestamp string in format yyyyMMdd',
+  PRIMARY KEY(id, dt) NOT ENFORCED
+) PARTITIONED BY (dt);
+```
+
+这将在路径 `/tmp/paimon/default.db/T` 下创建 Paimon 表 `T`，其 schema（表结构）存储在 `/tmp/paimon/default.db/T/schema/schema-0` 中。
+
+
+### 向表中插入记录 {#insert-records-into-table}
+
+在 Flink SQL 中执行以下插入语句：
+
+```sql
+INSERT INTO T VALUES (1, 10001, 'varchar00001', '20230501');
+```
+
+Flink 作业完成后，这些记录会通过一次成功的 `commit` 写入到 Paimon 表中。用户可以执行查询 `SELECT * FROM T` 来验证这些记录的可见性，该查询将返回一行数据。提交过程会创建一个位于路径 `/tmp/paimon/default.db/T/snapshot/snapshot-1` 的快照。snapshot-1 所对应的文件布局如下所示：
+
+![](/img/file-operations-0.png)
+
+snapshot-1 的内容包含该快照的元数据，例如 manifest 列表和 schema id：
+```json
+{
+  "version" : 3,
+  "id" : 1,
+  "schemaId" : 0,
+  "baseManifestList" : "manifest-list-4ccc-c07f-4090-958c-cfe3ce3889e5-0",
+  "deltaManifestList" : "manifest-list-4ccc-c07f-4090-958c-cfe3ce3889e5-1",
+  "changelogManifestList" : null,
+  "commitUser" : "7d758485-981d-4b1a-a0c6-d34c3eb254bf",
+  "commitIdentifier" : 9223372036854775807,
+  "commitKind" : "APPEND",
+  "timeMillis" : 1684155393354,
+  "logOffsets" : { },
+  "totalRecordCount" : 1,
+  "deltaRecordCount" : 1,
+  "changelogRecordCount" : 0,
+  "watermark" : -9223372036854775808
+}
+```
+
+需要提醒的是，一个 manifest 列表包含了该快照的所有变更，`baseManifestList` 是基础文件，`deltaManifestList` 中的变更将应用在它之上。第一次提交会产生 1 个 manifest（清单）文件，并创建 2 个 manifest 列表（文件名可能与你实验中的不同）：
+
+```bash
+./T/manifest:
+manifest-list-4ccc-c07f-4090-958c-cfe3ce3889e5-1	
+manifest-list-4ccc-c07f-4090-958c-cfe3ce3889e5-0
+manifest-2b833ea4-d7dc-4de0-ae0d-ad76eced75cc-0
+```
+`manifest-2b833ea4-d7dc-4de0-ae0d-ad76eced75cc-0` 是 manifest 文件（即上图中的 manifest-1-0），它存储了该快照中数据文件的相关信息。
+
+`manifest-list-4ccc-c07f-4090-958c-cfe3ce3889e5-0` 是 baseManifestList（即上图中的 manifest-list-1-base），实际上它是空的。
+
+`manifest-list-4ccc-c07f-4090-958c-cfe3ce3889e5-1` 是 deltaManifestList（即上图中的 manifest-list-1-delta），它包含了一组对数据文件执行操作的 manifest 条目，在本例中即为 `manifest-1-0`。
+
+
+现在，让我们插入一批跨越不同分区的记录，看看会发生什么。在 Flink SQL 中执行以下语句：
+
+```sql
+INSERT INTO T VALUES 
+(2, 10002, 'varchar00002', '20230502'),
+(3, 10003, 'varchar00003', '20230503'),
+(4, 10004, 'varchar00004', '20230504'),
+(5, 10005, 'varchar00005', '20230505'),
+(6, 10006, 'varchar00006', '20230506'),
+(7, 10007, 'varchar00007', '20230507'),
+(8, 10008, 'varchar00008', '20230508'),
+(9, 10009, 'varchar00009', '20230509'),
+(10, 10010, 'varchar00010', '20230510');
+```
+
+第二次 `commit` 发生后，执行 `SELECT * FROM T` 将返回 10 行数据。一个新的快照（即 `snapshot-2`）被创建，并为我们呈现出以下物理文件布局：
+```bash
+ % ls -1tR . 
+./T:
+dt=20230501
+dt=20230502	
+dt=20230503	
+dt=20230504	
+dt=20230505	
+dt=20230506	
+dt=20230507	
+dt=20230508	
+dt=20230509	
+dt=20230510	
+snapshot
+schema
+manifest
+
+./T/snapshot:
+LATEST
+snapshot-2
+EARLIEST
+snapshot-1
+
+./T/manifest:
+manifest-list-9ac2-5e79-4978-a3bc-86c25f1a303f-1 # delta manifest list for snapshot-2
+manifest-list-9ac2-5e79-4978-a3bc-86c25f1a303f-0 # base manifest list for snapshot-2	
+manifest-f1267033-e246-4470-a54c-5c27fdbdd074-0	 # manifest file for snapshot-2
+
+manifest-list-4ccc-c07f-4090-958c-cfe3ce3889e5-1 # delta manifest list for snapshot-1 
+manifest-list-4ccc-c07f-4090-958c-cfe3ce3889e5-0 # base manifest list for snapshot-1
+manifest-2b833ea4-d7dc-4de0-ae0d-ad76eced75cc-0  # manifest file for snapshot-1
+
+./T/dt=20230501/bucket-0:
+data-b75b7381-7c8b-430f-b7e5-a204cb65843c-0.orc
+
+...
+# each partition has the data written to bucket-0
+...
+
+./T/schema:
+schema-0
+```
+snapshot-2 所对应的新文件布局如下所示
+![](/img/file-operations-1.png)
+
+### 从表中删除记录 {#delete-records-from-table}
+
+现在，让我们删除满足条件 `dt>=20230503` 的记录。在 Flink SQL 中执行以下语句：
+
+<Label>批式</Label>
+```sql
+DELETE FROM T WHERE dt >= '20230503';
+```
+第三次 `commit` 发生，它为我们生成了 `snapshot-3`。此时，列出表下的文件，你会发现没有任何分区被删除。相反，系统为分区 `20230503` 到 `20230510` 创建了新的数据文件：
+
+```bash
+./T/dt=20230510/bucket-0:
+data-b93f468c-b56f-4a93-adc4-b250b3aa3462-0.orc # newer data file created by the delete statement 
+data-0fcacc70-a0cb-4976-8c88-73e92769a762-0.orc # older data file created by the insert statement
+```
+
+这是合理的，因为我们在第二次提交中插入了一条记录（由 `+I[10, 10010, 'varchar00010', '20230510']` 表示），然后在第三次提交中删除了该记录。执行 `SELECT * FROM T` 将返回 2 行数据，即：
+```
++I[1, 10001, 'varchar00001', '20230501']
++I[2, 10002, 'varchar00002', '20230502']
+```
+
+snapshot-3 所对应的新文件布局如下所示
+![](/img/file-operations-2.png)
+
+注意，`manifest-3-0` 包含 8 个 `ADD` 操作类型的 manifest 条目，对应于 8 个新写入的数据文件。
+
+
+
+### Compaction 表 {#compact-table}
+
+正如你可能已经注意到的，随着快照的不断累积，小文件的数量会持续增加，这可能导致读取性能下降。因此，需要进行一次全量 Compaction 以减少小文件的数量。
+
+现在，让我们触发全量 Compaction，并通过 `flink run` 运行一个独立 Compaction 作业：
+
+<Label>批式</Label>
+
+<Tabs groupId="compact">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+```sql  
+CALL sys.compact(
+   `table` => 'database_name.table_name', 
+   partitions => 'partition_name', 
+   order_strategy => 'order_strategy',
+   order_by => 'order_by',
+   options => 'paimon_table_dynamic_conf'
+);
+```
+
+</TabItem>
+
+<TabItem value="flink-action" label="Flink Action">
+
+```bash  
+<FLINK_HOME>/bin/flink run \
+    -D execution.runtime-mode=batch \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    compact \
+    --warehouse <warehouse-path> \
+    --database <database-name> \
+    --table <table-name> \
+    [--partition <partition-name>] \
+    [--catalog_conf <paimon-catalog-conf> [--catalog_conf <paimon-catalog-conf> ...]] \
+    [--table_conf <paimon-table-dynamic-conf> [--table_conf <paimon-table-dynamic-conf>] ...]
+```
+
+</TabItem>
+
+</Tabs>
+
+一个示例如下（假设你已经处于 Flink home 目录中）
+
+<Tabs groupId="compact-example">
+
+<TabItem value="flink-sql" label="Flink SQL">
+
+```sql
+CALL sys.compact('T');
+```
+
+</TabItem>
+
+<TabItem value="flink-action" label="Flink Action">
+
+```bash
+./bin/flink run \
+    ./lib/paimon-flink-action-@@VERSION@@.jar \
+    compact \
+    --path file:///tmp/paimon/default.db/T
+```
+
+</TabItem>
+
+</Tabs>
+
+当前所有的表文件都将被执行 Compaction，并生成一个新的快照（即 `snapshot-4`），其中包含以下信息：
+
+```json
+{
+  "version" : 3,
+  "id" : 4,
+  "schemaId" : 0,
+  "baseManifestList" : "manifest-list-9be16-82e7-4941-8b0a-7ce1c1d0fa6d-0",
+  "deltaManifestList" : "manifest-list-9be16-82e7-4941-8b0a-7ce1c1d0fa6d-1",
+  "changelogManifestList" : null,
+  "commitUser" : "a3d951d5-aa0e-4071-a5d4-4c72a4233d48",
+  "commitIdentifier" : 9223372036854775807,
+  "commitKind" : "COMPACT",
+  "timeMillis" : 1684163217960,
+  "logOffsets" : { },
+  "totalRecordCount" : 2,
+  "deltaRecordCount" : -16,
+  "changelogRecordCount" : 0,
+  "watermark" : -9223372036854775808
+}
+```
+
+snapshot-4 所对应的新文件布局如下所示
+![](/img/file-operations-3.png)
+
+注意，`manifest-4-0` 包含 20 个 manifest 条目（18 个 `DELETE` 操作和 2 个 `ADD` 操作）
+1. 对于分区 `20230503` 到 `20230510`，针对两个数据文件有两个 `DELETE` 操作
+2. 对于分区 `20230501` 到 `20230502`，针对同一个数据文件有一个 `DELETE` 操作和一个 `ADD` 操作。
+   这是因为该文件从 level 0 升级到了最高层（level）。请放心，这仅仅是元数据上的变化，文件本身仍然是相同的。
+
+### 修改表 {#alter-table}
+执行以下语句来配置全量 Compaction：
+```sql
+ALTER TABLE T SET ('full-compaction.delta-commits' = '1');
+```
+
+这将为 Paimon 表创建一个新的 schema（即 `schema-1`），但在下一次提交之前，实际上还没有任何快照使用这个 schema。
+
+### 过期快照 {#expire-snapshots}
+
+需要提醒的是，被标记的数据文件在快照过期且没有任何消费者依赖该快照之前，并不会被真正删除。更多信息请参阅 [过期快照](../maintenance/manage-snapshots#expire-snapshots)。
+
+在快照过期的过程中，系统首先确定快照的范围，然后将这些快照内的数据文件标记为待删除。只有当存在一个 `DELETE` 类型的 manifest 条目引用了某个特定数据文件时，该数据文件才会被 `标记` 为待删除。这种标记机制确保了该文件不会被后续快照使用，并且可以被安全地移除。
+
+
+假设上图中的全部 4 个快照都即将过期。过期过程如下：
+
+1. 它首先删除所有被标记的数据文件，并记录所有发生变更的桶。
+
+2. 然后删除所有 changelog（变更日志）文件及其相关联的 manifest。
+
+3. 最后，它删除快照本身，并写入 earliest 提示文件。
+
+如果删除过程结束后有任何目录变为空目录，这些目录也将被删除。
+
+
+假设又创建了一个快照 `snapshot-5`，并触发了快照过期。`snapshot-1` 到 `snapshot-4` 将被删除。为简单起见，我们只关注来自先前快照的文件，快照过期之后的最终布局如下所示：
+
+![](/img/file-operations-4.png)
+
+最终，分区 `20230503` 到 `20230510` 被物理删除了。
+
+### Flink 流式写入 {#flink-stream-write}
+
+最后，我们将以 CDC 接入为例来考察 Flink 流式写入。本节将讲解变更数据的捕获与写入 Paimon 的过程，以及异步 Compaction、快照提交与过期背后的机制。
+
+首先，让我们更仔细地了解一下 CDC 接入的工作流程，以及其中每个组件所扮演的独特角色。
+
+![](/img/cdc-ingestion-topology.png)
+
+1. `MySQL CDC Source` 统一读取快照数据和增量数据，其中 `SnapshotReader` 负责读取快照数据，`BinlogReader` 负责读取增量数据。
+2. `Paimon Sink` 以桶为粒度将数据写入 Paimon 表。其内部的 `CompactManager` 会异步触发 Compaction。
+3. `Committer Operator` 是一个单例，负责提交和使快照过期。
+
+接下来，我们将梳理端到端的数据流。
+
+
+![](/img/cdc-ingestion-source.png)
+
+`MySQL Cdc Source` 读取快照数据和增量数据，并在归一化处理后将它们发往下游。
+
+![](/img/cdc-ingestion-write.png)
+
+
+`Paimon Sink` 首先将新记录缓冲在一个基于堆的 LSM 树中，当内存缓冲区满时将它们刷写到磁盘。注意，每个写出的数据文件都是一个 sorted run。此时，尚未创建任何 manifest 文件和快照。在 Flink checkpoint 即将发生之前，`Paimon Sink` 会刷写所有缓冲的记录，并向下游发送可提交（committable）消息，这些消息会在 checkpoint 期间由 `Committer Operator` 读取并提交。
+
+![](/img/cdc-ingestion-commit.png)
+
+在 checkpoint 期间，`Committer Operator` 会创建一个新的快照，并将其与 manifest 列表相关联，从而使该快照包含表中所有数据文件的信息。
+
+![](/img/cdc-ingestion-compact.png)
+
+在稍后的某个时刻，可能会发生异步 Compaction，`CompactManager` 产生的可提交（committable）消息包含了关于先前文件和合并后文件的信息，以便 `Committer Operator` 能够构造相应的 manifest 条目。在这种情况下，`Committer Operator` 可能会在一次 Flink checkpoint 期间产生两个快照，一个用于写入的数据（`Append` 类型的快照），另一个用于 Compaction（`Compact` 类型的快照）。如果在 checkpoint 间隔内没有写入任何数据文件，则只会创建 `Compact` 类型的快照。`Committer Operator` 会检查快照是否过期，并对被标记的数据文件执行物理删除。
+
+## 理解小文件 {#understand-small-files}
+
+许多用户对小文件问题感到担忧，小文件可能导致：
+1. 稳定性问题：HDFS 中过多的小文件会使 NameNode 承受过大的压力。
+2. 成本问题：HDFS 中的一个小文件会临时占用至少一个 Block 大小的空间，例如 128 MB。
+3. 查询效率：查询过多小文件会影响查询效率。
+
+### 理解 Checkpoint {#understand-checkpoints}
+
+假设你正在使用 Flink Writer，每个 checkpoint 会生成 1-2 个快照，并且 checkpoint 会强制将文件生成到 DFS 上，因此 checkpoint 间隔越小，生成的小文件就越多。
+
+1. 所以第一件事是增大 checkpoint 间隔。
+
+默认情况下，不仅 checkpoint 会导致文件生成，writer 内存（write-buffer-size）耗尽时也会将数据刷写到 DFS 并生成相应的文件。你可以启用 `write-buffer-spillable`，让 writer 生成溢写（spilled）文件，从而在 DFS 上生成更大的文件。
+
+2. 所以第二件事是增大 `write-buffer-size` 或启用 `write-buffer-spillable`。
+
+### 理解快照 {#understand-snapshots}
+
+![](/img/file-operations-3.png)
+
+Paimon 维护着文件的多个版本，文件的 Compaction 和删除都是逻辑上的，并不会真正删除文件。只有当快照过期时，文件才会被真正删除，所以减少文件的第一种方式是缩短快照过期所需的时间。Flink writer 会自动使快照过期。
+
+请参阅 [过期快照](../maintenance/manage-snapshots#expire-snapshots)。
+
+### 理解分区与桶 {#understand-partitions-and-buckets}
+
+Paimon 文件以分层的方式组织。下图展示了文件布局。从一个快照文件开始，Paimon 读取器可以递归地访问表中的所有记录。
+
+![](/img/file-layout.png)
+
+例如，以下这张表：
+
+```sql
+CREATE TABLE MyTable (
+    user_id BIGINT,
+    item_id BIGINT,
+    behavior STRING,
+    dt STRING,
+    hh STRING,
+    PRIMARY KEY (dt, hh, user_id) NOT ENFORCED
+) PARTITIONED BY (dt, hh) WITH (
+    'bucket' = '10'
+);
+```
+
+表数据将在物理上被切分到不同的分区中，分区内部又切分到不同的桶中，因此如果整体数据量太小，单个桶中至少会有一个文件，我建议你配置较少的桶数，否则同样会产生相当多的小文件。
+
+### 理解主键表的 LSM {#understand-lsm-for-primary-table}
+
+LSM 树将文件组织成若干个 sorted run。一个 sorted run 由一个或多个数据文件组成，并且每个数据文件恰好属于一个 sorted run。
+
+![](/img/sorted-runs.png)
+
+默认情况下，sorted run 的数量取决于 `num-sorted-run.compaction-trigger`，参见 [主键表的 Compaction](../primary-key-table/compaction)，这意味着一个桶中至少有 5 个文件。如果你想减少这个数量，可以保留更少的文件，但写入性能可能会受到影响。
+
+### 理解分桶 Append 表的文件 {#understand-files-for-bucketed-append-table}
+
+默认情况下，Append 表也会执行自动 Compaction 以减少小文件的数量。
+
+然而，对于分桶 Append 表，出于保持顺序的目的，它只会对桶内的文件执行 Compaction，这可能会保留更多的小文件。参见 [分桶 Append](../append-table/bucketed)。
+
+### 理解全量 Compaction {#understand-full-compaction}
+
+也许你觉得主键表的 5 个文件其实还可以接受，但 Append 表（桶）在单个桶中可能有 50 个小文件，这是非常难以接受的。更糟糕的是，那些不再活跃的分区也会保留如此多的小文件。
+
+配置 'full-compaction.delta-commits' 可以在 Flink 写入过程中周期性地执行全量 Compaction。并且它能够确保在写入结束之前分区已被执行全量 Compaction。

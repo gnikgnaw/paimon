@@ -1,0 +1,178 @@
+---
+title: "概述"
+sidebar_position: 1
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# 概述 {#overview}
+
+如果一张表没有定义主键，那么它就是 Append 表（追加表）。与主键表相比，它不具备直接接收 changelog（变更日志）的能力，也无法通过 Upsert 直接更新数据，只能接收追加数据写入的传入数据。
+
+<Tabs groupId="create-append-table">
+
+<TabItem value="flink" label="Flink">
+
+```sql
+CREATE TABLE my_table (
+    product_id BIGINT,
+    price DOUBLE,
+    sales BIGINT
+) WITH (
+    -- 'target-file-size' = '256 MB',
+    -- 'file.format' = 'parquet',
+    -- 'file.compression' = 'zstd',
+    -- 'file.compression.zstd-level' = '3'
+);
+```
+
+</TabItem>
+
+</Tabs>
+
+在典型应用场景中进行批式写入与批式读取，类似于普通的 Hive 分区表，但相比 Hive 表，它能够带来：
+
+1. 时间旅行使可复现查询成为可能——可以使用完全相同的表快照进行查询，或让用户轻松检查变更。版本回滚允许用户通过将表重置到良好状态来快速纠正问题。
+2. 扫描规划很快——利用表元数据，通过分区与列级统计信息对数据文件进行裁剪。文件索引（布隆过滤器、位图、Range Bitmap）以及聚合下推进一步加速查询。
+3. schema 演进支持新增、删除、更新或重命名列，且没有副作用。
+4. 丰富的生态系统——将表接入包括 Flink、Spark、Hive、Trino、Presto、StarRocks 和 Doris 在内的计算引擎，使用起来就像一张普通的 SQL 表。
+5. 增量聚类（Incremental Clustering）采用 z-order/hilbert/order 排序，以低成本优化数据布局。
+6. 像队列一样进行流式读写，DELETE / UPDATE / MERGE INTO 支持低成本的行级操作。
+
+---
+title: "Streaming"
+weight: 2
+type: docs
+aliases:
+- /append-table/streaming.html
+---
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+## Append 流式（Append Streaming） {#append-streaming}
+
+你可以通过 Flink 以非常灵活的方式向 Append 表进行流式写入，或者通过 Flink 流式读取 Append 表，像使用队列一样使用它。唯一的区别在于它的延迟以分钟计。它的优势是成本极低，并且能够下推过滤条件和投影。
+
+**提交前小文件合并（Pre small files merging）**
+
+“Pre” 表示这次 Compaction 发生在文件提交到快照之前。
+
+如果 Flink 的 checkpoint 间隔很短（例如 30 秒），每个快照可能会产生大量小的 changelog 文件。文件过多可能会给分布式存储集群带来负担。
+
+为了将小的 changelog 文件 Compaction 成大文件，你可以设置表配置项 `precommit-compact = true`。该配置项的默认值为 false，如果设置为 true，它会在 writer 算子之后增加一个 compact coordinator 算子和 compact worker 算子，将 changelog 文件合并成大文件。
+
+**提交后小文件合并（Post small files merging）**
+
+“Post” 表示这次 Compaction 发生在文件提交到快照之后。
+
+在流式写入作业中，如果没有桶（bucket）定义，writer 中不会进行 Compaction，而是会使用 `Compact Coordinator` 扫描小文件并将 Compaction 任务传递给 `Compact Worker`。在流式模式下，如果你在 Flink 中运行 insert SQL，拓扑结构将如下所示：
+
+![](/img/unaware-bucket-topo.png)
+
+不用担心背压，Compaction 永远不会产生背压。
+
+如果你将 `write-only` 设置为 true，`Compact Coordinator` 和 `Compact Worker` 将从拓扑中移除。
+
+自动 Compaction 仅在 Flink 引擎的流式模式下支持。你也可以通过 Paimon 中的 Flink Action 启动一个 Compaction 作业，并通过设置 `write-only` 禁用所有其他的 Compaction。
+
+**流式查询（Streaming Query）**
+
+你可以对 Append 表进行流式读取，像使用消息队列一样使用它。与主键表一样，流式读取有两个选项：
+1. 默认情况下，流式读取在首次启动时产生表上的最新快照，并继续读取最新的增量记录。
+2. 你可以指定 `scan.mode`、`scan.snapshot-id`、`scan.timestamp-millis` 和/或 `scan.file-creation-time-millis` 来仅流式读取增量数据。
+
+与 flink-kafka 类似，默认情况下顺序无法保证，如果你的数据有某种顺序要求，你还需要考虑定义一个 `bucket-key`，参见 [Bucketed Append](./bucketed)
+
+## 聚合下推（Aggregate push down） {#aggregate-push-down}
+
+Append 表支持聚合下推：
+
+```sql
+SELECT COUNT(*) FROM TABLE WHERE DT = '20230101';
+```
+
+该查询可以在编译期间被加速，并很快返回结果。
+
+对于 Spark SQL，使用默认 `metadata.stats-mode` 的表可以被加速：
+
+```sql
+SELECT MIN(a), MAX(b) FROM TABLE WHERE DT = '20230101';
+
+SELECT * FROM TABLE ORDER BY a LIMIT 1;
+```
+
+Min max topN 查询也可以在编译期间被加速，并很快返回结果。
+
+## 按顺序进行数据跳过（Data Skipping By Order） {#data-skipping-by-order}
+
+Paimon 默认在 manifest（清单）文件中记录每个字段的最大值和最小值。
+
+在查询时，根据查询的 `WHERE` 条件，结合 manifest 中的统计信息，我们可以进行文件过滤。如果过滤效果良好，原本需要数分钟的查询将被加速到毫秒级完成执行。
+
+通常数据分布并不总是适合过滤，那么我们能否按照 `WHERE` 条件中的字段对数据进行排序呢？你可以查看 [Flink COMPACT Action](../maintenance/dedicated-compaction#sort-compact)、[Flink COMPACT Procedure](../flink/procedures) 或 [Spark COMPACT Procedure](../spark/procedures)。
+
+## 按文件索引进行数据跳过（Data Skipping By File Index） {#data-skipping-by-file-index}
+
+你也可以使用文件索引，它在读取侧通过索引来过滤文件。
+
+定义 `file-index.bitmap.columns` 后，数据文件索引是一个外部索引文件，Paimon 会为每个文件创建其对应的索引文件。如果索引文件太小，它将直接存储在 manifest 中，否则存储在数据文件所在的目录中。每个数据文件对应一个索引文件，该索引文件有独立的文件定义，并且可以包含针对多个列的不同类型的索引。
+
+不同的文件索引在不同场景下可能各有优势。例如，布隆过滤器可能在点查询（point lookup）场景下加速查询。使用位图可能会消耗更多空间，但能带来更高的准确性。
+
+* [BloomFilter](../concepts/spec/fileindex#index-bloomfilter)：`file-index.bloom-filter.columns`。
+* [Bitmap](../concepts/spec/fileindex#index-bitmap)：`file-index.bitmap.columns`。
+* [Range Bitmap](../concepts/spec/fileindex#index-range-bitmap)：`file-index.range-bitmap.columns`。
+
+如果你想在不进行任何重写的情况下，为已有的表添加文件索引，可以使用 `rewrite_file_index` 存储过程。在使用该存储过程之前，你应该在目标表中配置适当的配置项。你可以使用 ALTER 子句为表配置 `file-index.<filter-type>.columns`。
+
+如何调用：参见 [flink procedures](../flink/procedures)
+
+## 行级操作（Row Level Operations） {#row-level-operations}
+
+目前，只有 Spark SQL 支持 DELETE、UPDATE 和 MERGE INTO，你可以查看 [Spark Write](../spark/sql-write)。
+
+示例：
+```sql
+DELETE FROM my_table WHERE currency = 'UNKNOWN';
+```
+
+更新 Append 表有两种模式：
+
+1. COW（Copy on Write，写时复制）：搜索命中的文件，然后重写每个文件，从文件中移除需要删除的数据。这种操作代价较高。
+2. MOW（Merge on Write，写时合并）：通过指定 `'deletion-vectors.enabled' = 'true'`，可以启用删除向量（Deletion Vector）模式。仅标记对应文件中的某些记录为删除并写入删除文件，而无需重写整个文件。

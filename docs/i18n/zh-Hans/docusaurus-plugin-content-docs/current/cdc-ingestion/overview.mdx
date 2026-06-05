@@ -1,0 +1,135 @@
+---
+title: "概述"
+sidebar_position: 1
+---
+
+import ConfigTable from '@site/src/components/ConfigTable';
+import temporalFunctionsHtml from '@site/generated/temporal_functions.html';
+import otherFunctionsHtml from '@site/generated/other_functions.html';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# 概述 {#overview}
+
+Paimon 支持以多种方式将数据接入（ingestion）到 Paimon 表中，并支持 schema（表结构）演进（schema evolution）。这意味着新增的列会实时同步到 Paimon 表中，并且同步作业不会因此而重启。
+
+我们目前支持以下同步方式：
+
+1. MySQL 同步表：将一个或多个 MySQL 表同步到一个 Paimon 表中。
+2. MySQL 同步数据库：将整个 MySQL 数据库同步到一个 Paimon 数据库中。
+3. [Program API 同步](../program-api/flink-api#cdc-ingestion-table)：将你自定义的 DataStream 输入同步到一个 Paimon 表中。
+4. Kafka 同步表：将一个 Kafka topic 中的表同步到一个 Paimon 表中。
+5. Kafka 同步数据库：将一个包含多个表的 Kafka topic，或多个各自包含一个表的 topic，同步到一个 Paimon 数据库中。
+6. MongoDB 同步集合：将一个 MongoDB 集合（Collection）同步到一个 Paimon 表中。
+7. MongoDB 同步数据库：将整个 MongoDB 数据库同步到一个 Paimon 数据库中。
+8. Pulsar 同步表：将一个 Pulsar topic 中的表同步到一个 Paimon 表中。
+9. Pulsar 同步数据库：将一个包含多个表的 Pulsar topic，或多个各自包含一个表的 topic，同步到一个 Paimon 数据库中。
+
+## 什么是 Schema 演进 {#what-is-schema-evolution}
+
+假设我们有一个名为 `tableA` 的 MySQL 表，它有三个字段：`field_1`、`field_2`、`field_3`。当我们想把这个 MySQL 表加载到 Paimon 时，可以在 Flink SQL 中完成，或者使用 [MySqlSyncTableAction](https://paimon.apache.org/docs/master/api/java/org/apache/paimon/flink/action/cdc/mysql/MySqlSyncTableAction)。
+
+**Flink SQL：**
+
+在 Flink SQL 中，如果我们在接入之后修改了 MySQL 表的表结构，该表结构变更不会同步到 Paimon。
+
+![](/img/cdc-ingestion-flinksql.png)
+
+**MySqlSyncTableAction：**
+
+在 [MySqlSyncTableAction](https://paimon.apache.org/docs/master/api/java/org/apache/paimon/flink/action/cdc/mysql/MySqlSyncTableAction) 中，如果我们在接入之后修改了 MySQL 表的表结构，该表结构变更会同步到 Paimon，并且新增加的 `field_4` 的数据也会同步到 Paimon。
+
+![](/img/cdc-ingestion-schema-evolution.png)
+
+## Schema 变更演进 {#schema-change-evolution}
+
+CDC 接入支持有限数量的 schema 变更。目前，框架无法重命名表、删除列，因此 `RENAME TABLE` 和 `DROP COLUMN` 的行为会被忽略，`RENAME COLUMN` 会新增一列。目前支持的 schema 变更包括：
+
+* 新增列。
+
+* 修改列类型。更具体地说，支持以下情况：
+
+    * 从一个字符串类型（char、varchar、text）修改为另一个长度更长的字符串类型，
+    * 从一个非字符串类型修改为字符串类型（char、varchar、text），
+    * 从一个二进制类型（binary、varbinary、blob）修改为另一个长度更长的二进制类型，
+    * 从一个整数类型（tinyint、smallint、int、bigint）修改为另一个取值范围更宽的整数类型，
+    * 从一个浮点类型（float、double）修改为另一个取值范围更宽的浮点类型，
+
+  以上修改均受支持。
+
+## 计算函数 {#computed-functions}
+
+`--computed_column` 是计算列的定义。其参数字段来源于源表的字段名。
+
+### 时间函数 {#temporal-functions}
+
+时间函数可以将日期和 epoch time（纪元时间）转换为另一种形式。一个常见的用例是生成分区值。
+
+<ConfigTable html={temporalFunctionsHtml} />
+
+时间列（temporal-column）的数据类型可以是以下几种情况之一：
+1. DATE、DATETIME 或 TIMESTAMP。
+2. 任意整数数值类型（例如 INT 和 BIGINT）。在这种情况下，数据会被视为相对于 `1970-01-01 00:00:00` 的 epoch time。
+你应当设置该值的精度（默认值为 0）。
+3. STRING。在这种情况下，如果你没有设置时间单位，数据会被视为 DATE、DATETIME 或 TIMESTAMP 值的格式化字符串。否则，数据会被视为 epoch time 的字符串值。因此在后一种情况下你必须设置时间单位。
+
+精度表示 epoch time 的单位。目前有四种有效的精度：`0`（表示 epoch 秒）、`3`（表示 epoch 毫秒）、`6`（表示 epoch 微秒）和 `9`（表示 epoch 纳秒）。以时间点 `1970-01-01 00:00:00.123456789` 为例，epoch 秒为 0，epoch 毫秒为 123，epoch 微秒为 123456，epoch 纳秒为 123456789。精度应当与输入值相匹配。你可以这样设置精度：`date_format(epoch_col, yyyy-MM-dd, 0)`。
+
+`date_format` 是一个灵活的函数，它能够使用不同的格式字符串将时间值转换为各种格式。一个最常见的格式字符串是 `yyyy-MM-dd HH:mm:ss.SSS`。另一个示例是 `yyyy-ww`，它可以从输入中提取年份和当年的周序号。注意，输出会受到 locale 的影响。例如，在某些地区一周的第一天是周一，而在另一些地区是周日，因此如果你使用 `date_format(date_col, yyyy-ww)`，而 date_col 的输入是 2024-01-07（周日），那么输出可能是 `2024-01`（如果一周的第一天是周一）或 `2024-02`（如果一周的第一天是周日）。
+
+### 其他函数 {#other-functions}
+
+<ConfigTable html={otherFunctionsHtml} />
+
+## 特殊数据类型映射 {#special-data-type-mapping}
+
+有可能上游系统的某些数据类型无法直接映射到 Paimon 数据类型。我们提供了一些特殊的数据类型映射规则：
+
+1. MySQL `TINYINT(1)` 类型将被映射为 `Boolean`。
+2. MySQL `BIT(1)` 类型将被映射为 `Boolean`。
+3. MySQL `BIGINT UNSIGNED`、`BIGINT UNSIGNED ZEROFILL`、`SERIAL` 将被映射为 `DECIMAL(20, 0)`。
+4. MySQL `BINARY` 将被映射为 Paimon `VARBINARY`。这是因为二进制值在 binlog 中以字节形式传递，所以它应当被映射为字节类型（`BYTES` 或 `VARBINARY`）。我们选择 `VARBINARY`，因为它能够保留长度信息。
+5. 某些上游系统可能不会传递 decimal 的精度和小数位（scale）信息。在这种情况下，我们将使用 `DECIMAL(38, 18)`。
+6. 当使用 Hive catalog 时，MySQL `TIME` 类型将被映射为 `STRING`。
+
+我们提供了一些配置项来自定义映射规则。请使用 `--type_mapping option1,option2,...` 来指定它们：
+
+1. `tinyint1-not-bool`：将 MySQL `TINYINT(1)` 映射为 Paimon `TINYINT`，而不是 `Boolean`。
+2. `to-nullable`：忽略所有 `NOT NULL` 约束（主键除外）。
+3. `to-string`：将所有 MySQL 数据类型映射为 `STRING`。
+4. `char-to-string`：将 MySQL `CHAR(length)`/`VARCHAR(length)` 类型映射为 `STRING`。
+5. `longtext-to-bytes`：将 MySQL `LONGTEXT` 类型映射为 `BYTES`。
+6. `decimal_no_change`：避免 Paimon CDC 框架自动使用 `DECIMAL(38, 18)`。
+7. `bigint-unsigned-to-bigint`：将 MySQL `BIGINT UNSIGNED`、`BIGINT UNSIGNED ZEROFILL`、`SERIAL` 映射为 Paimon `BIGINT`，但存在潜在的数据溢出风险，因为 `BIGINT UNSIGNED` 最多可以存储 20 位的整数值，而 Paimon `BIGINT` 最多只能存储 19 位的整数值。因此在使用此选项时，你应当确保不会发生溢出。
+8. `allow_non_string_to_string`：默认情况下，schema 变更不支持从非字符串类型变更为字符串类型。使用此选项以允许该变更。
+
+## 自定义作业设置 {#custom-job-settings}
+
+### Checkpointing {#checkpointing}
+
+使用 `-Dexecution.checkpointing.interval=<interval>` 来启用 checkpointing 并设置间隔。对于 0.7 及之后的版本，如果你没有启用 checkpointing，Paimon 将默认启用 checkpointing 并将 checkpoint 间隔设置为 180 秒。
+
+### 作业名称 {#job-name}
+
+使用 `-Dpipeline.name=<job-name>` 来设置自定义的同步作业名称。
+
+### 表配置 {#table-configuration}
+
+你可以使用 `--table_conf` 来设置表属性以及某些 Flink 作业属性（例如 `sink.parallelism`）。如果该表是由 CDC 作业创建的，则该表的属性将等于所给定的属性。否则，作业将使用所给定的属性来修改表的属性。但请注意，不可变配置项（例如 `merge-engine`）和桶数不会被修改。

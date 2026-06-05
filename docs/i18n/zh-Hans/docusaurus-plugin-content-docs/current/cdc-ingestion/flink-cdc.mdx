@@ -1,0 +1,163 @@
+---
+title: "Flink CDC"
+sidebar_position: 10
+---
+
+import ConfigTable from '@site/src/components/ConfigTable';
+import cdcConfigurationHtml from '@site/generated/cdc_configuration.html';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# Flink CDC {#flink-cdc}
+
+Flink CDC 是面向 Flink 引擎的流式数据集成工具。它允许用户通过 YAML 优雅地描述其 ETL 管道逻辑，并帮助用户自动生成定制化的 Flink 算子和提交作业。
+
+Paimon Pipeline 连接器既可以作为 Flink CDC 管道的数据源（Data Source），也可以作为数据 Sink（Data Sink）。本文档介绍如何将 Paimon Pipeline 连接器配置为数据源。如果你想将 Paimon 作为数据 Sink，请参考 Flink CDC 的 [Paimon Pipeline Connector](https://nightlies.apache.org/flink/flink-cdc-docs-release-3.5/docs/connectors/pipeline-connectors/paimon/) 文档。
+
+## 该连接器能做什么？ {#what-can-the-connector-do}
+
+* 将数据从 Paimon warehouse（仓库目录）、数据库或表同步到 Flink CDC 支持的外部系统
+* 同步 schema（表结构）变更
+* 自动发现源 Paimon warehouse 中新创建的表。
+
+如何创建 Pipeline
+----------------
+
+从 Paimon 读取数据并 Sink 到 Doris 的管道可以按如下方式定义：
+
+```yaml
+source:
+  type: paimon
+  name: Paimon Source
+  database: default
+  table: test_table
+  catalog.properties.metastore: filesystem
+  catalog.properties.warehouse: /path/warehouse
+
+sink:
+  type: doris
+  name: Doris Sink
+  fenodes: 127.0.0.1:8030
+  username: root
+  password: pass
+
+pipeline:
+  name: Paimon to Doris Pipeline
+  parallelism: 2
+```
+
+Pipeline 连接器配置项
+----------------
+
+<ConfigTable html={cdcConfigurationHtml} />
+
+Catalog 配置项
+----------------
+
+除了上文描述的 pipeline 连接器配置项之外，在 CDC yaml 文件中你还可以配置以 `catalog.properties.` 开头的配置项。例如 `catalog.properties.warehouse` 或 `catalog.properties.metastore`。这类配置项的前缀会被移除，其余部分将被视为 Catalog 配置项。可用的 Catalog 配置项请参考 [Configurations](../maintenance/configurations) 章节。
+
+使用须知
+--------
+
+* 主键表的数据更新（-U、+U）将被替换为 -D 和 +I。
+* 不支持删除表。如果你需要从 Paimon warehouse 中删除某张表，请在执行删除操作后重启 Flink CDC 作业。当作业重启后，它将停止从被删除的表中读取数据，外部系统中的目标表将保持作业停止之前的状态不变。
+* 同一张表的数据将由同一个 Flink source 子任务消费。如果不同表之间的数据量差异显著，可能会在 Flink CDC 作业中观察到由数据倾斜引起的性能瓶颈。
+* 如果 CDC 作业已经消费到某张表的最新快照，而下一个快照尚不可用，那么对该表的监控与消费可能会暂时暂停，直到经过 `continuous.discovery-interval` 之后再恢复。
+
+数据类型映射
+----------------
+<div className="wy-table-responsive">
+<table className="colwidths-auto docutils">
+    <thead>
+      <tr>
+        <th className="text-left">Paimon 类型</th>
+        <th className="text-left">CDC 类型</th>
+        <th className="text-left" style={{width: "60%"}}>说明</th>
+      </tr>
+    </thead>
+    <tbody>
+    <tr>
+      <td>TINYINT</td>
+      <td>TINYINT</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>SMALLINT</td>
+      <td>SMALLINT</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>INT</td>
+      <td>INT</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>BIGINT</td>
+      <td>BIGINT</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>FLOAT</td>
+      <td>FLOAT</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>DOUBLE</td>
+      <td>DOUBLE</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>DECIMAL(p, s)</td>
+      <td>DECIMAL(p, s)</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>BOOLEAN</td>
+      <td>BOOLEAN</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>DATE</td>
+      <td>DATE</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>TIMESTAMP</td>
+      <td>TIMESTAMP</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>TIMESTAMP_LTZ</td>
+      <td>TIMESTAMP_LTZ</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>CHAR(n)</td>
+      <td>CHAR(n)</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>VARCHAR(n)</td>
+      <td>VARCHAR(n)</td>
+      <td></td>
+    </tr>
+    </tbody>
+</table>
+</div>

@@ -1,0 +1,215 @@
+---
+title: "增量聚簇"
+sidebar_position: 2
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+<!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+-->
+
+# 增量聚簇 {#incremental-clustering}
+
+Paimon 当前支持使用 SFC（空间填充曲线，Space-Filling Curve）对 Append 表（追加表）进行排序（更多信息参见 [sort compact](../maintenance/dedicated-compaction#sort-compact)）。
+由此产生的数据布局通常能为针对聚簇键的查询带来更好的性能。
+然而，在当前的 SortCompaction 下，即使数据和聚簇键都没有变化，
+每一次运行仍会重写整个数据集，这代价极其高昂。
+
+为解决这一问题，Paimon 引入了一种更灵活的、增量式的聚簇机制——增量聚簇（Incremental Clustering）。
+每次运行时，它只选取特定的文件子集进行聚簇，从而避免全量重写。这使得基于排序的数据布局优化得以低成本进行，
+并提升查询性能。此外，借助增量聚簇，
+你可以在不重写现有数据的情况下调整聚簇键，布局会随聚簇运行而动态演进，
+并逐步收敛到最优状态，从而显著降低围绕数据布局的决策复杂度。
+
+
+增量聚簇支持：
+- 支持增量聚簇；尽可能减少写放大。
+- 支持小文件 Compaction；在重写时遵循 target-file-size。
+- 支持变更聚簇键；新接入的数据将按照最新的聚簇键进行聚簇。
+- 提供全量模式；选用该模式时，将对整个数据集重新聚簇。
+
+**只有 append unaware-bucket 表支持增量聚簇。**
+
+## 启用增量聚簇 {#enable-incremental-clustering}
+
+要启用增量聚簇，需要为表设置以下配置：
+<table className="table table-bordered">
+    <thead>
+    <tr>
+      <th className="text-left" style={{width: "20%"}}>配置项</th>
+      <th className="text-left" style={{width: "10%"}}>值</th>
+      <th className="text-left" style={{width: "5%"}}>是否必填</th>
+      <th className="text-left" style={{width: "10%"}}>类型</th>
+      <th className="text-left" style={{width: "55%"}}>描述</th>
+    </tr>
+    </thead>
+    <tbody>
+    <tr>
+      <td><h5>clustering.incremental</h5></td>
+      <td>true</td>
+      <td style={{wordWrap: "break-word"}}>是</td>
+      <td>Boolean</td>
+      <td>必须设置为 true 才能启用增量聚簇。默认值为 false。</td>
+    </tr>
+    <tr>
+      <td><h5>clustering.columns</h5></td>
+      <td>'clustering-columns'</td>
+      <td style={{wordWrap: "break-word"}}>是</td>
+      <td>String</td>
+      <td>聚簇列，格式为 'columnName1,columnName2'。不建议使用分区键作为聚簇键。</td>
+    </tr>
+    <tr>
+      <td><h5>clustering.strategy</h5></td>
+      <td>'zorder' or 'hilbert' or 'order'</td>
+      <td style={{wordWrap: "break-word"}}>否</td>
+      <td>String</td>
+      <td>聚簇所使用的排序算法。如果未设置，将根据聚簇列的数量来决定。1 列时使用 'order'，少于 5 列时使用 'zorder'，5 列或以上时使用 'hilbert'。</td>
+    </tr>
+    </tbody>
+
+</table>
+
+一旦为某张表启用了增量聚簇，你就可以定期以批式（batch）模式运行增量聚簇，
+持续优化该表的数据布局并带来更好的查询性能。
+
+**注意**：由于普通的 Compaction 同样会重写文件，它可能会破坏增量聚簇所构建的有序数据布局。
+因此，启用增量聚簇后，该表不再支持写入时 Compaction 或独立 Compaction；
+聚簇与小文件合并必须仅通过增量聚簇的运行来执行。
+
+## 运行增量聚簇 {#run-incremental-clustering}
+:::info
+
+仅支持以批式（batch）模式运行增量聚簇。
+
+:::
+
+要运行一个增量聚簇作业，请按照以下说明操作。
+
+运行增量聚簇时，你无需指定任何聚簇相关的参数，
+这些配置项已被定义为表的配置项。如果你需要更改聚簇设置，请更新对应的表配置项。
+
+<Tabs groupId="incremental-clustering">
+
+<TabItem value="spark-sql" label="Spark SQL">
+
+运行以下 sql：
+
+```sql
+--set the write parallelism, if too big, may generate a large number of small files.
+SET spark.sql.shuffle.partitions=10;
+
+-- run incremental clustering
+CALL sys.compact(table => 'T')
+
+-- run incremental clustering with full mode, this will recluster all data
+CALL sys.compact(table => 'T', compact_strategy => 'full')
+```
+
+</TabItem>
+
+<TabItem value="flink-action" label="Flink Action">
+
+运行以下命令，为该表提交一个增量聚簇作业。
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    compact \
+    --warehouse <warehouse-path> \
+    --database <database-name> \
+    --table <table-name> \
+    [--compact_strategy <minor / full>] \
+    [--table_conf <table_conf>] \
+    [--catalog_conf <paimon-catalog-conf> [--catalog_conf <paimon-catalog-conf> ...]]
+```
+
+示例：运行增量聚簇
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-@@VERSION@@.jar \
+    compact \
+    --warehouse s3:///path/to/warehouse \
+    --database test_db \
+    --table test_table \
+    --table_conf sink.parallelism=2 \
+    --compact_strategy minor \
+    --catalog_conf s3.endpoint=https://****.com \
+    --catalog_conf s3.access-key=***** \
+    --catalog_conf s3.secret-key=*****
+```
+* `--compact_strategy` 决定如何挑选要聚簇的文件，默认值为 `minor`。
+    * `full`：将选取所有文件进行聚簇。
+    * `minor`：根据指定条件挑选出需要聚簇的文件集合。
+
+注意：写入并行度由 `sink.parallelism` 设置，如果设置过大，可能会生成大量小文件。
+
+你可以使用 `-D execution.runtime-mode=batch` 或 `-yD execution.runtime-mode=batch`（用于 ON-YARN 场景）来使用批式模式。
+
+</TabItem>
+
+</Tabs>
+
+## 历史分区的自动聚簇 {#auto-clustering-for-historical-partition}
+在对近期活跃的分区执行增量聚簇的同时，Paimon 能够自动检测历史的、
+不活跃的分区，并评估其数据布局是否已达到最优状态。
+对于那些尚未达到最优布局的历史分区，Paimon 也会在同一次操作中对其执行全量聚簇，
+从而提升它们的查询性能。
+
+要为历史分区启用自动聚簇，需要为表设置以下配置：
+<table className="table table-bordered">
+    <thead>
+    <tr>
+      <th className="text-left" style={{width: "20%"}}>配置项</th>
+      <th className="text-left" style={{width: "10%"}}>值</th>
+      <th className="text-left" style={{width: "5%"}}>是否必填</th>
+      <th className="text-left" style={{width: "10%"}}>类型</th>
+      <th className="text-left" style={{width: "55%"}}>描述</th>
+    </tr>
+    </thead>
+    <tbody>
+    <tr>
+      <td><h5>clustering.history-partition.idle-to-full-sort</h5></td>
+      <td>3d</td>
+      <td style={{wordWrap: "break-word"}}>是</td>
+      <td>Duration</td>
+      <td>一个分区在没有新更新后，经过该时长即被视为历史分区。默认值为 null。</td>
+    </tr>
+    <tr>
+      <td><h5>clustering.history-partition.limit</h5></td>
+      <td>5</td>
+      <td style={{wordWrap: "break-word"}}>是</td>
+      <td>Integer</td>
+      <td>自动执行全量聚簇的历史分区数量上限。默认值为 5。</td>
+    </tr>
+    </tbody>
+
+</table>
+
+
+## 实现 {#implement}
+为了在写放大与排序效果之间取得平衡，Paimon 借鉴了 LSM 树中层（level）的概念来对数据文件进行分层，
+并使用 Universal Compaction 策略来选取要聚簇的文件。
+- 新写入的数据落在 level-0；level-0 中的文件是未聚簇的。
+- level-i 中的所有文件都是在同一个排序集合内排序产生的。
+- 类比 Universal Compaction：在 level-0 中，每个文件都是一个 sorted run；在 level-i 中，所有文件共同构成单个 sorted run。在聚簇期间，sorted run 是基本的工作单元。
+
+通过引入更多的层，我们可以控制每次聚簇运行所处理的数据量。
+更高层的数据聚簇得更为稳定、更不易被重写，从而在保持良好排序效果的同时缓解写放大。
