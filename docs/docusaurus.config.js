@@ -120,7 +120,7 @@ const config = {
         title: 'Apache Paimon',
         logo: {
           alt: 'Apache Paimon Logo',
-          src: 'paimon_black.svg',
+          src: 'favicon_blue.svg',
           srcDark: 'paimon_white.svg',
         },
         items: [

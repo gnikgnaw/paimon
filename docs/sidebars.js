@@ -11,7 +11,6 @@ const sidebars = {
       "id": "concepts/index"
     },
     "items": [
-      "concepts/overview",
       "concepts/basic-concepts",
       "concepts/concurrency-control",
       "concepts/catalog",
@@ -24,10 +23,10 @@ const sidebars = {
         "label": "RESTCatalog",
         "collapsed": true,
         "link": {
-          type: "generated-index"
+          type: "doc",
+          "id": "concepts/rest/index"
         },
         "items": [
-          "concepts/rest/overview",
           "concepts/rest/bear",
           "concepts/rest/dlf",
           "concepts/rest/tables",
@@ -40,15 +39,16 @@ const sidebars = {
         "label": "Specification",
         "collapsed": true,
         "link": {
-          type: "generated-index"
+          type: "doc",
+          "id": "concepts/spec/index"
         },
         "items": [
-          "concepts/spec/overview",
           "concepts/spec/schema",
           "concepts/spec/snapshot",
           "concepts/spec/manifest",
           "concepts/spec/datafile",
           "concepts/spec/fileformat",
+          "concepts/spec/rowformat",
           "concepts/spec/tableindex",
           "concepts/spec/fileindex"
         ]
@@ -57,14 +57,27 @@ const sidebars = {
   },
   {
     type: "category",
-    "label": "Table with PK",
+    "label": "Append Table",
+    "collapsed": true,
+    "link": {
+      type: "doc",
+      "id": "append-table/index"
+    },
+    "items": [
+      "append-table/incremental-clustering",
+      "append-table/bucketed",
+      "append-table/row-tracking"
+    ]
+  },
+  {
+    type: "category",
+    "label": "PrimaryKey Table",
     "collapsed": true,
     "link": {
       type: "doc",
       "id": "primary-key-table/index"
     },
     "items": [
-      "primary-key-table/overview",
       "primary-key-table/data-distribution",
       "primary-key-table/table-mode",
       "primary-key-table/changelog-producer",
@@ -78,10 +91,10 @@ const sidebars = {
         "label": "Merge Engine",
         "collapsed": true,
         "link": {
-          type: "generated-index"
+          type: "doc",
+          "id": "primary-key-table/merge-engine/index"
         },
         "items": [
-          "primary-key-table/merge-engine/overview",
           "primary-key-table/merge-engine/partial-update",
           "primary-key-table/merge-engine/aggregation",
           "primary-key-table/merge-engine/first-row"
@@ -91,21 +104,17 @@ const sidebars = {
   },
   {
     type: "category",
-    "label": "Table w/o PK",
+    "label": "Multimodal Table",
     "collapsed": true,
     "link": {
       type: "doc",
-      "id": "append-table/index"
+      "id": "multimodal-table/index"
     },
     "items": [
-      "append-table/overview",
-      "append-table/incremental-clustering",
-      "append-table/bucketed",
-      "append-table/row-tracking",
-      "append-table/data-evolution",
-      "append-table/blob",
-      "append-table/vector",
-      "append-table/global-index"
+      "multimodal-table/data-evolution",
+      "multimodal-table/blob",
+      "multimodal-table/vector",
+      "multimodal-table/global-index"
     ]
   },
   {
@@ -162,7 +171,6 @@ const sidebars = {
       "id": "pypaimon/index"
     },
     "items": [
-      "pypaimon/overview",
       "pypaimon/python-api",
       "pypaimon/manage-tags",
       "pypaimon/ray-data",
@@ -186,7 +194,6 @@ const sidebars = {
       "id": "ecosystem/index"
     },
     "items": [
-      "ecosystem/overview",
       "ecosystem/starrocks",
       "ecosystem/doris",
       "ecosystem/hive",
@@ -203,7 +210,6 @@ const sidebars = {
       "id": "cdc-ingestion/index"
     },
     "items": [
-      "cdc-ingestion/overview",
       "cdc-ingestion/mysql-cdc",
       "cdc-ingestion/postgres-cdc",
       "cdc-ingestion/kafka-cdc",
@@ -275,7 +281,6 @@ const sidebars = {
       "id": "iceberg/index"
     },
     "items": [
-      "iceberg/overview",
       "iceberg/append-table",
       "iceberg/primary-key-table",
       "iceberg/iceberg-tags",
@@ -296,7 +301,8 @@ const sidebars = {
     "items": [
       "project/download",
       "project/contributing",
-      "project/committer"
+      "project/committer",
+      "project/security"
     ]
   },
   {

@@ -2,7 +2,11 @@
 module.exports = [
   {
     "from": "/append-table/blob-storage.html",
-    "to": "/append-table/blob"
+    "to": "/multimodal-table/blob"
+  },
+  {
+    "from": "/append-table/blob",
+    "to": "/multimodal-table/blob"
   },
   {
     "from": "/append-table/bucketed.html",
@@ -10,19 +14,23 @@ module.exports = [
   },
   {
     "from": "/append-table/data-evolution.html",
-    "to": "/append-table/data-evolution"
+    "to": "/multimodal-table/data-evolution"
+  },
+  {
+    "from": "/append-table/data-evolution",
+    "to": "/multimodal-table/data-evolution"
   },
   {
     "from": "/append-table/global-index.html",
-    "to": "/append-table/global-index"
+    "to": "/multimodal-table/global-index"
+  },
+  {
+    "from": "/append-table/global-index",
+    "to": "/multimodal-table/global-index"
   },
   {
     "from": "/append-table/incremental-clustering.html",
     "to": "/append-table/incremental-clustering"
-  },
-  {
-    "from": "/append-table/overview.html",
-    "to": "/append-table/overview"
   },
   {
     "from": "/append-table/row-tracking.html",
@@ -30,7 +38,11 @@ module.exports = [
   },
   {
     "from": "/append-table/vector-storage.html",
-    "to": "/append-table/vector"
+    "to": "/multimodal-table/vector"
+  },
+  {
+    "from": "/append-table/vector",
+    "to": "/multimodal-table/vector"
   },
   {
     "from": "/cdc-ingestion/flink-cdc.html",
@@ -47,10 +59,6 @@ module.exports = [
   {
     "from": "/cdc-ingestion/mysql-cdc.html",
     "to": "/cdc-ingestion/mysql-cdc"
-  },
-  {
-    "from": "/cdc-ingestion/overview.html",
-    "to": "/cdc-ingestion/overview"
   },
   {
     "from": "/cdc-ingestion/postgres-cdc.html",
@@ -81,20 +89,12 @@ module.exports = [
     "to": "/concepts/functions"
   },
   {
-    "from": "/concepts/overview.html",
-    "to": "/concepts/overview"
-  },
-  {
     "from": "/concepts/rest/bear.html",
     "to": "/concepts/rest/bear"
   },
   {
     "from": "/concepts/rest/dlf.html",
     "to": "/concepts/rest/dlf"
-  },
-  {
-    "from": "/concepts/rest/overview.html",
-    "to": "/concepts/rest/overview"
   },
   {
     "from": "/concepts/rest/pvfs.html",
@@ -119,10 +119,6 @@ module.exports = [
   {
     "from": "/concepts/spec/manifest.html",
     "to": "/concepts/spec/manifest"
-  },
-  {
-    "from": "/concepts/spec/overview.html",
-    "to": "/concepts/spec/overview"
   },
   {
     "from": "/concepts/spec/schema.html",
@@ -155,10 +151,6 @@ module.exports = [
   {
     "from": "/ecosystem/hive.html",
     "to": "/ecosystem/hive"
-  },
-  {
-    "from": "/ecosystem/overview.html",
-    "to": "/ecosystem/overview"
   },
   {
     "from": "/ecosystem/starrocks.html",
@@ -227,10 +219,6 @@ module.exports = [
   {
     "from": "/iceberg/iceberg-tags.html",
     "to": "/iceberg/iceberg-tags"
-  },
-  {
-    "from": "/iceberg/overview.html",
-    "to": "/iceberg/overview"
   },
   {
     "from": "/iceberg/primary-key-table.html",
@@ -329,16 +317,8 @@ module.exports = [
     "to": "/primary-key-table/merge-engine/first-row"
   },
   {
-    "from": "/primary-key-table/merge-engine/overview.html",
-    "to": "/primary-key-table/merge-engine/overview"
-  },
-  {
     "from": "/primary-key-table/merge-engin/partial-update.html",
     "to": "/primary-key-table/merge-engine/partial-update"
-  },
-  {
-    "from": "/primary-key-table/overview.html",
-    "to": "/primary-key-table/overview"
   },
   {
     "from": "/primary-key-table/pk-clustering-override.html",
@@ -423,10 +403,6 @@ module.exports = [
   {
     "from": "/pypaimon/manage-tags.html",
     "to": "/pypaimon/manage-tags"
-  },
-  {
-    "from": "/pypaimon/overview.html",
-    "to": "/pypaimon/overview"
   },
   {
     "from": "/pypaimon/pyjindosdk-support.html",

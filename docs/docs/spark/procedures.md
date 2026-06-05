@@ -361,6 +361,21 @@ This section introduce all available spark procedures about paimon.
       </td>
     </tr>
    <tr>
+      <td>merge_branch</td>
+      <td>
+         Merge data files from source branch into target branch for append-only tables.
+         The table must be created with <code>'branch-merge.enabled' = 'true'</code>. This option enforces a pure-append table history by rejecting compaction and INSERT OVERWRITE, and it is incompatible with deletion vectors.
+         Requires compatible schema history and consistent row-tracking settings between source and target. Arguments:
+            <li>table: the table identifier. Cannot be empty.</li>
+            <li>source_branch: name of the source branch to merge from. Cannot be empty.</li>
+            <li>target_branch(optional): name of the target branch to merge into. Default is 'main'.</li>
+      </td>
+      <td>
+         CALL sys.merge_branch(table => 'test_db.T', source_branch => 'branch1')<br/><br/>
+         CALL sys.merge_branch(table => 'test_db.T', source_branch => 'branch1', target_branch => 'branch2')
+      </td>
+    </tr>
+   <tr>
       <td>reset_consumer</td>
       <td>
          To reset or delete consumer. Arguments:
@@ -502,14 +517,16 @@ This section introduce all available spark procedures about paimon.
          To create global index files for a given column. The table must have <code>row-tracking.enabled=true</code>. Arguments:
             <li>table: the target table identifier. Cannot be empty.</li>
             <li>index_column: the name of the column to index. Cannot be empty.</li>
-            <li>index_type: type of the index to build, e.g. 'btree' or 'bitmap'. Cannot be empty.</li>
+            <li>index_type: type of the index to build, e.g. 'btree'. Cannot be empty.</li>
             <li>partitions: partition filter to limit the partitions on which to build the index. The comma (",") represents "AND", the semicolon (";") represents "OR". Left empty for all partitions.</li>
             <li>options: additional dynamic options of the table. It prioritizes higher than original `tableProp` and lower than `procedureArg`.</li>
       </td>
       <td>
-         CALL sys.create_global_index(table => 'default.T', index_column => 'name', index_type => 'bitmap')<br/><br/>
          CALL sys.create_global_index(table => 'default.T', index_column => 'name', index_type => 'btree')<br/><br/>
-         CALL sys.create_global_index(table => 'default.T', index_column => 'name', index_type => 'btree', partitions => 'pt=p1;pt=p2')
+         CALL sys.create_global_index(table => 'default.T', index_column => 'name', index_type => 'btree', partitions => 'pt=p1;pt=p2')<br/><br/>
+         CALL sys.create_global_index(table => 'default.T', index_column => 'content', index_type => 'tantivy-fulltext', options => 'tantivy.tokenizer=ngram,tantivy.ngram.min-gram=2,tantivy.ngram.max-gram=2')<br/><br/>
+         CALL sys.create_global_index(table => 'default.T', index_column => 'content', index_type => 'tantivy-fulltext', options => 'tantivy.tokenizer=jieba')<br/><br/>
+         CALL sys.create_global_index(table => 'default.T', index_column => 'content', index_type => 'tantivy-fulltext', options => 'tantivy.tokenizer=simple,tantivy.stem=true,tantivy.remove-stop-words=true')
       </td>
    </tr>
    <tr>
@@ -518,12 +535,11 @@ This section introduce all available spark procedures about paimon.
          To drop global index files for a given column. Arguments:
             <li>table: the target table identifier. Cannot be empty.</li>
             <li>index_column: the name of the indexed column. Cannot be empty.</li>
-            <li>index_type: type of the index to drop, e.g. 'btree' or 'bitmap'. Cannot be empty.</li>
+            <li>index_type: type of the index to drop, e.g. 'btree'. Cannot be empty.</li>
             <li>partitions: partition filter to limit the partitions from which to drop the index. The comma (",") represents "AND", the semicolon (";") represents "OR". Left empty for all partitions.</li>
       </td>
       <td>
-         CALL sys.drop_global_index(table => 'default.T', index_column => 'name', index_type => 'bitmap')<br/><br/>
-         CALL sys.drop_global_index(table => 'default.T', index_column => 'name', index_type => 'bitmap', partitions => 'pt=p1')
+         CALL sys.drop_global_index(table => 'default.T', index_column => 'name', index_type => 'btree', partitions => 'pt=p1')
       </td>
    </tr>
    <tr>

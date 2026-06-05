@@ -36,6 +36,7 @@ from pypaimon.manifest.schema.data_file_meta import DataFileMeta
 from pypaimon.manifest.schema.manifest_entry import ManifestEntry
 from pypaimon.manifest.schema.manifest_file_meta import ManifestFileMeta
 from pypaimon.manifest.schema.simple_stats import SimpleStats
+from pypaimon.schema.data_types import AtomicType, DataField
 from pypaimon.schema.schema import Schema
 from pypaimon.table.row.generic_row import GenericRow
 
@@ -282,6 +283,48 @@ class ManifestFileManagerTest(_ManifestManagerSetup):
             "test-manifest.avro", manifest_entry_filter=lambda e: e.bucket == 0)
         self.assertEqual(len(result_filtered), 2)
 
+    def test_read_write_cols_with_system_field(self):
+        manager = self._make_manager()
+
+        id_field = DataField(0, 'id', AtomicType('INT', nullable=True))
+        min_row = GenericRow([1], [id_field])
+        max_row = GenericRow([10], [id_field])
+        value_stats = SimpleStats(
+            min_values=min_row, max_values=max_row, null_counts=[2])
+
+        entry = ManifestEntry(
+            kind=0,
+            partition=_EMPTY_ROW,
+            bucket=0,
+            total_buckets=1,
+            file=DataFileMeta(
+                file_name="data-dirty.parquet", file_size=1024, row_count=50,
+                min_key=_EMPTY_ROW, max_key=_EMPTY_ROW,
+                key_stats=_EMPTY_STATS, value_stats=value_stats,
+                min_sequence_number=1, max_sequence_number=50,
+                schema_id=0, level=0, extra_files=[],
+                creation_time=Timestamp.from_epoch_millis(0),
+                delete_row_count=0, embedded_index=None, file_source=None,
+                value_stats_cols=None, external_path=None,
+                first_row_id=0,
+                write_cols=["id", "_ROW_ID", "_SEQUENCE_NUMBER"],
+            ),
+        )
+        manager.write("dirty-manifest.avro", [entry])
+
+        entries = manager.read("dirty-manifest.avro", drop_stats=False)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(
+            entries[0].file.write_cols, ["id", "_ROW_ID", "_SEQUENCE_NUMBER"])
+
+        read_stats = entries[0].file.value_stats
+        stats_field_names = [f.name for f in read_stats.min_values.fields]
+        self.assertEqual(stats_field_names, ["id"])
+
+        self.assertEqual(read_stats.min_values.get_field(0), 1)
+        self.assertEqual(read_stats.max_values.get_field(0), 10)
+        self.assertEqual(read_stats.null_counts, [2])
+
 
 class ManifestListManagerTest(_ManifestManagerSetup):
     """Tests for ManifestListManager."""
@@ -336,8 +379,8 @@ class ManifestListManagerTest(_ManifestManagerSetup):
         'PyPI backports.zstd only supports Python 3.9–3.13',
     )
     @unittest.skipIf(
-        sys.version_info >= (3, 14),
-        'fastavro uses stdlib compression.zstd on Python 3.14+, not backports.zstd',
+        sys.version_info >= (3, 13),
+        'fastavro >= 1.12 bundles zstd in compiled extension on Python 3.13+',
     )
     def test_zstd_manifest_list_fastavro_requires_backports_zstd(self):
         """Child venv runs ``manifest_list_zstd_read_subprocess`` (argv: warehouse, table id, list file name).
@@ -363,7 +406,8 @@ class ManifestListManagerTest(_ManifestManagerSetup):
         isolated_venv_python = _manifest_zstd_read_subprocess_venv_python()
         pip_install_env = _subprocess_env_for_pip()
         subprocess.run(
-            [isolated_venv_python, '-m', 'pip', 'uninstall', '-y', 'backports.zstd'],
+            [isolated_venv_python, '-m', 'pip', 'uninstall', '-y',
+             'backports.zstd', 'zstandard'],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             env=pip_install_env,
@@ -389,7 +433,8 @@ class ManifestListManagerTest(_ManifestManagerSetup):
         self.assertIn('backports.zstd', stderr_and_stdout)
 
         subprocess.check_call(
-            [isolated_venv_python, '-m', 'pip', 'install', '-q', 'backports.zstd'],
+            [isolated_venv_python, '-m', 'pip', 'install', '-q',
+             'backports.zstd', 'zstandard'],
             env=pip_install_env,
         )
         read_with_zstd_backend = subprocess.run(

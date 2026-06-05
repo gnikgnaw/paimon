@@ -22,6 +22,10 @@ import org.apache.paimon.data.variant.{GenericVariant, Variant}
 import org.apache.paimon.spark.catalyst.analysis.Spark4ResolutionRules
 import org.apache.paimon.spark.catalyst.parser.extensions.PaimonSpark4SqlExtensionsParser
 import org.apache.paimon.spark.data.{Spark4ArrayData, Spark4InternalRow, Spark4InternalRowWithBlob, SparkArrayData, SparkInternalRow}
+import org.apache.paimon.spark.format.FormatTableBatchWrite
+import org.apache.paimon.spark.rowops.PaimonCopyOnWriteScan
+import org.apache.paimon.spark.write.PaimonBatchWrite
+import org.apache.paimon.table.{FileStoreTable, FormatTable}
 import org.apache.paimon.types.{DataType, RowType}
 
 import org.apache.hadoop.conf.Configuration
@@ -38,6 +42,7 @@ import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.util.{ArrayData, GeneratedColumn, IdentityColumn, ResolveDefaultColumns}
 import org.apache.spark.sql.connector.catalog.{CatalogV2Util, Column, Identifier, StagingTableCatalog, Table, TableCatalog}
 import org.apache.spark.sql.connector.expressions.Transform
+import org.apache.spark.sql.connector.write.BatchWrite
 import org.apache.spark.sql.execution.{SparkFormatTable, SparkPlan}
 import org.apache.spark.sql.execution.datasources.{PartitioningAwareFileIndex, PartitionSpec}
 import org.apache.spark.sql.execution.datasources.v2.{AtomicReplaceTableAsSelectExec, AtomicReplaceTableExec, ReplaceTableAsSelectExec, ReplaceTableExec}
@@ -183,6 +188,21 @@ class Spark4Shim extends SparkShim {
     tableCatalog.invalidateTable(ident)
   }
 
+  override def createPaimonBatchWrite(
+      table: FileStoreTable,
+      writeSchema: StructType,
+      dataSchema: StructType,
+      overwritePartitions: Option[Map[String, String]],
+      copyOnWriteScan: Option[PaimonCopyOnWriteScan]): BatchWrite =
+    new PaimonBatchWrite(table, writeSchema, dataSchema, overwritePartitions, copyOnWriteScan)
+
+  override def createFormatTableBatchWrite(
+      table: FormatTable,
+      overwriteDynamic: Option[Boolean],
+      overwritePartitions: Option[Map[String, String]],
+      writeSchema: StructType): BatchWrite =
+    new FormatTableBatchWrite(table, overwriteDynamic, overwritePartitions, writeSchema)
+
   override def createCTERelationRef(
       cteId: Long,
       resolved: Boolean,
@@ -220,23 +240,24 @@ class Spark4Shim extends SparkShim {
       withSchemaEvolution)
   }
 
+  override def notMatchedBySourceActions(merge: MergeIntoTable): Seq[MergeAction] =
+    merge.notMatchedBySourceActions
+
+  override def createUpdateAction(
+      condition: Option[Expression],
+      assignments: Seq[Assignment]): UpdateAction =
+    UpdateAction(condition, assignments)
+
+  override def createInsertAction(
+      condition: Option[Expression],
+      assignments: Seq[Assignment]): InsertAction =
+    InsertAction(condition, assignments)
+
   override def copyDataSourceV2Relation(
       relation: DataSourceV2Relation,
       table: Table,
       output: Seq[AttributeReference]): DataSourceV2Relation = {
     relation.copy(table = table, output = output)
-  }
-
-  override def copyUpdateAction(
-      action: UpdateAction,
-      assignments: Seq[Assignment]): UpdateAction = {
-    action.copy(assignments = assignments)
-  }
-
-  override def copyInsertAction(
-      action: InsertAction,
-      assignments: Seq[Assignment]): InsertAction = {
-    action.copy(assignments = assignments)
   }
 
   override def earlyBatchRules(): Seq[Rule[LogicalPlan]] = Seq(CTESubstitution)
