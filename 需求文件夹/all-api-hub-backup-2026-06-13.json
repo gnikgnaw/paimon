@@ -1,0 +1,520 @@
+{
+  "version": "2.0",
+  "timestamp": 1781340880232,
+  "accounts": {
+    "accounts": [
+      {
+        "id": "account-614fb4ce-5fec-4a8f-bfb4-78177fb8eba5",
+        "site_name": "Old API",
+        "site_url": "https://sakuradori.dpdns.org",
+        "health": {
+          "status": "healthy",
+          "reason": "账号状态正常"
+        },
+        "site_type": "new-api",
+        "exchange_rate": 1,
+        "account_info": {
+          "id": "1003",
+          "access_token": "EfjMc7Q71eqkFhP7cHhATtFK7226",
+          "username": "linuxdo_1003",
+          "quota": 477711512,
+          "today_prompt_tokens": 0,
+          "today_completion_tokens": 0,
+          "today_quota_consumption": 0,
+          "today_requests_count": 0,
+          "today_income": 5289477
+        },
+        "last_sync_time": 1781337098791,
+        "updated_at": 1781337098792,
+        "user_updated_at": 1780128995020,
+        "created_at": 1777173992554,
+        "notes": "",
+        "tagIds": [],
+        "disabled": false,
+        "excludeFromTotalBalance": false,
+        "excludeFromTodayIncome": false,
+        "authType": "access_token",
+        "checkIn": {
+          "enableDetection": true,
+          "autoCheckInEnabled": true,
+          "siteStatus": {
+            "isCheckedInToday": true,
+            "lastDetectedAt": 1781337098791,
+            "lastCheckInDate": "2026-06-13"
+          },
+          "customCheckIn": {
+            "url": "",
+            "redeemUrl": "",
+            "openRedeemWithCheckIn": true,
+            "isCheckedInToday": false
+          }
+        },
+        "manualBalanceUsd": "",
+        "configVersion": 6
+      },
+      {
+        "id": "account-84e4811f-e9ae-4deb-99b6-de536db5e78b",
+        "site_name": "Anyrouter",
+        "site_url": "https://anyrouter.top",
+        "health": {
+          "status": "healthy",
+          "reason": "账号状态正常"
+        },
+        "site_type": "anyrouter",
+        "exchange_rate": 7.3,
+        "account_info": {
+          "id": "135498",
+          "access_token": "ovtXe6l8W6yNSOnznlwpHXZgeBH5Tw==",
+          "username": "linuxdo_135498",
+          "quota": 273246026,
+          "today_prompt_tokens": 0,
+          "today_completion_tokens": 0,
+          "today_quota_consumption": 0,
+          "today_requests_count": 0,
+          "today_income": 0
+        },
+        "last_sync_time": 1777431629505,
+        "updated_at": 1781337088821,
+        "user_updated_at": 1780128965775,
+        "created_at": 1777174013872,
+        "notes": "",
+        "tagIds": [],
+        "disabled": false,
+        "excludeFromTotalBalance": false,
+        "excludeFromTodayIncome": false,
+        "authType": "access_token",
+        "checkIn": {
+          "enableDetection": true,
+          "autoCheckInEnabled": true,
+          "siteStatus": {
+            "isCheckedInToday": true,
+            "lastDetectedAt": 1781337088820,
+            "lastCheckInDate": "2026-06-13"
+          },
+          "customCheckIn": {
+            "url": "",
+            "redeemUrl": "",
+            "openRedeemWithCheckIn": true,
+            "isCheckedInToday": false
+          }
+        },
+        "manualBalanceUsd": "",
+        "configVersion": 6
+      },
+      {
+        "id": "account-5128f4ac-2b24-4f7b-8340-ea6b1e5de74f",
+        "site_name": "HotaruAPI",
+        "site_url": "https://hotaruapi.com",
+        "health": {
+          "status": "unknown",
+          "reason": "无权进行此操作，access token 无效"
+        },
+        "site_type": "new-api",
+        "exchange_rate": 2.5,
+        "account_info": {
+          "id": "9312",
+          "access_token": "N8AfyGe78vBt9MLto/zJzMqCdWWz",
+          "username": "linuxdo_9312",
+          "quota": 183736577,
+          "today_prompt_tokens": 0,
+          "today_completion_tokens": 0,
+          "today_quota_consumption": 0,
+          "today_requests_count": 0,
+          "today_income": 3924279
+        },
+        "last_sync_time": 1781340801237,
+        "updated_at": 1781340801241,
+        "user_updated_at": 1779265715257,
+        "created_at": 1777174422510,
+        "notes": "",
+        "tagIds": [],
+        "disabled": false,
+        "excludeFromTotalBalance": false,
+        "excludeFromTodayIncome": false,
+        "authType": "access_token",
+        "checkIn": {
+          "enableDetection": true,
+          "autoCheckInEnabled": true,
+          "siteStatus": {
+            "isCheckedInToday": true,
+            "lastDetectedAt": 1779265715251,
+            "lastCheckInDate": "2026-05-20"
+          },
+          "customCheckIn": {
+            "url": "",
+            "redeemUrl": "",
+            "openRedeemWithCheckIn": true,
+            "isCheckedInToday": false
+          }
+        },
+        "manualBalanceUsd": "",
+        "configVersion": 6
+      },
+      {
+        "id": "account-b3fddfce-08de-4a3c-84e6-d5f0600d28d1",
+        "site_name": "「慕鸢の公益站」",
+        "site_url": "https://newapi.linuxdo.edu.rs",
+        "health": {
+          "status": "warning",
+          "reason": "HTTP 401: 无权进行此操作，未登录且未提供 access token"
+        },
+        "site_type": "new-api",
+        "exchange_rate": 7.3,
+        "account_info": {
+          "id": "2213",
+          "access_token": "OyRX8fWCtT8zu9OtD/kzLd0g+wT8byR3",
+          "username": "linuxdo_2213",
+          "quota": 136547430,
+          "today_prompt_tokens": 0,
+          "today_completion_tokens": 0,
+          "today_quota_consumption": 0,
+          "today_requests_count": 0,
+          "today_income": 1906774
+        },
+        "last_sync_time": 1781340801805,
+        "updated_at": 1781340801805,
+        "user_updated_at": 1780128995024,
+        "created_at": 1777174684493,
+        "notes": "",
+        "tagIds": [],
+        "disabled": false,
+        "excludeFromTotalBalance": false,
+        "excludeFromTodayIncome": false,
+        "authType": "access_token",
+        "checkIn": {
+          "enableDetection": true,
+          "autoCheckInEnabled": true,
+          "siteStatus": {
+            "isCheckedInToday": true,
+            "lastDetectedAt": 1780495148380,
+            "lastCheckInDate": "2026-06-03"
+          },
+          "customCheckIn": {
+            "url": "",
+            "redeemUrl": "",
+            "openRedeemWithCheckIn": true,
+            "isCheckedInToday": false
+          }
+        },
+        "manualBalanceUsd": "",
+        "configVersion": 6
+      }
+    ],
+    "bookmarks": [],
+    "pinnedAccountIds": [],
+    "orderedAccountIds": [],
+    "deletedEntryRecords": {},
+    "last_updated": 1781340801806
+  },
+  "tagStore": {
+    "version": 1,
+    "tagsById": {}
+  },
+  "preferences": {
+    "activeTab": "cashflow",
+    "currencyType": "USD",
+    "showTodayCashflow": true,
+    "sortField": "balance",
+    "sortOrder": "desc",
+    "actionClickBehavior": "popup",
+    "openChangelogOnUpdate": false,
+    "autoProvisionKeyOnAccountAdd": false,
+    "autoFillCurrentSiteUrlOnAccountAdd": false,
+    "warnOnDuplicateAccountAdd": true,
+    "accountAutoRefresh": {
+      "enabled": false,
+      "interval": 900,
+      "minInterval": 120,
+      "refreshOnOpen": false
+    },
+    "usageHistory": {
+      "enabled": true,
+      "retentionDays": 7,
+      "scheduleMode": "afterRefresh",
+      "syncIntervalMinutes": 360
+    },
+    "balanceHistory": {
+      "enabled": false,
+      "endOfDayCapture": {
+        "enabled": false
+      },
+      "estimatedTodayIncome": {
+        "enabled": false
+      },
+      "retentionDays": 365
+    },
+    "showHealthStatus": true,
+    "webdav": {
+      "url": "",
+      "username": "",
+      "password": "",
+      "backupEncryptionEnabled": false,
+      "backupEncryptionPassword": "",
+      "syncData": {
+        "accounts": true,
+        "bookmarks": true,
+        "apiCredentialProfiles": true,
+        "preferences": true
+      },
+      "autoSync": false,
+      "syncInterval": 3600,
+      "syncStrategy": "merge"
+    },
+    "lastUpdated": 1777431606717,
+    "sharedPreferencesLastUpdated": 1777431606717,
+    "newApi": {
+      "baseUrl": "",
+      "adminToken": "",
+      "userId": "",
+      "username": "",
+      "password": "",
+      "totpSecret": ""
+    },
+    "doneHub": {
+      "baseUrl": "",
+      "adminToken": "",
+      "userId": ""
+    },
+    "veloera": {
+      "baseUrl": "",
+      "adminToken": "",
+      "userId": ""
+    },
+    "octopus": {
+      "baseUrl": "",
+      "username": "",
+      "password": ""
+    },
+    "axonHub": {
+      "baseUrl": "",
+      "email": "",
+      "password": ""
+    },
+    "claudeCodeHub": {
+      "baseUrl": "",
+      "adminToken": ""
+    },
+    "managedSiteType": "new-api",
+    "cliProxy": {
+      "baseUrl": "",
+      "managementKey": ""
+    },
+    "claudeCodeRouter": {
+      "baseUrl": "",
+      "apiKey": ""
+    },
+    "managedSiteModelSync": {
+      "enabled": false,
+      "interval": 86400000,
+      "concurrency": 2,
+      "maxRetries": 2,
+      "rateLimit": {
+        "requestsPerMinute": 20,
+        "burst": 5
+      },
+      "allowedModels": [],
+      "globalChannelModelFilters": []
+    },
+    "autoCheckin": {
+      "globalEnabled": true,
+      "pretriggerDailyOnUiOpen": false,
+      "notifyUiOnCompletion": true,
+      "windowStart": "09:00",
+      "windowEnd": "23:00",
+      "scheduleMode": "random",
+      "deterministicTime": "09:00",
+      "retryStrategy": {
+        "enabled": false,
+        "intervalMinutes": 30,
+        "maxAttemptsPerDay": 3
+      }
+    },
+    "modelRedirect": {
+      "enabled": false,
+      "standardModels": [
+        "gpt-4o",
+        "gpt-4o-mini",
+        "o3",
+        "o3-mini",
+        "gpt-5",
+        "gpt-5-mini",
+        "gpt-5-codex",
+        "claude-4.5-haiku",
+        "claude-4.5-sonnet",
+        "claude-4.1-opus",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "mistral-small",
+        "mistral-large",
+        "mistral-medium",
+        "deepseek-chat",
+        "deepseek-reasoner",
+        "glm-4.6",
+        "glm-4.5",
+        "glm-4.5-air",
+        "qwen-max",
+        "qwen-plus",
+        "qwen-flash",
+        "qwen-coder"
+      ],
+      "pruneMissingTargetsOnModelSync": false
+    },
+    "redemptionAssist": {
+      "enabled": true,
+      "contextMenu": {
+        "enabled": true
+      },
+      "relaxedCodeValidation": true,
+      "urlWhitelist": {
+        "enabled": true,
+        "patterns": [
+          "cdk.linux.do"
+        ],
+        "includeAccountSiteUrls": true,
+        "includeCheckInAndRedeemUrls": true
+      }
+    },
+    "webAiApiCheck": {
+      "enabled": true,
+      "contextMenu": {
+        "enabled": true
+      },
+      "autoDetect": {
+        "enabled": false,
+        "enhanced": {
+          "enabled": true
+        },
+        "urlWhitelist": {
+          "patterns": []
+        }
+      }
+    },
+    "sortingPriorityConfig": {
+      "criteria": [
+        {
+          "id": "disabled_account",
+          "enabled": true,
+          "priority": 0
+        },
+        {
+          "id": "current_site",
+          "enabled": true,
+          "priority": 1
+        },
+        {
+          "id": "pinned",
+          "enabled": true,
+          "priority": 2
+        },
+        {
+          "id": "user_sort_field",
+          "enabled": true,
+          "priority": 3
+        },
+        {
+          "id": "manual_order",
+          "enabled": true,
+          "priority": 4
+        },
+        {
+          "id": "check_in_requirement",
+          "enabled": true,
+          "priority": 5
+        },
+        {
+          "id": "matched_open_tabs",
+          "enabled": true,
+          "priority": 6
+        },
+        {
+          "id": "health_status",
+          "enabled": true,
+          "priority": 7
+        },
+        {
+          "id": "custom_check_in_url",
+          "enabled": true,
+          "priority": 8
+        },
+        {
+          "id": "custom_redeem_url",
+          "enabled": true,
+          "priority": 9
+        }
+      ],
+      "lastModified": 1777431606717
+    },
+    "themeMode": "dark",
+    "logging": {
+      "consoleEnabled": true,
+      "level": "info"
+    },
+    "preferencesVersion": 26,
+    "tempWindowFallback": {
+      "enabled": true,
+      "useInPopup": true,
+      "useInSidePanel": true,
+      "useInOptions": true,
+      "useForAutoRefresh": true,
+      "useForManualRefresh": true,
+      "tempContextMode": "composite"
+    },
+    "tempWindowFallbackReminder": {
+      "dismissed": false
+    },
+    "taskNotifications": {
+      "enabled": true,
+      "tasks": {
+        "autoCheckin": true,
+        "webdavAutoSync": true,
+        "managedSiteModelSync": true,
+        "usageHistorySync": true,
+        "balanceHistoryCapture": true,
+        "siteAnnouncements": true
+      },
+      "channels": {
+        "browser": {
+          "enabled": true
+        },
+        "telegram": {
+          "enabled": false,
+          "botToken": "",
+          "chatId": ""
+        },
+        "feishu": {
+          "enabled": false,
+          "webhookKey": ""
+        },
+        "dingtalk": {
+          "enabled": false,
+          "webhookKey": "",
+          "secret": ""
+        },
+        "wecom": {
+          "enabled": false,
+          "webhookKey": ""
+        },
+        "ntfy": {
+          "enabled": false,
+          "topicUrl": "",
+          "accessToken": ""
+        },
+        "webhook": {
+          "enabled": false,
+          "url": ""
+        }
+      }
+    },
+    "siteAnnouncementNotifications": {
+      "enabled": false,
+      "notificationEnabled": true,
+      "intervalMinutes": 360
+    }
+  },
+  "channelConfigs": {},
+  "apiCredentialProfiles": {
+    "version": 3,
+    "profiles": [],
+    "lastUpdated": 1781340880229
+  }
+}
